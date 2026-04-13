@@ -18,8 +18,9 @@ class LogProcessorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Log Classifier & DeBERTa Trainer")
-        self.root.geometry("650x650")
-        self.root.resizable(False, False)
+        self.root.geometry("650x700")
+        self.root.minsize(650, 620)
+        self.root.resizable(True, True)
 
         # UI Styling
         style = ttk.Style()
@@ -28,33 +29,14 @@ class LogProcessorApp:
         self.create_widgets()
 
     def create_widgets(self):
-        # --- GitHub Section ---
-        github_frame = ttk.LabelFrame(self.root, text="GitHub Configuration", padding=(10, 10))
-        github_frame.pack(fill="x", padx=10, pady=5)
-
-        ttk.Label(github_frame, text="GitHub PAT:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.github_key_entry = ttk.Entry(github_frame, width=30, show="*")
-        self.github_key_entry.grid(row=0, column=1, padx=5, pady=5)
-
-        self.load_repos_btn = ttk.Button(github_frame, text="Load Repos", command=self.start_repo_thread)
-        self.load_repos_btn.grid(row=0, column=2, padx=5, pady=5)
-
-        ttk.Label(github_frame, text="Repository:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.repo_combo = ttk.Combobox(github_frame, state="readonly", width=28)
-        self.repo_combo.grid(row=1, column=1, padx=5, pady=5)
-        self.repo_combo.bind("<<ComboboxSelected>>", self.start_branch_thread)
-
-        ttk.Label(github_frame, text="Branch:").grid(row=1, column=2, sticky="w", padx=5, pady=5)
-        self.branch_combo = ttk.Combobox(github_frame, state="readonly", width=15)
-        self.branch_combo.grid(row=1, column=3, padx=5, pady=5)
-
         # --- File Upload Section ---
         file_frame = ttk.LabelFrame(self.root, text="Data Processing", padding=(10, 10))
         file_frame.pack(fill="x", padx=10, pady=5)
+        file_frame.columnconfigure(1, weight=1)
 
         ttk.Label(file_frame, text="Log File (CSV):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.filepath_entry = ttk.Entry(file_frame, width=40)
-        self.filepath_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.filepath_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
         self.browse_btn = ttk.Button(file_frame, text="Browse", command=self.browse_file)
         self.browse_btn.grid(row=0, column=2, padx=5, pady=5)
@@ -65,32 +47,62 @@ class LogProcessorApp:
         # --- Model Training Section ---
         train_frame = ttk.LabelFrame(self.root, text="Model Training (DeBERTa)", padding=(10, 10))
         train_frame.pack(fill="x", padx=10, pady=5)
+        train_frame.columnconfigure(1, weight=1)
 
         ttk.Label(train_frame, text="Azure Sub ID:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.azure_sub_entry = ttk.Entry(train_frame, width=40)
-        self.azure_sub_entry.grid(row=0, column=1, columnspan=2, padx=5, pady=5)
+        self.azure_sub_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
 
         ttk.Label(train_frame, text="Tenant ID:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.azure_tenant_entry = ttk.Entry(train_frame, width=40)
-        self.azure_tenant_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=5)
+        self.azure_tenant_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
 
-        ttk.Label(train_frame, text="Environment:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(train_frame, text="Labeled Data (CSV):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self.training_filepath_entry = ttk.Entry(train_frame, width=40)
+        self.training_filepath_entry.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+
+        self.training_browse_btn = ttk.Button(train_frame, text="Browse", command=self.browse_training_file)
+        self.training_browse_btn.grid(row=2, column=2, padx=5, pady=5)
+
+        ttk.Label(train_frame, text="Environment:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
         
         self.train_mode = tk.StringVar(value="azure")
         self.azure_radio = ttk.Radiobutton(train_frame, text="Azure Cloud (Free CPU)", variable=self.train_mode, value="azure")
-        self.azure_radio.grid(row=2, column=1, sticky="w", padx=5)
+        self.azure_radio.grid(row=3, column=1, sticky="w", padx=5)
         self.local_radio = ttk.Radiobutton(train_frame, text="Local GPU (Coming Soon)", variable=self.train_mode, value="local", state="disabled")
-        self.local_radio.grid(row=2, column=2, sticky="w", padx=5)
+        self.local_radio.grid(row=3, column=2, sticky="w", padx=5)
 
-        # --- Actions Section ---
-        action_frame = ttk.Frame(self.root, padding=(10, 10))
-        action_frame.pack(fill="x", padx=10, pady=5)
+        self.get_model_btn = ttk.Button(train_frame, text="Get Model (Train)", command=self.start_training_thread)
+        self.get_model_btn.grid(row=4, column=0, columnspan=3, pady=10)
 
-        self.get_model_btn = ttk.Button(action_frame, text="Get Model (Train)", command=self.start_training_thread)
-        self.get_model_btn.pack(side="left", padx=20, expand=True)
+        # --- Hosting Section ---
+        hosting_frame = ttk.LabelFrame(self.root, text="Hosting", padding=(10, 10))
+        hosting_frame.pack(fill="x", padx=10, pady=5)
+        hosting_frame.columnconfigure(1, weight=1)
+        hosting_frame.columnconfigure(3, weight=1)
 
-        self.host_service_btn = ttk.Button(action_frame, text="Host Service", command=lambda: messagebox.showinfo("Info", "Host Service feature coming soon."))
-        self.host_service_btn.pack(side="right", padx=20, expand=True)
+        ttk.Label(hosting_frame, text="GitHub PAT:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.github_key_entry = ttk.Entry(hosting_frame, width=30, show="*")
+        self.github_key_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+
+        self.load_repos_btn = ttk.Button(hosting_frame, text="Load Repos", command=self.start_repo_thread)
+        self.load_repos_btn.grid(row=0, column=2, padx=5, pady=5)
+
+        ttk.Label(hosting_frame, text="Repository:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self.repo_combo = ttk.Combobox(hosting_frame, state="readonly", width=28)
+        self.repo_combo.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+        self.repo_combo.bind("<<ComboboxSelected>>", self.start_branch_thread)
+
+        ttk.Label(hosting_frame, text="Branch:").grid(row=1, column=2, sticky="w", padx=5, pady=5)
+        self.branch_combo = ttk.Combobox(hosting_frame, state="readonly", width=15)
+        self.branch_combo.grid(row=1, column=3, sticky="ew", padx=5, pady=5)
+
+        self.host_service_btn = ttk.Button(
+            hosting_frame,
+            text="Host Service",
+            command=lambda: messagebox.showinfo("Info", "Host Service feature coming soon.")
+        )
+        self.host_service_btn.grid(row=2, column=0, columnspan=4, pady=10)
 
         # Status Bar
         self.status_var = tk.StringVar()
@@ -167,6 +179,15 @@ class LogProcessorApp:
         if filepath:
             self.filepath_entry.delete(0, tk.END)
             self.filepath_entry.insert(0, filepath)
+
+    def browse_training_file(self):
+        filepath = filedialog.askopenfilename(
+            title="Select Labeled Data File",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*"))
+        )
+        if filepath:
+            self.training_filepath_entry.delete(0, tk.END)
+            self.training_filepath_entry.insert(0, filepath)
 
     def load_prompt(self):
         if not os.path.exists("prompt.txt"):
@@ -308,7 +329,7 @@ class LogProcessorApp:
 
     # --- HEAVILY LOGGED TRAINING METHODS ---
     def start_training_thread(self):
-        csv_path = self.filepath_entry.get().strip()
+        csv_path = self.training_filepath_entry.get().strip()
         sub_id = self.azure_sub_entry.get().strip()
         tenant_id = self.azure_tenant_entry.get().strip()
 
@@ -318,7 +339,10 @@ class LogProcessorApp:
         print(f"[DEBUG] Tenant ID: {tenant_id}")
 
         if not csv_path:
-            messagebox.showwarning("Warning", "Please select a processed CSV file first.")
+            messagebox.showwarning("Warning", "Please select a labeled CSV file for training.")
+            return
+        if not os.path.exists(csv_path):
+            messagebox.showwarning("Warning", "The selected labeled CSV file does not exist.")
             return
         if self.train_mode.get() == "azure" and not sub_id:
             messagebox.showwarning("Warning", "Please provide your Azure Subscription ID.")
@@ -416,31 +440,10 @@ class LogProcessorApp:
             # --- Define and Submit Job ---
             print(f"[DEBUG] Defining training job using target CSV: {csv_path}")
             self.root.after(0, lambda: self.status_var.set("Uploading data and starting DeBERTa training..."))
-
-            # Normalize Windows-style paths for Azure URI compatibility.
+            
+            # THE FIX: Convert Windows backslashes to forward slashes for Azure URI compatibility
             safe_csv_path = csv_path.replace("\\", "/")
             print(f"[DEBUG] Normalized safe path for Azure: {safe_csv_path}")
-
-            repo_raw = self.repo_combo.get().strip() or "manual"
-            branch_raw = self.branch_combo.get().strip() or "unknown"
-
-            def _safe_name(value):
-                cleaned = "".join(ch if (ch.isalnum() or ch in "-_") else "-" for ch in value)
-                cleaned = cleaned.strip("-_")
-                return cleaned or "na"
-
-            mlflow_run_name = f"{_safe_name(repo_raw)}-{_safe_name(branch_raw)}-{int(time.time())}"
-            registry_model_name = "log-monitor-deberta-classifier"
-            training_command = (
-                "pip install datasets transformers pandas accelerate sentencepiece protobuf "
-                "mlflow scikit-learn && "
-                "python train.py "
-                "--data ${{inputs.training_data}} "
-                "--experiment-name deberta-log-classification "
-                f"--run-name {mlflow_run_name} "
-                "--register-model "
-                f"--registry-model-name {registry_model_name}"
-            )
 
             job = command(
                 inputs={
@@ -448,8 +451,9 @@ class LogProcessorApp:
                 },
                 compute=compute_name,
                 environment="AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest", 
-                code=".", # Uploads train.py from current directory
-                command=training_command,
+                code=".", 
+                # THE FIX: Chain a pip install command right before running train.py
+                command="pip install datasets transformers pandas accelerate sentencepiece protobuf && python train.py --data ${{inputs.training_data}}",
                 experiment_name="deberta-log-classification",
             )
 

@@ -1,9 +1,6 @@
 requests
 pandas
-numpy
-mlflow
 datasets
-scikit-learn
 transformers
 torch
 accelerate

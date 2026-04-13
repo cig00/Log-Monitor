@@ -5,6 +5,8 @@ import requests
 import pandas as pd
 import json
 import os
+import subprocess
+import sys
 import time
 import traceback
 
@@ -57,23 +59,70 @@ class LogProcessorApp:
         self.azure_tenant_entry = ttk.Entry(train_frame, width=40)
         self.azure_tenant_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
 
-        ttk.Label(train_frame, text="Labeled Data (CSV):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(train_frame, text="Azure Compute:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self.azure_compute_var = tk.StringVar(value="cpu")
+        self.azure_compute_combo = ttk.Combobox(
+            train_frame,
+            textvariable=self.azure_compute_var,
+            state="readonly",
+            values=["cpu", "gpu"],
+            width=16,
+        )
+        self.azure_compute_combo.grid(row=2, column=1, sticky="w", padx=5, pady=5)
+
+        ttk.Label(train_frame, text="Labeled Data (CSV):").grid(row=3, column=0, sticky="w", padx=5, pady=5)
         self.training_filepath_entry = ttk.Entry(train_frame, width=40)
-        self.training_filepath_entry.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+        self.training_filepath_entry.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
 
         self.training_browse_btn = ttk.Button(train_frame, text="Browse", command=self.browse_training_file)
-        self.training_browse_btn.grid(row=2, column=2, padx=5, pady=5)
+        self.training_browse_btn.grid(row=3, column=2, padx=5, pady=5)
 
-        ttk.Label(train_frame, text="Environment:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(train_frame, text="Environment:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
         
         self.train_mode = tk.StringVar(value="azure")
-        self.azure_radio = ttk.Radiobutton(train_frame, text="Azure Cloud (Free CPU)", variable=self.train_mode, value="azure")
-        self.azure_radio.grid(row=3, column=1, sticky="w", padx=5)
-        self.local_radio = ttk.Radiobutton(train_frame, text="Local GPU (Coming Soon)", variable=self.train_mode, value="local", state="disabled")
-        self.local_radio.grid(row=3, column=2, sticky="w", padx=5)
+        self.azure_radio = ttk.Radiobutton(
+            train_frame,
+            text="Azure Cloud",
+            variable=self.train_mode,
+            value="azure",
+            command=self.on_train_mode_change,
+        )
+        self.azure_radio.grid(row=4, column=1, sticky="w", padx=5)
+        self.local_radio = ttk.Radiobutton(
+            train_frame,
+            text="Local Device (CPU/GPU)",
+            variable=self.train_mode,
+            value="local",
+            command=self.on_train_mode_change,
+        )
+        self.local_radio.grid(row=4, column=2, sticky="w", padx=5)
+
+        ttk.Label(train_frame, text="Local Device:").grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        self.local_device_var = tk.StringVar(value="auto")
+        self.local_device_combo = ttk.Combobox(
+            train_frame,
+            textvariable=self.local_device_var,
+            state="readonly",
+            values=["auto", "cpu", "cuda"],
+            width=16,
+        )
+        self.local_device_combo.grid(row=5, column=1, sticky="w", padx=5, pady=5)
+        self.local_device_combo.bind("<<ComboboxSelected>>", self.on_local_device_change)
+
+        self.local_runtime_label = ttk.Label(train_frame, text="Local Runtime:")
+        self.local_runtime_label.grid(row=6, column=0, sticky="w", padx=5, pady=5)
+        self.local_runtime_var = tk.StringVar(value="host")
+        self.local_runtime_combo = ttk.Combobox(
+            train_frame,
+            textvariable=self.local_runtime_var,
+            state="disabled",
+            values=["host", "container"],
+            width=16,
+        )
+        self.local_runtime_combo.grid(row=6, column=1, sticky="w", padx=5, pady=5)
 
         self.get_model_btn = ttk.Button(train_frame, text="Get Model (Train)", command=self.start_training_thread)
-        self.get_model_btn.grid(row=4, column=0, columnspan=3, pady=10)
+        self.get_model_btn.grid(row=7, column=0, columnspan=3, pady=10)
 
         # --- Hosting Section ---
         hosting_frame = ttk.LabelFrame(self.root, text="Hosting", padding=(10, 10))
@@ -109,6 +158,8 @@ class LogProcessorApp:
         self.status_var.set("Ready")
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w")
         status_bar.pack(side="bottom", fill="x")
+        self._last_local_device = self.local_device_var.get()
+        self.on_train_mode_change()
 
     # --- GitHub Repos/Branches Methods ---
     def start_repo_thread(self):
@@ -194,6 +245,44 @@ class LogProcessorApp:
             raise FileNotFoundError("Could not find 'prompt.txt' in the application directory.")
         with open("prompt.txt", "r") as file:
             return file.read()
+
+    def on_train_mode_change(self):
+        is_azure = self.train_mode.get() == "azure"
+        azure_state = "normal" if is_azure else "disabled"
+        azure_compute_state = "readonly" if is_azure else "disabled"
+        local_state = "disabled" if is_azure else "readonly"
+
+        self.azure_sub_entry.config(state=azure_state)
+        self.azure_tenant_entry.config(state=azure_state)
+        self.azure_compute_combo.config(state=azure_compute_state)
+        self.local_device_combo.config(state=local_state)
+
+        if is_azure:
+            self.local_runtime_label.grid_remove()
+            self.local_runtime_combo.grid_remove()
+            self.local_runtime_var.set("host")
+            self.local_runtime_combo.config(state="disabled")
+        else:
+            self.local_runtime_label.grid()
+            self.local_runtime_combo.grid()
+            self.on_local_device_change()
+
+    def on_local_device_change(self, event=None):
+        if self.train_mode.get() != "local":
+            self.local_runtime_var.set("host")
+            self.local_runtime_combo.config(state="disabled")
+            return
+
+        current_device = self.local_device_var.get().strip() or "auto"
+        if current_device == "cuda":
+            if self._last_local_device != "cuda":
+                self.local_runtime_var.set("container")
+            self.local_runtime_combo.config(state="readonly")
+        else:
+            self.local_runtime_var.set("host")
+            self.local_runtime_combo.config(state="disabled")
+
+        self._last_local_device = current_device
 
     def prepare_data(self):
         token = self.github_key_entry.get().strip()
@@ -332,11 +421,18 @@ class LogProcessorApp:
         csv_path = self.training_filepath_entry.get().strip()
         sub_id = self.azure_sub_entry.get().strip()
         tenant_id = self.azure_tenant_entry.get().strip()
+        azure_compute = self.azure_compute_var.get().strip().lower() or "cpu"
+        local_device = self.local_device_var.get().strip() or "auto"
+        local_runtime = self.local_runtime_var.get().strip() or "host"
 
         print("\n--- [DEBUG] STARTING TRAINING WORKFLOW ---")
         print(f"[DEBUG] CSV Path: {csv_path}")
         print(f"[DEBUG] Sub ID: {sub_id}")
         print(f"[DEBUG] Tenant ID: {tenant_id}")
+        print(f"[DEBUG] Azure Compute: {azure_compute}")
+        print(f"[DEBUG] Train Mode: {self.train_mode.get()}")
+        print(f"[DEBUG] Local Device: {local_device}")
+        print(f"[DEBUG] Local Runtime: {local_runtime}")
 
         if not csv_path:
             messagebox.showwarning("Warning", "Please select a labeled CSV file for training.")
@@ -354,15 +450,136 @@ class LogProcessorApp:
             messagebox.showerror("Error", "Could not find 'train.py' in the app directory.")
             return
 
-        self.get_model_btn.config(state="disabled")
-        self.status_var.set("Initializing authentication...")
-        
         if self.train_mode.get() == "azure":
-            threading.Thread(target=self.run_azure_training, args=(csv_path, sub_id, tenant_id), daemon=True).start()
+            self.get_model_btn.config(state="disabled")
+            self.status_var.set("Initializing authentication...")
+            threading.Thread(
+                target=self.run_azure_training,
+                args=(csv_path, sub_id, tenant_id, azure_compute),
+                daemon=True,
+            ).start()
+        else:
+            if local_device != "cuda":
+                local_runtime = "host"
 
-    def run_azure_training(self, csv_path, sub_id, tenant_id):
+            if local_device == "cuda" and local_runtime == "host":
+                available, check_error = self.check_host_cuda_available()
+                if not available:
+                    hint = (
+                        "CUDA is not available in the host Python environment.\n\n"
+                        "Switch Local Runtime to 'container' or install CUDA-enabled PyTorch locally."
+                    )
+                    if check_error:
+                        hint += f"\n\nDetails:\n{check_error}"
+                    messagebox.showerror("CUDA Not Available", hint)
+                    return
+
+            self.get_model_btn.config(state="disabled")
+            self.status_var.set("Preparing local training...")
+            threading.Thread(
+                target=self.run_local_training,
+                args=(csv_path, local_device, local_runtime),
+                daemon=True,
+            ).start()
+
+    def check_host_cuda_available(self):
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", "import torch; print('1' if torch.cuda.is_available() else '0')"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip() == "1", None
+        except Exception as exc:
+            return False, str(exc)
+
+    def run_local_training(self, csv_path, device, runtime):
+        try:
+            project_dir = os.path.dirname(os.path.abspath(__file__))
+            backend = "container" if runtime == "container" else "host"
+
+            if backend == "container":
+                docker_script = os.path.join(project_dir, "scripts", "train_docker.sh")
+                if not os.path.exists(docker_script):
+                    raise FileNotFoundError("Could not find scripts/train_docker.sh in the app directory.")
+                command_args = ["bash", docker_script, csv_path]
+                process_env = os.environ.copy()
+                process_env["DEVICE"] = device
+            else:
+                train_script = os.path.join(project_dir, "train.py")
+                if not os.path.exists(train_script):
+                    raise FileNotFoundError("Could not find 'train.py' in the app directory.")
+                command_args = [sys.executable, train_script, "--data", csv_path]
+                process_env = os.environ.copy()
+                if device == "cpu":
+                    process_env["CUDA_VISIBLE_DEVICES"] = "-1"
+
+            self.root.after(
+                0,
+                lambda: self.status_var.set(
+                    f"Starting local {backend} training on device: {device}..."
+                ),
+            )
+
+            process = subprocess.Popen(
+                command_args,
+                cwd=project_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=process_env,
+            )
+
+            if process.stdout:
+                for line in process.stdout:
+                    clean_line = line.strip()
+                    if clean_line:
+                        print(f"[LOCAL-TRAIN] {clean_line}")
+                        self.root.after(
+                            0,
+                            lambda msg=clean_line: self.status_var.set(msg[:150]),
+                        )
+
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(f"Local training failed with exit code {return_code}.")
+
+            model_path = os.path.abspath(os.path.join(project_dir, "outputs", "final_model"))
+            self.root.after(0, lambda: self.status_var.set("Local training completed successfully."))
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Success",
+                    f"Local {backend} model training completed.\n\nModel saved to:\n{model_path}",
+                ),
+            )
+        except Exception as e:
+            print("\n--- [DEBUG] LOCAL TRAINING EXCEPTION ---")
+            traceback.print_exc()
+            print("----------------------------------------\n")
+            self.root.after(
+                0,
+                lambda err=str(e): messagebox.showerror(
+                    "Training Error",
+                    f"An error occurred during local training.\n\n{err}",
+                ),
+            )
+            self.root.after(0, lambda: self.status_var.set("Local training failed."))
+        finally:
+            self.root.after(0, lambda: self.get_model_btn.config(state="normal"))
+            self.root.after(0, lambda: self.status_var.set("Ready"))
+
+    def run_azure_training(self, csv_path, sub_id, tenant_id, azure_compute):
         ml_client = None
-        compute_name = "cpu-cluster-temp"
+        compute_mode = "gpu" if azure_compute == "gpu" else "cpu"
+        if compute_mode == "gpu":
+            compute_name = "gpu-cluster-temp"
+            compute_size = "Standard_NC4as_T4_v3"
+        else:
+            compute_name = "cpu-cluster-temp"
+            compute_size = "Standard_D2as_v4"
         compute_created = False
         resource_group = "LogClassifier-RG"
         workspace_name = "LogClassifier-Workspace"
@@ -424,11 +641,16 @@ class LogProcessorApp:
 
             # --- Create Compute Cluster ---
             print(f"[DEBUG] Checking/Provisioning Compute Cluster: {compute_name}...")
-            self.root.after(0, lambda: self.status_var.set("Provisioning CPU cluster (Standard_D2as_v4)..."))
+            self.root.after(
+                0,
+                lambda: self.status_var.set(
+                    f"Provisioning {compute_mode.upper()} cluster ({compute_size})..."
+                ),
+            )
             compute = AmlCompute(
                 name=compute_name,
                 type="amlcompute",
-                size="Standard_D2as_v4", 
+                size=compute_size,
                 min_instances=0,
                 max_instances=1,
                 idle_time_before_scale_down=120

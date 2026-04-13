@@ -1,0 +1,14 @@
+requests
+pandas
+numpy
+mlflow
+datasets
+scikit-learn
+transformers
+torch
+accelerate
+sentencepiece
+protobuf
+azure-identity
+azure-ai-ml
+azure-mgmt-resource

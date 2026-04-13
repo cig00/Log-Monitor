@@ -416,10 +416,31 @@ class LogProcessorApp:
             # --- Define and Submit Job ---
             print(f"[DEBUG] Defining training job using target CSV: {csv_path}")
             self.root.after(0, lambda: self.status_var.set("Uploading data and starting DeBERTa training..."))
-            
-            # THE FIX: Convert Windows backslashes to forward slashes for Azure URI compatibility
+
+            # Normalize Windows-style paths for Azure URI compatibility.
             safe_csv_path = csv_path.replace("\\", "/")
             print(f"[DEBUG] Normalized safe path for Azure: {safe_csv_path}")
+
+            repo_raw = self.repo_combo.get().strip() or "manual"
+            branch_raw = self.branch_combo.get().strip() or "unknown"
+
+            def _safe_name(value):
+                cleaned = "".join(ch if (ch.isalnum() or ch in "-_") else "-" for ch in value)
+                cleaned = cleaned.strip("-_")
+                return cleaned or "na"
+
+            mlflow_run_name = f"{_safe_name(repo_raw)}-{_safe_name(branch_raw)}-{int(time.time())}"
+            registry_model_name = "log-monitor-deberta-classifier"
+            training_command = (
+                "pip install datasets transformers pandas accelerate sentencepiece protobuf "
+                "mlflow scikit-learn && "
+                "python train.py "
+                "--data ${{inputs.training_data}} "
+                "--experiment-name deberta-log-classification "
+                f"--run-name {mlflow_run_name} "
+                "--register-model "
+                f"--registry-model-name {registry_model_name}"
+            )
 
             job = command(
                 inputs={
@@ -427,9 +448,8 @@ class LogProcessorApp:
                 },
                 compute=compute_name,
                 environment="AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest", 
-                code=".", 
-                # THE FIX: Chain a pip install command right before running train.py
-                command="pip install datasets transformers pandas accelerate sentencepiece protobuf && python train.py --data ${{inputs.training_data}}",
+                code=".", # Uploads train.py from current directory
+                command=training_command,
                 experiment_name="deberta-log-classification",
             )
 

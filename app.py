@@ -452,8 +452,16 @@ class LogProcessorApp:
                 compute=compute_name,
                 environment="AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest", 
                 code=".", 
-                # THE FIX: Chain a pip install command right before running train.py
-                command="pip install datasets transformers pandas accelerate sentencepiece protobuf && python train.py --data ${{inputs.training_data}}",
+                # Install versions that remain compatible with the curated Torch 1.10 Azure image.
+                command=(
+                    "pip install --upgrade "
+                    "numpy==1.23.5 "
+                    "pandas==1.5.3 "
+                    "transformers==4.24.0 "
+                    "sentencepiece==0.1.99 "
+                    "protobuf==3.20.3 "
+                    "&& USE_TF=0 python train.py --data ${{inputs.training_data}}"
+                ),
                 experiment_name="deberta-log-classification",
             )
 

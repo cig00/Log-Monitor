@@ -6,6 +6,7 @@ import pandas as pd
 import json
 import os
 import time
+import traceback
 
 # Azure ML Imports
 from azure.identity import InteractiveBrowserCredential
@@ -17,7 +18,7 @@ class LogProcessorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Log Classifier & DeBERTa Trainer")
-        self.root.geometry("650x600")
+        self.root.geometry("650x650")
         self.root.resizable(False, False)
 
         # UI Styling
@@ -69,13 +70,17 @@ class LogProcessorApp:
         self.azure_sub_entry = ttk.Entry(train_frame, width=40)
         self.azure_sub_entry.grid(row=0, column=1, columnspan=2, padx=5, pady=5)
 
-        ttk.Label(train_frame, text="Environment:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(train_frame, text="Tenant ID:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self.azure_tenant_entry = ttk.Entry(train_frame, width=40)
+        self.azure_tenant_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=5)
+
+        ttk.Label(train_frame, text="Environment:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
         
         self.train_mode = tk.StringVar(value="azure")
         self.azure_radio = ttk.Radiobutton(train_frame, text="Azure Cloud (Free CPU)", variable=self.train_mode, value="azure")
-        self.azure_radio.grid(row=1, column=1, sticky="w", padx=5)
+        self.azure_radio.grid(row=2, column=1, sticky="w", padx=5)
         self.local_radio = ttk.Radiobutton(train_frame, text="Local GPU (Coming Soon)", variable=self.train_mode, value="local", state="disabled")
-        self.local_radio.grid(row=1, column=2, sticky="w", padx=5)
+        self.local_radio.grid(row=2, column=2, sticky="w", padx=5)
 
         # --- Actions Section ---
         action_frame = ttk.Frame(self.root, padding=(10, 10))
@@ -198,7 +203,6 @@ class LogProcessorApp:
             system_prompt = self.load_prompt()
             df = pd.read_csv(input_path)
             
-            # Find the log column
             log_col = None
             for col in df.columns:
                 if any(keyword in col.lower() for keyword in ['log', 'message', 'msg', 'text']):
@@ -235,7 +239,6 @@ class LogProcessorApp:
                     "temperature": 0.1
                 }
 
-                # Robust Retry Logic with Exponential Backoff
                 max_retries = 5
                 base_delay = 5 
                 success = False
@@ -256,7 +259,7 @@ class LogProcessorApp:
                     break 
 
                 if not success:
-                    raise Exception("Max retries reached. The API is persistently rejecting requests due to rate limits.")
+                    raise Exception("Max retries reached. API rejecting requests due to rate limits.")
                 
                 result_json = response.json()
                 llm_content = result_json['choices'][0]['message']['content']
@@ -284,7 +287,6 @@ class LogProcessorApp:
                         
                 time.sleep(1.5) 
 
-            # If the loop finishes completely without errors
             output_df = pd.DataFrame(processed_logs)
             output_df.to_csv(save_path, index=False)
             
@@ -292,29 +294,37 @@ class LogProcessorApp:
             self.root.after(0, lambda: messagebox.showinfo("Success", f"Data saved to:\n{save_path}"))
 
         except Exception as e:
-            # Partial Save Logic
             if processed_logs:
                 output_df = pd.DataFrame(processed_logs)
                 output_df.to_csv(save_path, index=False)
                 error_msg = f"An error stopped the process: {e}\n\nHowever, partial data ({len(processed_logs)} rows) was successfully saved to:\n{save_path}"
             else:
-                error_msg = f"Error processing file: {e}\n\nNo data was saved because the error occurred before the first batch finished."
+                error_msg = f"Error processing file: {e}\n\nNo data was saved."
             
             self.root.after(0, self.show_error, error_msg)
 
         finally:
             self.root.after(0, lambda: self.prepare_btn.config(state="normal"))
 
-    # --- Training Methods ---
+    # --- HEAVILY LOGGED TRAINING METHODS ---
     def start_training_thread(self):
         csv_path = self.filepath_entry.get().strip()
         sub_id = self.azure_sub_entry.get().strip()
+        tenant_id = self.azure_tenant_entry.get().strip()
+
+        print("\n--- [DEBUG] STARTING TRAINING WORKFLOW ---")
+        print(f"[DEBUG] CSV Path: {csv_path}")
+        print(f"[DEBUG] Sub ID: {sub_id}")
+        print(f"[DEBUG] Tenant ID: {tenant_id}")
 
         if not csv_path:
             messagebox.showwarning("Warning", "Please select a processed CSV file first.")
             return
         if self.train_mode.get() == "azure" and not sub_id:
-            messagebox.showwarning("Warning", "Please provide your Azure Subscription ID for cloud training.")
+            messagebox.showwarning("Warning", "Please provide your Azure Subscription ID.")
+            return
+        if self.train_mode.get() == "azure" and not tenant_id:
+            messagebox.showwarning("Warning", "Please provide your Azure Tenant ID.")
             return
         if not os.path.exists("train.py"):
             messagebox.showerror("Error", "Could not find 'train.py' in the app directory.")
@@ -324,9 +334,9 @@ class LogProcessorApp:
         self.status_var.set("Initializing authentication...")
         
         if self.train_mode.get() == "azure":
-            threading.Thread(target=self.run_azure_training, args=(csv_path, sub_id), daemon=True).start()
+            threading.Thread(target=self.run_azure_training, args=(csv_path, sub_id, tenant_id), daemon=True).start()
 
-    def run_azure_training(self, csv_path, sub_id):
+    def run_azure_training(self, csv_path, sub_id, tenant_id):
         ml_client = None
         compute_name = "cpu-cluster-temp"
         compute_created = False
@@ -334,113 +344,155 @@ class LogProcessorApp:
         workspace_name = "LogClassifier-Workspace"
 
         try:
-            # 1. Authenticate (This will open a browser window for the user)
+            print(f"[DEBUG] Attempting Interactive Browser Login to Tenant: {tenant_id}")
             self.root.after(0, lambda: self.status_var.set("Please log in to Azure in your web browser..."))
-            credential = InteractiveBrowserCredential()
             
+            # Authenticate directly to the correct Tenant
+            credential = InteractiveBrowserCredential(tenant_id=tenant_id)
             ml_client = MLClient(credential, sub_id, resource_group, workspace_name)
+            print("[DEBUG] MLClient instantiated successfully.")
 
-            # --- UPDATED: Check for Resource Group before creating ---
+            # --- Check / Create Resource Group ---
+            print(f"[DEBUG] Checking existence of Resource Group: {resource_group}")
             self.root.after(0, lambda: self.status_var.set("Checking Resource Group..."))
             resource_client = ResourceManagementClient(credential, sub_id)
             
             try:
-                # Try to get the group. If this works, we skip creation.
                 resource_client.resource_groups.get(resource_group)
-                print(f"Resource Group {resource_group} already exists. Using it.")
-            except:
-                # Only try to create it if it DOESN'T exist
+                print(f"[DEBUG] SUCCESS: Resource Group '{resource_group}' already exists. Skipping creation.")
+            except Exception as e:
+                print(f"[DEBUG] Resource group not found. Reason: {e}")
+                print(f"[DEBUG] Attempting to create Resource Group '{resource_group}'...")
                 self.root.after(0, lambda: self.status_var.set("Creating Resource Group..."))
                 resource_client.resource_groups.create_or_update(
                     resource_group, 
                     {"location": "eastus"}
                 )
-           
-            # --- NEW: Auto-Register Machine Learning Services ---
+                print(f"[DEBUG] SUCCESS: Resource Group '{resource_group}' created.")
+
+            # --- Auto-Register Machine Learning Services ---
+            print("[DEBUG] Verifying Microsoft.MachineLearningServices provider registration...")
             self.root.after(0, lambda: self.status_var.set("Verifying Azure ML registration..."))
-            resource_client = ResourceManagementClient(credential, sub_id)
-            
-            # Tell Azure to register the ML provider (safe to call even if already registered)
             resource_client.providers.register('Microsoft.MachineLearningServices')
             
-            # Wait for it to finish (Azure takes 1-2 minutes to register a new service)
             while True:
                 provider_info = resource_client.providers.get('Microsoft.MachineLearningServices')
+                print(f"[DEBUG] Provider State: {provider_info.registration_state}")
                 if provider_info.registration_state == 'Registered':
+                    print("[DEBUG] SUCCESS: Provider is fully Registered.")
                     break
-                self.root.after(0, lambda: self.status_var.set("First-time setup: Activating ML Services on Azure (takes 1-2 mins)..."))
-                time.sleep(15)
+                self.root.after(0, lambda: self.status_var.set("Activating ML Services on Azure (takes 1-2 mins)..."))
+                time.sleep(10)
 
-            # 2. Create Workspace (if it doesn't exist)
+            # --- Check / Create Workspace ---
+            print(f"[DEBUG] Checking existence of ML Workspace: {workspace_name}")
             self.root.after(0, lambda: self.status_var.set("Ensuring Azure ML Workspace exists..."))
-            ws = Workspace(name=workspace_name, location="eastus")
-            ml_client.workspaces.begin_create(ws).result()
+            try:
+                ml_client.workspaces.get(workspace_name)
+                print(f"[DEBUG] SUCCESS: Workspace '{workspace_name}' already exists. Skipping creation.")
+            except Exception as e:
+                print(f"[DEBUG] Workspace not found or inaccessible. Reason: {e}")
+                print(f"[DEBUG] Attempting to create ML Workspace '{workspace_name}' (This takes a minute)...")
+                self.root.after(0, lambda: self.status_var.set("Creating ML Workspace..."))
+                ws = Workspace(name=workspace_name, location="eastus")
+                ml_client.workspaces.begin_create(ws).result()
+                print(f"[DEBUG] SUCCESS: Workspace '{workspace_name}' created.")
 
-            # 3. Create Compute Cluster
+            # --- Create Compute Cluster ---
+            print(f"[DEBUG] Checking/Provisioning Compute Cluster: {compute_name}...")
             self.root.after(0, lambda: self.status_var.set("Provisioning CPU cluster (Standard_D2as_v4)..."))
             compute = AmlCompute(
                 name=compute_name,
                 type="amlcompute",
-                size="Standard_D2as_v4", # Cheap, valid on free trial
+                size="Standard_D2as_v4", 
                 min_instances=0,
                 max_instances=1,
                 idle_time_before_scale_down=120
             )
             ml_client.compute.begin_create_or_update(compute).result()
             compute_created = True
+            print(f"[DEBUG] SUCCESS: Compute cluster '{compute_name}' is ready.")
 
-            # 4. Define and Submit Job
+            # --- Define and Submit Job ---
+            print(f"[DEBUG] Defining training job using target CSV: {csv_path}")
             self.root.after(0, lambda: self.status_var.set("Uploading data and starting DeBERTa training..."))
+            
+            # THE FIX: Convert Windows backslashes to forward slashes for Azure URI compatibility
+            safe_csv_path = csv_path.replace("\\", "/")
+            print(f"[DEBUG] Normalized safe path for Azure: {safe_csv_path}")
+
             job = command(
-                inputs={"training_data": Input(type="uri_file", path=csv_path)},
+                inputs={
+                    "training_data": Input(type="uri_file", path=safe_csv_path, mode="download")
+                },
                 compute=compute_name,
-                # Pre-built PyTorch environment provided by Azure
                 environment="AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest", 
-                code=".", # Uploads train.py from current directory
-                command="python train.py --data ${{inputs.training_data}}",
+                code=".", 
+                # THE FIX: Chain a pip install command right before running train.py
+                command="pip install datasets transformers pandas accelerate sentencepiece protobuf && python train.py --data ${{inputs.training_data}}",
                 experiment_name="deberta-log-classification",
             )
 
+            print("[DEBUG] Submitting job to Azure...")
             returned_job = ml_client.jobs.create_or_update(job)
+            print(f"[DEBUG] SUCCESS: Job submitted! Job Name: {returned_job.name}")
 
-            # 5. Polling Loop
+            # --- Polling Loop ---
+            print("[DEBUG] Beginning polling loop for job completion...")
             while True:
                 job_status = ml_client.jobs.get(returned_job.name).status
+                print(f"[DEBUG] Azure Job Status: {job_status}")
                 self.root.after(0, lambda s=job_status: self.status_var.set(f"Training in progress. Azure Status: {s}"))
                 if job_status in ["Completed", "Failed", "Canceled"]:
                     break
                 time.sleep(30)
 
             if job_status == "Failed":
-                raise Exception("The training job failed on the Azure machine.")
+                print("[DEBUG] FATAL: Job failed on the Azure side.")
+                raise Exception("The training job failed on the Azure machine. Check Azure Portal logs.")
 
-            # 6. Download Model
+            # --- Download Model ---
+            print("[DEBUG] Job Completed! Attempting to download outputs...")
             self.root.after(0, lambda: self.status_var.set("Training Complete! Downloading model..."))
             download_path = "./downloaded_model"
             ml_client.jobs.download(name=returned_job.name, download_path=download_path, all=False)
+            print(f"[DEBUG] SUCCESS: Files downloaded to {download_path}")
             
             self.root.after(0, lambda: messagebox.showinfo("Success", f"Model trained and downloaded to:\n{os.path.abspath(download_path)}"))
 
         except Exception as e:
-            self.root.after(0, lambda err=str(e): messagebox.showerror("Training Error", f"An error occurred:\n\n{err}"))
+            print("\n--- [DEBUG] AN EXCEPTION OCCURRED ---")
+            traceback.print_exc() 
+            print("--------------------------------------\n")
+            
+            self.root.after(0, lambda err=str(e): messagebox.showerror("Training Error", f"An error occurred. Check the terminal for full details.\n\n{err}"))
             self.root.after(0, lambda: self.status_var.set("Process halted due to error."))
 
         finally:
             # --- THE CRITICAL CLEANUP BLOCK ---
+            print("[DEBUG] Entering cleanup block...")
             if ml_client and compute_created:
                 self.root.after(0, lambda: self.status_var.set("Destroying compute cluster to prevent charges..."))
+                print(f"[DEBUG] Issuing delete command for compute cluster '{compute_name}'...")
                 try:
                     ml_client.compute.begin_delete(compute_name).result()
-                    print("Cleanup successful: Compute cluster deleted.")
+                    print(f"[DEBUG] SUCCESS: Compute cluster '{compute_name}' permanently deleted.")
                 except Exception as cleanup_error:
-                    print(f"CRITICAL: Failed to delete cluster: {cleanup_error}")
+                    print("\n--- [DEBUG] FATAL CLEANUP ERROR ---")
+                    print(f"FAILED TO DELETE CLUSTER {compute_name}. You may be charged!")
+                    traceback.print_exc()
+                    print("--------------------------------------\n")
+            else:
+                print("[DEBUG] Cleanup bypassed: Compute cluster was never fully created.")
             
+            print("[DEBUG] WORKFLOW FINISHED.\n")
             self.root.after(0, lambda: self.status_var.set("Ready"))
             self.root.after(0, lambda: self.get_model_btn.config(state="normal"))
 
     def show_error(self, message):
         self.status_var.set("Process halted.")
         messagebox.showerror("Notice", message)
+
 
 if __name__ == "__main__":
     root = tk.Tk()

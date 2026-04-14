@@ -9,3 +9,5 @@ protobuf
 azure-identity
 azure-ai-ml
 azure-mgmt-resource
+mlflow==2.9.2
+scikit-learn

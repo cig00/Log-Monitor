@@ -2,3 +2,5 @@ agents.md
 outputs/
 downloaded_model/
 __pycache__/
+mlruns/
+*.mlmeta.json

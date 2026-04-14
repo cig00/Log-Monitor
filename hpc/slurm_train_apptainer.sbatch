@@ -36,6 +36,22 @@ fi
 OUTPUT_DIR="${OUTPUT_DIR:-${SLURM_SUBMIT_DIR}/outputs}"
 mkdir -p "${OUTPUT_DIR}"
 
+MLOPS_KEYS=(
+  MLOPS_ENABLED
+  MLFLOW_TRACKING_URI
+  MLFLOW_EXPERIMENT_NAME
+  MLFLOW_PIPELINE_ID
+  MLFLOW_PARENT_RUN_ID
+  MLFLOW_RUN_SOURCE
+  MLFLOW_TAGS_JSON
+)
+
+for key in "${MLOPS_KEYS[@]}"; do
+  if [[ -n "${!key:-}" ]]; then
+    export "APPTAINERENV_${key}=${!key}"
+  fi
+done
+
 apptainer exec --nv \
   --bind "${OUTPUT_DIR}:/workspace/outputs" \
   --bind "$(dirname "${DATA_PATH}"):/data:ro" \

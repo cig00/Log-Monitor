@@ -21,6 +21,7 @@ RUN python -m pip install --upgrade pip \
     && pip install -r /workspace/requirements.train.txt
 
 COPY train.py /workspace/train.py
+COPY mlops_utils.py /workspace/mlops_utils.py
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "train.py", "--help"]

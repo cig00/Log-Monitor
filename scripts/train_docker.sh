@@ -35,6 +35,22 @@ if [[ "${DEVICE}" == "cpu" ]]; then
   ENV_FLAGS=(-e CUDA_VISIBLE_DEVICES=-1)
 fi
 
+MLOPS_KEYS=(
+  MLOPS_ENABLED
+  MLFLOW_TRACKING_URI
+  MLFLOW_EXPERIMENT_NAME
+  MLFLOW_PIPELINE_ID
+  MLFLOW_PARENT_RUN_ID
+  MLFLOW_RUN_SOURCE
+  MLFLOW_TAGS_JSON
+)
+
+for key in "${MLOPS_KEYS[@]}"; do
+  if [[ -n "${!key:-}" ]]; then
+    ENV_FLAGS+=(-e "${key}=${!key}")
+  fi
+done
+
 docker run --rm \
   "${GPU_FLAGS[@]}" \
   "${ENV_FLAGS[@]}" \

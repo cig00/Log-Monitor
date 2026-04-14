@@ -53,6 +53,14 @@ class TrainingInterrupted(Exception):
 class LogProcessorApp:
     RESOURCE_GROUP = "LogClassifier-RG"
     WORKSPACE_NAME = "LogClassifier-Workspace"
+    OPENAI_LABEL_MODELS = (
+        "gpt-5-mini",
+        "gpt-4.1-mini",
+        "gpt-4.1",
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-5.2",
+    )
 
     def __init__(self, root):
         self.root = root
@@ -116,8 +124,23 @@ class LogProcessorApp:
         self.browse_btn = ttk.Button(file_frame, text="Browse", command=self.browse_file)
         self.browse_btn.grid(row=0, column=2, padx=5, pady=5)
 
-        self.prepare_btn = ttk.Button(file_frame, text="Prepare Data (GPT-4o)", command=self.prepare_data)
-        self.prepare_btn.grid(row=1, column=0, columnspan=3, pady=10)
+        ttk.Label(file_frame, text="OpenAI API Key:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self.openai_api_key_entry = ttk.Entry(file_frame, width=40, show="*")
+        self.openai_api_key_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+
+        ttk.Label(file_frame, text="OpenAI Model:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self.openai_model_var = tk.StringVar(value=self.OPENAI_LABEL_MODELS[0])
+        self.openai_model_combo = ttk.Combobox(
+            file_frame,
+            textvariable=self.openai_model_var,
+            values=self.OPENAI_LABEL_MODELS,
+            state="normal",
+            width=37,
+        )
+        self.openai_model_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+
+        self.prepare_btn = ttk.Button(file_frame, text="Prepare Data (OpenAI)", command=self.prepare_data)
+        self.prepare_btn.grid(row=3, column=0, columnspan=3, pady=10)
 
         # --- Model Training Section ---
         train_frame = ttk.LabelFrame(self.content_frame, text="Model Training (DeBERTa)", padding=(10, 10))
@@ -513,9 +536,10 @@ class LogProcessorApp:
             self.training_filepath_entry.insert(0, filepath)
 
     def load_prompt(self):
-        if not os.path.exists("prompt.txt"):
+        prompt_path = os.path.join(self.project_dir, "prompt.txt")
+        if not os.path.exists(prompt_path):
             raise FileNotFoundError("Could not find 'prompt.txt' in the application directory.")
-        with open("prompt.txt", "r") as file:
+        with open(prompt_path, "r", encoding="utf-8") as file:
             return file.read()
 
     def on_mlflow_enabled_change(self):
@@ -576,7 +600,12 @@ class LogProcessorApp:
             traceback.print_exc()
             return ""
 
-    def resolve_mlflow_config(self, require_tracking_uri: bool, ml_client: MLClient | None = None):
+    def resolve_mlflow_config(
+        self,
+        require_tracking_uri: bool,
+        ml_client: MLClient | None = None,
+        soft_disable: bool = False,
+    ):
         enabled = bool(self.mlflow_enabled_var.get())
         backend = self.mlflow_backend_var.get().strip() or "local"
         experiment_name = clean_optional_string(self.mlflow_experiment_var.get())
@@ -593,7 +622,17 @@ class LogProcessorApp:
         if not enabled:
             return config, None
 
+        def soft_disabled(reason: str):
+            fallback = dict(config)
+            fallback["enabled"] = False
+            fallback["tracking_uri"] = ""
+            fallback["disabled_reason"] = reason
+            print(f"[MLOPS] {reason} Proceeding with MLflow disabled.")
+            return fallback, None
+
         if mlflow is None:
+            if soft_disable:
+                return soft_disabled("MLflow is enabled in UI, but the `mlflow` package is not available.")
             return config, "MLflow is enabled in UI, but the `mlflow` package is not available."
 
         missing_fields: list[str] = []
@@ -603,6 +642,15 @@ class LogProcessorApp:
             missing_fields.append("Registered Model")
         if missing_fields:
             fields_text = ", ".join(missing_fields)
+            if soft_disable:
+                return soft_disabled(
+                    (
+                        f"MLflow is enabled, but required field(s) are empty: {fields_text}.\n\n"
+                        "Set non-empty values in Hosting:\n"
+                        "- Experiment Name (example: `log-monitor`)\n"
+                        "- Registered Model (example: `deberta-log-classifier`)"
+                    )
+                )
             return (
                 config,
                 (
@@ -619,6 +667,8 @@ class LogProcessorApp:
         elif backend == "custom_uri":
             config["tracking_uri"] = clean_optional_string(self.mlflow_tracking_uri_var.get())
             if require_tracking_uri and not config["tracking_uri"]:
+                if soft_disable:
+                    return soft_disabled("MLflow backend is `custom_uri` but Tracking URI is empty.")
                 return config, "MLflow backend is `custom_uri` but Tracking URI is empty."
         elif backend == "azure":
             config["tracking_uri"] = self._resolve_azure_mlflow_tracking_uri(ml_client)
@@ -627,8 +677,12 @@ class LogProcessorApp:
                 if current_value and "resolved during Azure run" not in current_value:
                     config["tracking_uri"] = current_value
             if require_tracking_uri and not config["tracking_uri"]:
+                if soft_disable:
+                    return soft_disabled("Azure MLflow URI is not resolved yet. Run Azure auth or provide `custom_uri` backend.")
                 return config, "Azure MLflow URI is not resolved yet. Run Azure auth or provide `custom_uri` backend."
         else:
+            if soft_disable:
+                return soft_disabled(f"Unsupported MLflow backend: {backend}")
             return config, f"Unsupported MLflow backend: {backend}"
 
         return config, None
@@ -743,6 +797,7 @@ class LogProcessorApp:
         input_path: str,
         output_path: str,
         system_prompt: str,
+        llm_model: str,
         input_df: pd.DataFrame,
         output_df: pd.DataFrame,
         input_hash: str,
@@ -794,7 +849,7 @@ class LogProcessorApp:
                     input_meta = dataframe_metadata(input_df, label_col="class")
                     output_meta = dataframe_metadata(output_df, label_col="class")
 
-                    mlflow.log_param("llm_model", "gpt-4o")
+                    mlflow.log_param("llm_model", clean_optional_string(llm_model) or "unknown")
                     mlflow.log_param("input_filename", os.path.basename(input_path))
                     mlflow.log_param("output_filename", os.path.basename(output_path))
                     mlflow.log_param("prompt_hash", payload["prompt_hash"])
@@ -1301,11 +1356,15 @@ class LogProcessorApp:
                 traceback.print_exc()
 
     def prepare_data(self):
-        token = self.github_key_entry.get().strip()
+        api_key = self.openai_api_key_entry.get().strip()
+        model_name = self.openai_model_var.get().strip()
         input_path = self.filepath_entry.get().strip()
         
-        if not token:
-            messagebox.showwarning("Warning", "Please enter your GitHub PAT to use the LLM.")
+        if not api_key:
+            messagebox.showwarning("Warning", "Please enter your OpenAI API key.")
+            return
+        if not model_name:
+            messagebox.showwarning("Warning", "Please select or enter an OpenAI model name.")
             return
         if not input_path:
             messagebox.showwarning("Warning", "Please select a log file first.")
@@ -1319,20 +1378,23 @@ class LogProcessorApp:
         if not save_path:
             return 
 
-        mlflow_config, mlflow_error = self.resolve_mlflow_config(require_tracking_uri=False)
+        mlflow_config, mlflow_error = self.resolve_mlflow_config(
+            require_tracking_uri=False,
+            soft_disable=True,
+        )
         if mlflow_error:
             messagebox.showerror("MLflow Configuration Error", mlflow_error)
             return
 
-        self.status_var.set("Processing data with GPT-4o...")
+        self.status_var.set(f"Processing data with OpenAI ({model_name})...")
         self.prepare_btn.config(state="disabled")
         threading.Thread(
             target=self.process_logs_llm,
-            args=(input_path, save_path, token, mlflow_config),
+            args=(input_path, save_path, api_key, model_name, mlflow_config),
             daemon=True,
         ).start()
 
-    def process_logs_llm(self, input_path, save_path, token, mlflow_config):
+    def process_logs_llm(self, input_path, save_path, api_key, model_name, mlflow_config):
         processed_logs = []
         try:
             system_prompt = self.load_prompt()
@@ -1350,9 +1412,9 @@ class LogProcessorApp:
             total_rows = len(df)
             batch_size = 10 
 
-            api_url = "https://models.inference.ai.azure.com/chat/completions"
+            api_url = "https://api.openai.com/v1/chat/completions"
             headers = {
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             }
 
@@ -1366,13 +1428,12 @@ class LogProcessorApp:
                 logs_batch = batch_df[log_col].astype(str).tolist()
 
                 payload = {
-                    "model": "gpt-4o",
+                    "model": model_name,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": json.dumps(logs_batch)}
                     ],
                     "response_format": {"type": "json_object"},
-                    "temperature": 0.1
                 }
 
                 max_retries = 5
@@ -1380,7 +1441,7 @@ class LogProcessorApp:
                 success = False
 
                 for attempt in range(max_retries):
-                    response = requests.post(api_url, json=payload, headers=headers)
+                    response = requests.post(api_url, json=payload, headers=headers, timeout=120)
                     
                     if response.status_code == 429:
                         wait_time = base_delay * (2 ** attempt)
@@ -1432,6 +1493,7 @@ class LogProcessorApp:
                 input_path=input_path,
                 output_path=save_path,
                 system_prompt=system_prompt,
+                llm_model=model_name,
                 input_df=df,
                 output_df=output_df,
                 input_hash=input_file_hash,
@@ -1510,7 +1572,10 @@ class LogProcessorApp:
             messagebox.showerror("Training Configuration Error", "Training configuration could not be resolved.")
             return
 
-        mlflow_config, mlflow_error = self.resolve_mlflow_config(require_tracking_uri=False)
+        mlflow_config, mlflow_error = self.resolve_mlflow_config(
+            require_tracking_uri=False,
+            soft_disable=True,
+        )
         if mlflow_error:
             messagebox.showerror("MLflow Configuration Error", mlflow_error)
             return

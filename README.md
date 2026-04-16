@@ -1,151 +1,668 @@
 # Log-Monitor
 
-Log-Monitor is a desktop app for:
-- Preparing labeled log data with GPT-4o.
-- Training a DeBERTa classifier on Azure ML (CPU or GPU) or locally.
-- Running local/HPC training through reproducible Docker/Apptainer workflows.
+Log-Monitor is a Tkinter desktop application for the full log-classification lifecycle:
+
+1. ingest raw log CSVs
+2. label them with an OpenAI model
+3. train a DeBERTa classifier locally or on Azure ML
+4. track lineage and metrics with MLflow-style MLOps/LLMOps metadata
+5. host the trained model locally or on Azure
+6. expose a prediction API with a stable request/response contract
+
+The project also includes Docker, Apptainer, and Slurm helpers for reproducible training outside the desktop UI.
+
+## What The Project Does
+
+At a high level, the application turns unlabeled operational logs into a hosted classifier:
+
+1. `Data Processing`
+   - reads a raw CSV
+   - finds the log text column automatically
+   - batches logs to the OpenAI Chat Completions API using the prompt in `prompt.txt`
+   - writes a labeled CSV with `LogMessage` and `class`
+
+2. `Training`
+   - trains `microsoft/deberta-v3-xsmall`
+   - supports local host training, local container training, and Azure ML training
+   - supports `default`, `tune`, and `tune_cv` selection modes
+   - saves the final model and evaluation metadata
+
+3. `Tracking`
+   - records data-prep lineage and training lineage when MLflow is enabled
+   - writes sidecar metadata next to labeled CSV files
+   - writes training metadata JSON next to saved models
+
+4. `Hosting`
+   - starts a local prediction API, or
+   - deploys an Azure ML managed online endpoint
+
+5. `Consumption`
+   - clients send:
+
+```json
+{
+  "errorMessage": ""
+}
+```
+
+   - the service returns:
+
+```json
+{
+  "prediction": ""
+}
+```
 
 ## Repository Layout
 
-- `app.py`: Tkinter UI + orchestration for data prep and training.
-- `train.py`: DeBERTa training script.
-- `mlops_utils.py`: shared MLOps helpers (hashes, sidecar metadata, MLflow env helpers).
-- `prompt.txt`: prompt used by the data labeling pipeline.
-- `requirements.txt`: app/runtime dependencies.
+- `app.py`: Tkinter UI and workflow orchestrator.
+- `train.py`: model training script.
+- `mlops_utils.py`: shared helpers for hashes, sidecars, JSON, model discovery, and prompt metadata.
+- `inference_utils.py`: shared inference loader and prediction helper.
+- `serve_model.py`: local HTTP prediction service.
+- `azure_score.py`: Azure ML online endpoint scoring entrypoint.
+- `prompt.txt`: system prompt used during OpenAI labeling.
+- `requirements.txt`: desktop app/runtime dependencies.
 - `requirements.train.txt`: training/container dependencies.
-- `Dockerfile`: container build for training.
-- `scripts/`: helper scripts for Docker and Apptainer.
+- `Dockerfile`: training image definition.
+- `azure_inference_conda.yml`: Azure inference environment definition.
+- `scripts/train_docker.sh`: run training inside Docker.
+- `scripts/train_apptainer.sh`: run training inside Apptainer.
+- `scripts/docker_build_train_image.sh`: build the Docker training image.
+- `scripts/apptainer_build_from_docker.sh`: build a `.sif` from the Docker image.
+- `scripts/apptainer_pull_from_registry.sh`: pull a `.sif` from a registry image.
 - `hpc/slurm_train_apptainer.sbatch`: Slurm example for Apptainer GPU jobs.
 
-## Prerequisites
+## Labels And Model
 
-- Python 3.10+ (3.11 recommended).
-- Azure subscription + tenant access (for Azure training).
-- Docker (for container runtime).
-- Apptainer (for HPC / `.sif` workflows).
-- `scikit-learn` is required for splits/CV and classification metrics (installed via requirements files).
+The classifier predicts one of four classes:
 
-Install Python dependencies:
+- `Error`
+- `CONFIGURATION`
+- `SYSTEM`
+- `Noise`
+
+The current model backbone is:
+
+- `microsoft/deberta-v3-xsmall`
+
+The labeling prompt in `prompt.txt` explicitly tells the LLM to classify by root cause, not by superficial keywords like "error" or "exception".
+
+## Requirements
+
+Minimum practical requirements:
+
+- Python 3.10 or newer
+- `pip`
+- internet access for OpenAI labeling, Hugging Face model download, and Azure workflows
+
+Optional, depending on workflow:
+
+- Azure subscription and tenant access for Azure training/hosting
+- Docker for local container training
+- Apptainer for HPC or `.sif`-based training
+- NVIDIA drivers / CUDA-capable environment for GPU workflows
+
+Platform notes:
+
+- The Tkinter app is desktop-oriented and can be run on Windows or Linux.
+- The Docker, Apptainer, and Slurm helper scripts are Bash-based and assume a Linux-style shell environment.
+- Azure training and Azure hosting currently create or reuse resources in `eastus`.
+
+## Installation
+
+Create a clean environment and install the app dependencies:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Run the app:
+On Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Run the desktop app:
 
 ```bash
 python app.py
 ```
 
-UI behavior:
-- The main window is scrollable, so all controls remain reachable on smaller windows.
+Important:
 
-## UI Overview
+- `requirements.txt` includes `mlflow==2.9.2`. If the local dashboard says MLflow is unavailable, the Python environment running the app is missing that dependency.
+- Local container training assumes the Docker image already exists. The UI does not build the image for you.
 
-### 1) Data Processing
+## Full Lifecycle
 
-- `Log File (CSV)`: input raw logs.
-- `Prepare Data (GPT-4o)`: labels logs and saves a labeled CSV.
-- Uses the GitHub PAT entered in `Hosting` for API authentication.
+### 1. Prepare Raw Logs
 
-### 2) Model Training (DeBERTa)
+Use the `Data Processing` section in the UI:
 
-- `Azure Sub ID`, `Tenant ID`: required for Azure mode.
-- `Azure Compute`: `cpu` or `gpu` (used only in Azure mode).
-- `Labeled Data (CSV)`: training file used by both Azure and local training.
-- `Environment`:
-  - `Azure Cloud`
-  - `Local Device (CPU/GPU)`
-- Environment-specific visibility:
-  - Azure fields appear only when `Azure Cloud` is selected.
-  - Local device/runtime fields appear only when `Local Device (CPU/GPU)` is selected.
-- `Local Device`: `auto`, `cpu`, `cuda`
-- `Local Runtime`: `host` or `container` (policy-driven)
-- `Training Config`:
-  - hidden by default and shown via `Show Model Parameters`
-  - `Mode`: `default`, `tune`, `tune_cv`
-  - base params: epochs, batch size, learning rate, weight decay, max length
-  - tuning candidates (comma-separated): LRs, batch sizes, epochs, weight decays, max lengths
-  - `CV Folds` (used only for `tune_cv`, default `3`)
-  - `Max Trials` (used for tuning modes)
-- `Interrupt Training`: stops any active training run (local host/container or Azure job).
+- `Log File (CSV)`: raw input file
+- `OpenAI API Key`: used for labeling
+- `OpenAI Model`: any supported chat model you want to use for classification
+- `Prepare Data (OpenAI)`: starts the labeling workflow
 
-Local runtime policy:
-- If local device is `auto` or `cpu`, runtime is forced to `host`.
-- If local device is `cuda`, runtime selector is enabled and defaults to `container` when switching to `cuda`.
+How data preparation works:
 
-### 3) Hosting
+- the app loads `prompt.txt`
+- detects a likely log text column by checking names like `log`, `message`, `msg`, or `text`
+- falls back to the first CSV column if no obvious log column is found
+- sends logs in batches of 10
+- requests JSON output from OpenAI
+- retries API rate-limit failures with exponential backoff
+- writes a labeled CSV even if the run partially fails
 
-- GitHub PAT, repository, branch controls.
-- `Host Service` is currently a placeholder button.
-- MLflow controls:
-  - `MLflow Enabled`
-  - `MLflow Backend`: `local`, `azure`, `custom_uri`
-  - `Tracking URI` (local default: `<current_working_dir>/mlruns`)
-  - `Experiment Name` (no default; required when MLflow is enabled)
-  - `Registered Model` (no default; required when MLflow is enabled)
-  - `Open MLflow Console`
-  - `Register Last Model`
+Output:
 
-### MLflow Backend Policy
-
-- Default backend is `local` (`./mlruns`) for cost-safe tracking.
-- `custom_uri` requires a non-empty tracking URI.
-- `azure` resolves the workspace MLflow tracking URI during Azure auth.
-- Azure training blocks when MLflow is enabled with `local` backend (remote backend is required for Azure jobs).
-
-## MLOps Tracking
-
-The app tracks both data preparation and training when MLflow is enabled.
-
-### Data Preparation Tracking
-
-- Starts a pipeline parent run and nested data-prep run.
-- Logs:
-  - prompt hash + preview artifact (first 2000 chars)
-  - input/output dataset SHA256
-  - dataset metadata (rows/columns/label distribution)
-  - sanitized sample artifact (first 100 rows)
-- Writes sidecar metadata next to the labeled CSV:
+- a labeled CSV chosen by the user via Save As
+- a sidecar file next to that CSV:
 
 ```text
 <labeled_csv>.mlmeta.json
 ```
 
-Sidecar fields:
-- `pipeline_id`
-- `parent_run_id`
-- `data_prep_run_id`
-- `prompt_hash`
-- `input_dataset_hash`
-- `output_dataset_hash`
-- `created_at`
+### 2. Train The Classifier
+
+Use the `Model Training (DeBERTa)` section:
+
+- `Labeled Data (CSV)`: training input
+- `Environment`:
+  - `Azure Cloud`
+  - `Local Device (CPU/GPU)`
+- `Show Model Parameters`: reveals the training config panel
+- `Interrupt Training`: requests cancellation for local or Azure runs
+
+Training options:
+
+- `Mode`: `default`, `tune`, `tune_cv`
+- `Epochs`
+- `Batch Size`
+- `Learning Rate`
+- `Weight Decay`
+- `Max Length`
+- `CV Folds`
+- `Max Trials`
+- tuning lists:
+  - `Tune LRs`
+  - `Tune Batch Sizes`
+  - `Tune Epochs`
+  - `Tune Weight Decays`
+  - `Tune Max Lengths`
+
+Default training split behavior from `train.py`:
+
+- `test_ratio = 0.15`
+- `val_ratio = 0.15`
+- `seed = 42`
+
+Mode behavior:
+
+- `default`
+  - uses the base hyperparameters directly
+  - performs a holdout validation split on the dev subset
+- `tune`
+  - builds a candidate grid from the tuning fields
+  - shuffles with the configured seed
+  - evaluates up to `Max Trials`
+  - selects by validation weighted F1
+- `tune_cv`
+  - builds the same candidate grid
+  - evaluates up to `Max Trials`
+  - uses stratified K-fold CV on the dev subset
+  - selects by average weighted F1
+
+After selection:
+
+- the best configuration is retrained on the full dev split
+- the final model is evaluated once on the held-out test split
+
+### 3. Review Outputs And Metrics
+
+Training creates:
+
+```text
+./outputs/final_model
+./outputs/last_training_mlflow.json
+```
+
+The saved model directory contains standard Hugging Face model files such as:
+
+- `config.json`
+- `pytorch_model.bin` or `model.safetensors`
+- tokenizer files
+- `last_training_mlflow.json`
+
+The metadata JSON contains:
+
+- `run_id`
 - `tracking_uri`
 - `experiment_name`
+- `model_uri`
+- `pipeline_id`
+- `parent_run_id`
+- `run_source`
+- `resolved_device`
+- `runtime_mode`
+- dataset hashes
+- data-prep lineage
+- `selection_summary`
+- `test_metrics`
 
-### Training Tracking
+Printed training output includes:
 
-`train.py` consumes MLOps env vars and logs:
-- params: model, epochs, batch size, lr, resolved device, runtime mode, run source
-- metrics:
-  - per-epoch `train_loss`
-  - selection metrics (validation or CV averages depending on mode)
-  - test metrics: `accuracy`, weighted/macro precision, recall, F1, and test loss
-  - selected configuration summary score (`weighted_f1`)
-- artifacts: `final_model` directory and run metadata JSON
-- dataset hash/metadata + sample artifact
-- evaluation artifacts:
-  - selection summary JSON
-  - selection report/confusion artifacts
-  - test classification report + confusion matrix JSON
+- final-train epoch losses
+- best selection metrics
+- final test metrics such as:
+  - `accuracy`
+  - `weighted_precision`
+  - `weighted_recall`
+  - `weighted_f1`
+  - `loss`
 
-Training writes metadata file for manual model registration:
+### 4. Host The Model
+
+Use the `Hosting` section:
+
+- `Generated Model`: select the trained model directory
+- `Host Target`:
+  - `Local`
+  - `Azure`
+
+The selected model path can be:
+
+- the exact `final_model` directory, or
+- a parent directory that contains a discoverable model folder
+
+The app resolves the actual model directory by searching for:
+
+- `config.json`
+- and one of:
+  - `pytorch_model.bin`
+  - `model.safetensors`
+  - `tf_model.h5`
+
+### 5. Query The Prediction API
+
+Both local and Azure hosting use the same request contract.
+
+Request:
+
+```json
+{
+  "errorMessage": "processed Canceled"
+}
+```
+
+Response:
+
+```json
+{
+  "prediction": "Noise"
+}
+```
+
+### 6. Inspect Dashboards
+
+Depending on backend and environment:
+
+- local dashboard HTML summarizes hosting, training metadata, and lineage
+- local MLflow UI can be opened if `mlflow` is installed
+- Azure dashboards open in Azure ML Studio
+
+The desktop UI provides:
+
+- `Open Dashboard`
+- `Open MLOps`
+- `Open LLMOps`
+- `Register Last Model`
+
+## UI Reference
+
+### Data Processing
+
+- `Log File (CSV)`: raw logs
+- `OpenAI API Key`: required for labeling
+- `OpenAI Model`: OpenAI model used for labeling
+- `Prepare Data (OpenAI)`: starts LLM labeling
+
+### Model Training
+
+- `Labeled Data (CSV)`: prepared dataset
+- `Environment`
+  - `Azure Cloud`
+  - `Local Device (CPU/GPU)`
+- Azure-only fields:
+  - `Azure Sub ID`
+  - `Tenant ID`
+  - `Azure Compute`
+- local-only fields:
+  - `Local Device`: `auto`, `cpu`, `cuda`
+  - `Local Runtime`: `host`, `container`
+
+Local runtime policy:
+
+- if local device is `cpu` or `auto`, runtime is forced to `host`
+- if local device is `cuda`, runtime selection is enabled
+- when switching to `cuda`, the UI defaults runtime to `container`
+
+### Hosting
+
+- `GitHub PAT`
+- `Repository`
+- `Branch`
+- `Generated Model`
+- `Host Target`
+- Azure-host-only fields:
+  - `Azure Host Sub ID`
+  - `Azure Host Tenant`
+  - `Azure Host Compute`
+- outputs:
+  - `POST API URL`
+  - `Hosting Status`
+  - `Azure MLOps URL`
+  - `Azure LLMOps URL`
+
+Important note about GitHub fields:
+
+- the GitHub PAT, repository, and branch controls currently load repo and branch lists from GitHub
+- they do not currently drive training or hosting behavior
+
+### MLflow Controls
+
+- `MLflow Enabled`
+- `MLflow Backend`
+  - `local`
+  - `azure`
+  - `custom_uri`
+- `Tracking URI`
+- `Experiment Name`
+- `Registered Model`
+- `Open Dashboard`
+- `Register Last Model`
+
+Backend policy:
+
+- `local` uses the local `mlruns` directory under the project
+- `custom_uri` requires a non-empty tracking URI
+- `azure` resolves the workspace MLflow URI during Azure auth
+- Azure training is blocked if MLflow is enabled with backend `local`
+
+## Input And Output Data Contracts
+
+### Raw Input CSV
+
+The data-prep stage expects a CSV with at least one text-like column containing log messages.
+
+Preferred column names include:
+
+- `LogMessage`
+- `log`
+- `message`
+- `msg`
+- `text`
+
+If none of those are present, the first column is used.
+
+### Labeled Training CSV
+
+`train.py` expects:
+
+- `LogMessage`
+- `class`
+
+Allowed `class` values:
+
+- `Error`
+- `CONFIGURATION`
+- `SYSTEM`
+- `Noise`
+
+Invalid rows are dropped before training. Training fails if no valid rows remain.
+
+## Local Training
+
+### Host Training
+
+Examples of what the app runs conceptually:
+
+- CPU:
+
+```bash
+python train.py --data /path/to/labeled.csv
+```
+
+- CPU-forced host mode:
+
+```bash
+CUDA_VISIBLE_DEVICES=-1 python train.py --data /path/to/labeled.csv
+```
+
+- CUDA host mode:
+  - the app first checks `torch.cuda.is_available()`
+  - if CUDA is unavailable, the UI blocks the run and suggests container mode
+
+### Container Training
+
+Build the image first:
+
+```bash
+./scripts/docker_build_train_image.sh log-monitor-train:latest
+```
+
+Optional CUDA wheel index:
+
+```bash
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 ./scripts/docker_build_train_image.sh log-monitor-train:latest
+```
+
+Run training:
+
+```bash
+./scripts/train_docker.sh /absolute/path/to/labeled.csv
+```
+
+Supported environment variables:
+
+- `DEVICE=auto|cpu|cuda`
+- `IMAGE_TAG`
+- `OUTPUT_DIR`
+
+The Docker workflow:
+
+- mounts `./outputs` into the container
+- mounts the labeled CSV directory read-only as `/data`
+- forwards MLOps env vars
+- bind-mounts the local MLflow directory when the tracking URI is filesystem-based
+
+## Azure Training
+
+Azure training is fully orchestrated from `app.py`.
+
+Current resource behavior:
+
+- resource group: `LogClassifier-RG`
+- workspace: `LogClassifier-Workspace`
+- region: `eastus`
+
+Compute mapping:
+
+- `Azure Compute = cpu`
+  - cluster name: `cpu-cluster-temp`
+  - size: `Standard_D2as_v4`
+- `Azure Compute = gpu`
+  - cluster name: `gpu-cluster-temp`
+  - size: `Standard_NC4as_T4_v3`
+
+Azure training flow:
+
+1. authenticate with `InteractiveBrowserCredential`
+2. verify or create the Azure resource group
+3. register `Microsoft.MachineLearningServices`
+4. verify or create the Azure ML workspace
+5. provision a temporary AML compute cluster
+6. submit an Azure ML command job
+7. install pinned training dependencies inside the Azure job
+8. run `train.py`
+9. poll until `Completed`, `Failed`, or `Canceled`
+10. download artifacts into:
+
+```text
+./downloaded_model
+```
+
+11. cache training metadata into:
 
 ```text
 ./outputs/last_training_mlflow.json
 ```
 
-Required MLOps env vars passed to `train.py`:
+12. delete the temporary training compute cluster during cleanup
+
+Azure job notes:
+
+- Windows dataset paths are normalized to forward-slash form for Azure input URIs.
+- The job uses the curated environment `AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest`.
+- MLflow env vars are injected into the Azure job when tracking is enabled.
+
+Interruption behavior:
+
+- clicking `Interrupt Training` requests Azure job cancellation
+- the app keeps polling until Azure reaches a terminal state
+- cleanup still runs afterward
+
+## Local Hosting
+
+Local hosting starts `serve_model.py` in a background process and exposes:
+
+- `GET /`
+  - HTML landing page
+- `GET /health`
+  - returns:
+
+```json
+{"status": "ok"}
+```
+
+- `POST /predict`
+  - accepts the prediction request JSON
+- `GET /predict`
+  - returns `405 Method Not Allowed` with a usage hint
+
+Behavior:
+
+- the app chooses a free localhost port dynamically
+- the hosted API binds to `127.0.0.1`
+- the app health-checks `/health` before marking hosting as ready
+- hosting metadata is saved to:
+
+```text
+./outputs/last_hosting.json
+```
+
+After successful local hosting, the app opens a local dashboard page at:
+
+```text
+./outputs/local_dashboard.html
+```
+
+The local dashboard:
+
+- summarizes hosted API information
+- shows training metadata if it can find `last_training_mlflow.json`
+- searches the project `outputs`, the project `downloaded_model`, and the selected hosted model path
+- links to the local API and local MLflow UI when available
+
+## Azure Hosting
+
+Azure hosting deploys the selected model to an Azure ML managed online endpoint.
+
+Azure hosting flow:
+
+1. authenticate and ensure workspace existence
+2. register the model as an Azure ML model asset
+3. create an Azure ML inference environment from `azure_inference_conda.yml`
+4. create a managed online endpoint
+5. deploy `azure_score.py`
+6. route 100% traffic to deployment `blue`
+7. return the endpoint scoring URI
+
+Azure scoring notes:
+
+- the endpoint expects the same JSON contract as local hosting
+- Azure ML online endpoints usually require key-based authentication
+- the scoring entrypoint loads the model from `/var/azureml-app/azureml-models`
+
+Azure hosting instance selection:
+
+- CPU tries these sizes in order:
+  - `Standard_D2as_v4`
+  - `Standard_DS2_v2`
+  - `Standard_DS1_v2`
+  - `Standard_F2s_v2`
+  - `Standard_DS3_v2`
+- GPU tries:
+  - `Standard_NC4as_T4_v3`
+  - `Standard_NC6s_v3`
+
+If Azure hosting fails because of quota:
+
+- the app now shows a reduced quota-focused message
+- the error includes the attempted instance types
+
+Important limitation:
+
+- unlike Azure training, Azure hosting does not currently clean up partially created endpoint assets automatically after a failed deployment
+- if a deployment fails midway, review Azure ML Studio for leftover endpoint, environment, or model assets
+
+## MLOps And LLMOps
+
+When MLflow is enabled, the app tracks both data preparation and training.
+
+### Data-Prep Tracking
+
+The labeling pipeline logs:
+
+- prompt hash
+- prompt preview artifact
+- input dataset hash
+- output dataset hash
+- input/output dataset metadata
+- output sample artifact
+- aggregate OpenAI token counts:
+  - `prompt_tokens`
+  - `completion_tokens`
+  - `total_tokens`
+
+It also writes a sidecar file next to the labeled CSV:
+
+```text
+<labeled_csv>.mlmeta.json
+```
+
+That sidecar carries lineage such as:
+
+- `pipeline_id`
+- `parent_run_id`
+- `data_prep_run_id`
+- `prompt_hash`
+- `llm_model`
+- `input_dataset_hash`
+- `output_dataset_hash`
+- tracking URI / experiment name
+- data-prep tracking URI / experiment name
+- training tracking URI / experiment name
+
+### Training Tracking
+
+Training consumes the following env vars:
+
 - `MLOPS_ENABLED`
 - `MLFLOW_TRACKING_URI`
 - `MLFLOW_EXPERIMENT_NAME`
@@ -154,161 +671,175 @@ Required MLOps env vars passed to `train.py`:
 - `MLFLOW_RUN_SOURCE`
 - `MLFLOW_TAGS_JSON`
 
-## Training Behavior
+Training logs:
 
-### Modes and Splits
+- base parameters
+- selected config parameters
+- resolved device and runtime mode
+- dataset metadata
+- split metadata
+- dataset sample artifact
+- per-epoch final-train loss
+- validation or CV selection metrics
+- test metrics
+- final model artifacts
+- evaluation JSON artifacts
+- training metadata JSON
 
-`train.py` now applies a fixed holdout test set and mode-dependent model selection:
+Lineage propagation:
 
-- `test_ratio=0.15` (held out, never used for model selection)
-- `val_ratio=0.15` (used for holdout validation in `default` and `tune`)
+- data-prep lineage is carried into training tags and metadata when available
+- if the app detects a sidecar pointing to a different MLflow target, it starts a new pipeline parent run instead of reusing stale lineage
 
-Training mode behavior:
-- `default`:
-  - single configuration from base parameters
-  - train/validation holdout on dev split
-- `tune`:
-  - random trial subset from candidate parameter grid (`Max Trials`)
-  - holdout validation on dev split
-- `tune_cv`:
-  - random trial subset from candidate parameter grid (`Max Trials`)
-  - stratified K-fold CV on dev split using `CV Folds` (default recommended: `3`)
+### Local Dashboard vs MLflow UI
 
-After selection, the best configuration is retrained on the full dev split, then evaluated once on test.
+These are different things:
 
-### Local Training
+- `local_dashboard.html`
+  - generated by the app
+  - shows the latest hosting and training metadata even if the full MLflow UI is unavailable
+- local MLflow UI
+  - launched with `python -m mlflow ui`
+  - usually served at `http://127.0.0.1:5001`
+  - requires the `mlflow` package in the Python environment running the app
 
-`app.py` launches `train.py` in a background process (host) or via Docker (container).
+### Registering A Model Version
 
-Interruption behavior:
-- Clicking `Interrupt Training` sends a stop signal to local training processes (host/container) and marks the run as interrupted.
+`Register Last Model` uses:
 
-- Local + `cpu` + `host`:
-  - Runs `python train.py --data <csv> ...training config args...`
-  - Sets `CUDA_VISIBLE_DEVICES=-1` to force CPU.
-- Local + `auto` + `host`:
-  - Runs `python train.py --data <csv> ...training config args...`
-  - `train.py` auto-selects CUDA if available, else CPU.
-- Local + `cuda` + `host`:
-  - Preflight checks `torch.cuda.is_available()` in host Python.
-  - Runs host training only if CUDA is available.
-- Local + `cuda` + `container`:
-  - Runs `scripts/train_docker.sh` with `DEVICE=cuda` and forwards training config args.
-  - Passes MLflow env vars into Docker for consistent tracking.
+- the latest `last_training_mlflow.json`
+- the `Registered Model` name from the Hosting section
 
-Artifacts are saved to:
+It registers:
 
-```text
-./outputs/final_model
-```
+- `model_uri` from metadata when present, or
+- `runs:/<run_id>/final_model` as a fallback
 
-### Azure Training
+## Container And HPC Workflows
 
-Azure mode provisions a temporary Azure ML compute cluster and submits a command job.
+### Docker
 
-Current mapping:
-- `Azure Compute=cpu` -> `Standard_D2as_v4` on `cpu-cluster-temp`
-- `Azure Compute=gpu` -> `Standard_NC4as_T4_v3` on `gpu-cluster-temp`
-
-The Azure job keeps the training fix currently implemented in `app.py`:
-- normalizes Windows paths for Azure input URIs
-- installs pinned packages compatible with the curated Azure image
-- runs `USE_TF=0 python train.py --data ...` with training config args
-- injects MLflow env vars into the Azure command when tracking is enabled
-
-After completion (or failure path), the temporary compute cluster is deleted by cleanup logic.
-
-Interruption behavior:
-- Clicking `Interrupt Training` requests job cancellation on Azure and the app keeps polling until Azure reports a terminal state (`Canceled`, `Failed`, or `Completed`), then cleanup runs.
-
-## Labeled CSV Requirements
-
-`train.py` expects:
-- `LogMessage` column
-- `class` column with values mapped from:
-  - `Error`
-  - `CONFIGURATION`
-  - `SYSTEM`
-  - `Noise`
-
-Invalid rows are dropped before training. If all rows are invalid after mapping, training fails fast.
-
-## Container Workflows
-
-The container source of truth is:
-- `Dockerfile`
-- `requirements.train.txt`
-
-Build Docker image:
+Build:
 
 ```bash
 ./scripts/docker_build_train_image.sh log-monitor-train:latest
 ```
 
-Optional Torch index override (for CUDA wheels, etc.):
+Run:
 
 ```bash
-TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 ./scripts/docker_build_train_image.sh log-monitor-train:latest
+./scripts/train_docker.sh /absolute/path/to/labeled.csv --train-mode tune --max-trials 8
 ```
 
-Run training in Docker:
+### Apptainer
 
-```bash
-./scripts/train_docker.sh /absolute/path/to/labeled.csv
-```
-
-Supported environment variables:
-- `DEVICE=auto|cpu|cuda` (default `auto`)
-- `IMAGE_TAG` (default `log-monitor-train:latest`)
-- `OUTPUT_DIR` (default `./outputs`)
-
-CUDA Docker example:
-
-```bash
-DEVICE=cuda ./scripts/train_docker.sh /absolute/path/to/labeled.csv
-```
-
-## Apptainer / HPC Workflows
-
-Build `.sif` from local Docker image:
+Build from local Docker image:
 
 ```bash
 ./scripts/apptainer_build_from_docker.sh log-monitor-train:latest log-monitor-train.sif
 ```
 
-Pull `.sif` from registry image:
+Pull from a registry:
 
 ```bash
 ./scripts/apptainer_pull_from_registry.sh ghcr.io/<org>/log-monitor-train:latest log-monitor-train.sif
 ```
 
-Run training with Apptainer:
+Run:
 
 ```bash
 DEVICE=cuda ./scripts/train_apptainer.sh /path/to/log-monitor-train.sif /absolute/path/to/labeled.csv
 ```
 
-The Docker and Apptainer scripts pass through the same MLOps env vars used by host training.
+### Slurm
 
-Slurm example:
+Example:
 
 ```bash
 sbatch --export=ALL,SIF_PATH=/path/to/log-monitor-train.sif,DATA_PATH=/path/to/labeled.csv hpc/slurm_train_apptainer.sbatch
 ```
 
-## Validation Status
+The Docker and Apptainer scripts:
 
-Validated successfully:
-- Local CPU training
-- Azure Cloud CPU training
+- pass through the same MLOps environment variables used by host training
+- bind local MLflow filesystem paths into the container when applicable
+- write model artifacts to a host-mounted `outputs` directory
 
-Pending validation:
-- Local GPU training
-- Azure Cloud GPU training
+## Troubleshooting
 
-## Notes / Troubleshooting
+### The Local Dashboard Opens But MLOps Fields Are Empty
 
-- HF Hub warning about unauthenticated requests is non-fatal; set `HF_TOKEN` to improve rate limits.
-- Azure GPU requires quota and region availability for selected GPU SKU.
-- If local CUDA host training fails preflight, switch local runtime to `container` or install CUDA-enabled PyTorch on host.
-- If Azure training is selected with MLflow backend `local`, the app blocks start and asks for `azure` or `custom_uri`.
+This usually means the app found hosting metadata but could not find `last_training_mlflow.json`.
+
+Check:
+
+- the selected hosted model directory
+- `./outputs/last_training_mlflow.json`
+- `./downloaded_model`
+- whether the model bundle actually contains `last_training_mlflow.json`
+
+### The Local Dashboard Says MLflow Is Unavailable
+
+The Python environment running `app.py` does not have `mlflow` installed, even if another environment does.
+
+Fix:
+
+```bash
+pip install -r requirements.txt
+```
+
+### `ImportError: cannot import name 'MLOPS_ENV_VARS'`
+
+The app now defines that constant locally in `app.py` so startup is resilient to stale copies of `mlops_utils.py`. If you still see this error, you are likely launching a different copy of the project than the one you edited.
+
+### Local API URL Returns `connection refused`
+
+That means the local hosting process exited after startup or never became healthy.
+
+Check:
+
+- the selected model directory really contains a trained model
+- the Python environment includes `torch`, `transformers`, and `sentencepiece`
+- the hosting error dialog or terminal output for the local process
+
+### Azure Hosting Fails With Quota Errors
+
+That is an Azure subscription capacity issue, not a model issue.
+
+Options:
+
+- request quota for the relevant VM family
+- use a different subscription
+- change the Azure region in code if you want a region other than `eastus`
+
+### Azure Training Or Hosting Opens The Browser Repeatedly
+
+Azure authentication uses `InteractiveBrowserCredential`, so browser-based login is expected.
+
+### CUDA Host Training Fails Preflight
+
+If local device is `cuda` and host training fails the preflight check:
+
+- switch local runtime to `container`, or
+- install a CUDA-enabled PyTorch build on the host
+
+## Known Limitations
+
+- The GitHub repo/branch UI controls currently browse GitHub metadata only; they are not wired into deployment automation.
+- Azure training cleanup deletes temporary compute clusters, but Azure hosting does not yet fully clean up partially created endpoint assets on failure.
+- Azure region is currently hardcoded to `eastus`.
+- Local container training assumes the Docker training image already exists.
+
+## Suggested End-To-End Demo
+
+For a clean demo of the full lifecycle:
+
+1. launch `python app.py`
+2. label a raw CSV with `Prepare Data (OpenAI)`
+3. enable MLflow and set an experiment name
+4. train locally on CPU first
+5. inspect `./outputs/final_model` and `./outputs/last_training_mlflow.json`
+6. host the saved model locally
+7. open the local dashboard
+8. send a `POST /predict` request
+9. if needed, repeat with Azure training or Azure hosting once Azure quota is available

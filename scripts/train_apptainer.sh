@@ -29,6 +29,26 @@ DEVICE="${DEVICE:-auto}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/outputs}"
 mkdir -p "${OUTPUT_DIR}"
 
+resolve_local_tracking_uri() {
+  local uri="$1"
+  if [[ -z "${uri}" ]]; then
+    return 1
+  fi
+  if [[ "${uri}" == file://* ]]; then
+    printf '%s\n' "${uri#file://}"
+    return 0
+  fi
+  if [[ "${uri}" == *"://"* ]]; then
+    return 1
+  fi
+  if [[ "${uri}" == /* ]]; then
+    printf '%s\n' "${uri}"
+    return 0
+  fi
+  printf '%s\n' "$(cd "$(dirname "${uri}")" && pwd)/$(basename "${uri}")"
+  return 0
+}
+
 NV_FLAG=()
 if [[ "${DEVICE}" == "cuda" ]]; then
   NV_FLAG=(--nv)
@@ -56,9 +76,21 @@ for key in "${MLOPS_KEYS[@]}"; do
   fi
 done
 
+BIND_FLAGS=(
+  --bind "${OUTPUT_DIR}:/workspace/outputs"
+  --bind "$(dirname "${DATA_PATH}"):/data:ro"
+)
+
+if [[ "${MLOPS_ENABLED:-0}" == "1" ]]; then
+  if HOST_MLFLOW_PATH="$(resolve_local_tracking_uri "${MLFLOW_TRACKING_URI:-}")"; then
+    mkdir -p "${HOST_MLFLOW_PATH}"
+    export APPTAINERENV_MLFLOW_TRACKING_URI="/workspace/mlruns"
+    BIND_FLAGS+=(--bind "${HOST_MLFLOW_PATH}:/workspace/mlruns")
+  fi
+fi
+
 apptainer exec \
   "${NV_FLAG[@]}" \
-  --bind "${OUTPUT_DIR}:/workspace/outputs" \
-  --bind "$(dirname "${DATA_PATH}"):/data:ro" \
+  "${BIND_FLAGS[@]}" \
   "${SIF_PATH}" \
   python /workspace/train.py --data "/data/$(basename "${DATA_PATH}")" "$@"

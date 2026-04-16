@@ -65,6 +65,12 @@ class LogDataset(Dataset):
 
 
 def build_mlflow_context() -> Dict[str, Any]:
+    raw_tags = clean_optional_string(os.getenv("MLFLOW_TAGS_JSON", "{}"))
+    try:
+        tags = parse_tags_json(raw_tags)
+    except Exception:
+        tags = {}
+
     context: Dict[str, Any] = {
         "enabled": False,
         "tracking_uri": "",
@@ -72,7 +78,7 @@ def build_mlflow_context() -> Dict[str, Any]:
         "pipeline_id": clean_optional_string(os.getenv("MLFLOW_PIPELINE_ID", "")),
         "parent_run_id": clean_optional_string(os.getenv("MLFLOW_PARENT_RUN_ID", "")),
         "run_source": clean_optional_string(os.getenv("MLFLOW_RUN_SOURCE", "")) or "unknown",
-        "tags": {},
+        "tags": tags,
     }
 
     if not bool_from_env(os.getenv("MLOPS_ENABLED", "0")):
@@ -87,12 +93,6 @@ def build_mlflow_context() -> Dict[str, Any]:
     if not tracking_uri or not experiment_name:
         print("[MLOPS] Missing tracking URI or experiment name; continuing without MLflow logging.")
         return context
-
-    raw_tags = clean_optional_string(os.getenv("MLFLOW_TAGS_JSON", "{}"))
-    try:
-        tags = parse_tags_json(raw_tags)
-    except Exception:
-        tags = {}
 
     context["enabled"] = True
     context["tracking_uri"] = tracking_uri
@@ -281,6 +281,14 @@ def train_with_validation(
             "val_macro_f1": float(val_metrics["macro_f1"]),
         }
         history.append(epoch_entry)
+        print(
+            "Selection epoch "
+            f"{epoch + 1}/{config['epochs']} - "
+            f"train_loss: {train_loss:.4f} - "
+            f"val_loss: {val_metrics['loss']:.4f} - "
+            f"val_accuracy: {val_metrics['accuracy']:.4f} - "
+            f"val_weighted_f1: {val_metrics['weighted_f1']:.4f}"
+        )
 
         if val_score > best_score:
             best_score = val_score
@@ -289,6 +297,13 @@ def train_with_validation(
 
     model.load_state_dict(best_state)
     best_eval = evaluate_model(model, val_loader, device)
+    print(
+        "Best selection metrics - "
+        f"epoch: {best_epoch} - "
+        f"accuracy: {best_eval['metrics']['accuracy']:.4f} - "
+        f"weighted_f1: {best_eval['metrics']['weighted_f1']:.4f} - "
+        f"loss: {best_eval['metrics']['loss']:.4f}"
+    )
 
     return {
         "model": model,
@@ -712,6 +727,14 @@ def main():
     test_metrics = test_eval["metrics"]
     test_report = test_eval["classification_report"]
     test_confusion = test_eval["confusion_matrix"]
+    print(
+        "Test metrics - "
+        f"accuracy: {test_metrics['accuracy']:.4f} - "
+        f"weighted_precision: {test_metrics['weighted_precision']:.4f} - "
+        f"weighted_recall: {test_metrics['weighted_recall']:.4f} - "
+        f"weighted_f1: {test_metrics['weighted_f1']:.4f} - "
+        f"loss: {test_metrics['loss']:.4f}"
+    )
 
     safe_mlflow_call(
         mlflow_enabled,
@@ -764,6 +787,7 @@ def main():
     )
 
     model_uri = f"runs:/{run_id}/final_model" if run_id else ""
+    lineage_tags = mlflow_context.get("tags", {})
     metadata_payload = {
         "run_id": run_id,
         "tracking_uri": clean_optional_string(mlflow_context.get("tracking_uri", "")),
@@ -775,6 +799,13 @@ def main():
         "resolved_device": resolved_device,
         "runtime_mode": runtime_mode,
         "input_dataset_hash": input_data_hash,
+        "data_prep_run_id": clean_optional_string(lineage_tags.get("data_prep_run_id", "")),
+        "data_prep_tracking_uri": clean_optional_string(lineage_tags.get("data_prep_tracking_uri", "")),
+        "data_prep_experiment_name": clean_optional_string(lineage_tags.get("data_prep_experiment_name", "")),
+        "data_prep_input_dataset_hash": clean_optional_string(lineage_tags.get("data_prep_input_dataset_hash", "")),
+        "data_prep_output_dataset_hash": clean_optional_string(lineage_tags.get("data_prep_output_dataset_hash", "")),
+        "prompt_hash": clean_optional_string(lineage_tags.get("prompt_hash", "")),
+        "llm_model": clean_optional_string(lineage_tags.get("llm_model", "")),
         "dataset_metadata": dataset_meta,
         "split_metadata": split_metadata,
         "selection_summary": selection_summary,

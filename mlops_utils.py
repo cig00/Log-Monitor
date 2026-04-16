@@ -129,3 +129,35 @@ def parse_tags_json(raw: str) -> Dict[str, str]:
             continue
         tags[text_key] = str(value)
     return tags
+
+
+def discover_model_dir(path: str) -> str:
+    candidate = Path(path).expanduser().resolve()
+    if not candidate.exists():
+        raise FileNotFoundError(f"Model path does not exist: {candidate}")
+
+    def looks_like_model_dir(folder: Path) -> bool:
+        return folder.is_dir() and (folder / "config.json").exists() and (
+            (folder / "pytorch_model.bin").exists()
+            or (folder / "model.safetensors").exists()
+            or (folder / "tf_model.h5").exists()
+        )
+
+    if looks_like_model_dir(candidate):
+        return str(candidate)
+
+    if candidate.is_file():
+        candidate = candidate.parent
+        if looks_like_model_dir(candidate):
+            return str(candidate)
+
+    config_matches = sorted(candidate.rglob("config.json")) if candidate.is_dir() else []
+    for config_path in config_matches:
+        folder = config_path.parent
+        if looks_like_model_dir(folder):
+            return str(folder)
+
+    raise FileNotFoundError(
+        "Could not find a saved model directory containing config.json and model weights "
+        f"under: {candidate}"
+    )

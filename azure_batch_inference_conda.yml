@@ -1,0 +1,13 @@
+name: log-monitor-batch-inference
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch
+      - transformers
+      - sentencepiece
+      - protobuf
+      - azureml-core
+      - azureml-dataset-runtime[fuse]

@@ -1,0 +1,5 @@
+azure-functions
+azure-servicebus
+azure-storage-blob
+azure-identity
+azure-ai-ml

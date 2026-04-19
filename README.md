@@ -7,7 +7,7 @@ Log-Monitor is a Tkinter desktop application for the full log-classification lif
 3. train a DeBERTa classifier locally or on Azure ML
 4. track lineage and metrics with MLflow-style MLOps/LLMOps metadata
 5. host the trained model locally or on Azure
-6. expose a prediction API with a stable request/response contract
+6. expose either a local prediction API or an Azure batch inference endpoint
 
 The project also includes Docker, Apptainer, and Slurm helpers for reproducible training outside the desktop UI.
 
@@ -34,10 +34,10 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 
 4. `Hosting`
    - starts a local prediction API, or
-   - deploys an Azure ML managed online endpoint
+   - deploys an Azure ML batch endpoint backed by scale-from-zero compute
 
 5. `Consumption`
-   - clients send:
+   - local clients send:
 
 ```json
 {
@@ -53,6 +53,8 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 }
 ```
 
+   - Azure batch jobs submit files or folders and read predictions from batch job outputs in storage
+
 ## Repository Layout
 
 - `app.py`: Tkinter UI and workflow orchestrator.
@@ -60,12 +62,14 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 - `mlops_utils.py`: shared helpers for hashes, sidecars, JSON, model discovery, and prompt metadata.
 - `inference_utils.py`: shared inference loader and prediction helper.
 - `serve_model.py`: local HTTP prediction service.
-- `azure_score.py`: Azure ML online endpoint scoring entrypoint.
+- `azure_score.py`: legacy Azure ML online endpoint scoring entrypoint.
+- `azure_batch_score.py`: Azure ML batch endpoint scoring entrypoint.
 - `prompt.txt`: system prompt used during OpenAI labeling.
 - `requirements.txt`: desktop app/runtime dependencies.
 - `requirements.train.txt`: training/container dependencies.
 - `Dockerfile`: training image definition.
-- `azure_inference_conda.yml`: Azure inference environment definition.
+- `azure_inference_conda.yml`: legacy Azure online inference environment definition.
+- `azure_batch_inference_conda.yml`: Azure batch inference environment definition.
 - `scripts/train_docker.sh`: run training inside Docker.
 - `scripts/train_apptainer.sh`: run training inside Apptainer.
 - `scripts/docker_build_train_image.sh`: build the Docker training image.
@@ -230,6 +234,8 @@ Training creates:
 ```text
 ./outputs/final_model
 ./outputs/last_training_mlflow.json
+./outputs/model_versions/<model_version_id>/final_model
+./outputs/data_versions/<data_version_id>/dataset.csv
 ```
 
 The saved model directory contains standard Hugging Face model files such as:
@@ -245,12 +251,16 @@ The metadata JSON contains:
 - `tracking_uri`
 - `experiment_name`
 - `model_uri`
+- `model_version_id`
+- `model_version_dir`
+- `model_version_model_dir`
 - `pipeline_id`
 - `parent_run_id`
 - `run_source`
 - `resolved_device`
 - `runtime_mode`
 - dataset hashes
+- data version fields
 - data-prep lineage
 - `selection_summary`
 - `test_metrics`
@@ -271,6 +281,7 @@ Printed training output includes:
 Use the `Hosting` section:
 
 - `Generated Model`: select the trained model directory
+- `Available Models`: review and select discovered local versioned models, latest local output, downloaded models, or the current manual selection
 - `Host Target`:
   - `Local`
   - `Azure`
@@ -290,7 +301,7 @@ The app resolves the actual model directory by searching for:
 
 ### 5. Query The Prediction API
 
-Both local and Azure hosting use the same request contract.
+Local hosting uses a direct synchronous HTTP request contract.
 
 Request:
 
@@ -307,6 +318,21 @@ Response:
   "prediction": "Noise"
 }
 ```
+
+Azure hosting is asynchronous batch inference rather than a direct `POST /predict` call.
+
+Typical Azure batch input file example:
+
+```csv
+LogMessage
+processed Canceled
+timeout while opening socket
+```
+
+Azure batch output:
+
+- one prediction row is written per processed input row
+- results are written to Azure Storage when the batch job finishes
 
 ### 6. Inspect Dashboards
 
@@ -364,7 +390,7 @@ Local runtime policy:
   - `Azure Host Tenant`
   - `Azure Host Compute`
 - outputs:
-  - `POST API URL`
+  - `Endpoint URL`
   - `Hosting Status`
   - `Azure MLOps URL`
   - `Azure LLMOps URL`
@@ -560,6 +586,7 @@ Behavior:
 - the app chooses a free localhost port dynamically
 - the hosted API binds to `127.0.0.1`
 - the app health-checks `/health` before marking hosting as ready
+- the app records which model version and training run were deployed when metadata is available
 - hosting metadata is saved to:
 
 ```text
@@ -576,28 +603,33 @@ The local dashboard:
 
 - summarizes hosted API information
 - shows training metadata if it can find `last_training_mlflow.json`
+- shows the hosted model version when known
+- lists discovered available models from local version archives and downloaded bundles
 - searches the project `outputs`, the project `downloaded_model`, and the selected hosted model path
 - links to the local API and local MLflow UI when available
 
 ## Azure Hosting
 
-Azure hosting deploys the selected model to an Azure ML managed online endpoint.
+Azure hosting deploys the selected model to an Azure ML batch endpoint.
 
 Azure hosting flow:
 
 1. authenticate and ensure workspace existence
 2. register the model as an Azure ML model asset
-3. create an Azure ML inference environment from `azure_inference_conda.yml`
-4. create a managed online endpoint
-5. deploy `azure_score.py`
-6. route 100% traffic to deployment `blue`
-7. return the endpoint scoring URI
+3. create an Azure ML batch inference environment from `azure_batch_inference_conda.yml`
+4. create or update a scale-from-zero AML compute cluster with `min_instances=0`
+5. create a batch endpoint
+6. deploy `azure_batch_score.py`
+7. set the deployment as the endpoint default
+8. return the endpoint scoring URI
 
 Azure scoring notes:
 
-- the endpoint expects the same JSON contract as local hosting
-- Azure ML online endpoints usually require key-based authentication
-- the scoring entrypoint loads the model from `/var/azureml-app/azureml-models`
+- the endpoint is asynchronous and intended for background scoring
+- batch jobs submit files, folders, or Azure ML data assets
+- results are written to Azure Storage when each batch job completes
+- batch endpoint authentication uses Microsoft Entra ID
+- the scoring entrypoint loads the model from `AZUREML_MODEL_DIR`
 
 Azure hosting instance selection:
 
@@ -619,7 +651,7 @@ If Azure hosting fails because of quota:
 Important limitation:
 
 - unlike Azure training, Azure hosting does not currently clean up partially created endpoint assets automatically after a failed deployment
-- if a deployment fails midway, review Azure ML Studio for leftover endpoint, environment, or model assets
+- if a deployment fails midway, review Azure ML Studio for leftover endpoint, environment, model, or compute assets
 
 ## MLOps And LLMOps
 
@@ -655,6 +687,9 @@ That sidecar carries lineage such as:
 - `llm_model`
 - `input_dataset_hash`
 - `output_dataset_hash`
+- `data_version_id`
+- `data_version_dir`
+- `data_version_path`
 - tracking URI / experiment name
 - data-prep tracking URI / experiment name
 - training tracking URI / experiment name
@@ -675,6 +710,8 @@ Training logs:
 
 - base parameters
 - selected config parameters
+- `model_version_id`
+- `data_version_id` when dataset lineage is available
 - resolved device and runtime mode
 - dataset metadata
 - split metadata
@@ -689,6 +726,8 @@ Training logs:
 Lineage propagation:
 
 - data-prep lineage is carried into training tags and metadata when available
+- labeled datasets are copied into immutable content-addressed folders under `./outputs/data_versions`
+- trained models are copied into immutable run-addressed folders under `./outputs/model_versions`
 - if the app detects a sidecar pointing to a different MLflow target, it starts a new pipeline parent run instead of reusing stale lineage
 
 ### Local Dashboard vs MLflow UI
@@ -842,4 +881,4 @@ For a clean demo of the full lifecycle:
 6. host the saved model locally
 7. open the local dashboard
 8. send a `POST /predict` request
-9. if needed, repeat with Azure training or Azure hosting once Azure quota is available
+9. if needed, repeat with Azure training or Azure hosting once Azure quota is available, then submit a batch scoring job

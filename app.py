@@ -17,26 +17,37 @@ import shlex
 import socket
 import re
 import html
+import tarfile
+import zipfile
+import platform
 from pathlib import Path
-from urllib.parse import quote as url_quote
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote as url_quote, urlparse
 
 # Azure ML Imports
 from azure.identity import InteractiveBrowserCredential
 from azure.ai.ml import MLClient, command, Input
 from azure.ai.ml.constants import AssetTypes
 from azure.ai.ml.entities import (
+    AccountKeyConfiguration,
     Workspace,
     AmlCompute,
+    AzureBlobDatastore,
+    BatchEndpoint,
     CodeConfiguration,
     Environment,
+    JobSchedule,
     ManagedOnlineDeployment,
     ManagedOnlineEndpoint,
     Model,
+    ModelBatchDeployment,
+    ModelBatchDeploymentSettings,
+    RecurrencePattern,
+    RecurrenceTrigger,
 )
 from azure.mgmt.resource import ResourceManagementClient
 
 from mlops_utils import (
-    MLOPS_ENV_VARS,
     bool_from_env,
     clean_optional_string,
     compute_file_sha256,
@@ -57,6 +68,17 @@ try:
     import mlflow
 except Exception:
     mlflow = None
+
+
+MLOPS_ENV_VARS = [
+    "MLOPS_ENABLED",
+    "MLFLOW_TRACKING_URI",
+    "MLFLOW_EXPERIMENT_NAME",
+    "MLFLOW_PIPELINE_ID",
+    "MLFLOW_PARENT_RUN_ID",
+    "MLFLOW_RUN_SOURCE",
+    "MLFLOW_TAGS_JSON",
+]
 
 
 class TrainingInterrupted(Exception):
@@ -96,14 +118,24 @@ class LogProcessorApp:
         self.hosting_active = False
         self.hosting_state_lock = threading.Lock()
         self.hosting_process = None
+        self.prometheus_process = None
+        self.grafana_process = None
         self.hosting_mode_var = tk.StringVar(value="local")
         default_model_dir = Path(self.project_dir) / "outputs" / "final_model"
         self.hosted_model_path_var = tk.StringVar(value=str(default_model_dir) if default_model_dir.exists() else "")
+        self.hosted_model_inventory = []
+        self.available_model_choice_var = tk.StringVar(value="")
         self.hosting_api_url_var = tk.StringVar(value="")
         self.hosting_mode_summary_var = tk.StringVar(value="")
         self.azure_host_sub_var = tk.StringVar(value="")
         self.azure_host_tenant_var = tk.StringVar(value="")
         self.azure_host_compute_var = tk.StringVar(value="cpu")
+        self.azure_host_service_var = tk.StringVar(value="queued_batch")
+        self.azure_batch_input_var = tk.StringVar(value="")
+        self.azure_batch_time_var = tk.StringVar(value="02:00")
+        self.azure_batch_timezone_var = tk.StringVar(value="UTC")
+        self.azure_training_instance_var = tk.StringVar(value="Standard_D2as_v4")
+        self.azure_host_instance_var = tk.StringVar(value="Standard_D2as_v4")
         self.azure_mlops_url_var = tk.StringVar(value="")
         self.azure_llmops_url_var = tk.StringVar(value="")
         self.azure_hosted_endpoint_name_var = tk.StringVar(value="")
@@ -224,6 +256,17 @@ class LogProcessorApp:
             width=16,
         )
         self.azure_compute_combo.grid(row=4, column=1, sticky="w", padx=5, pady=5)
+        self.azure_compute_combo.bind("<<ComboboxSelected>>", self.on_azure_training_compute_change)
+
+        self.azure_instance_label = ttk.Label(train_frame, text="Azure VM Size:")
+        self.azure_instance_label.grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        self.azure_instance_combo = ttk.Combobox(
+            train_frame,
+            textvariable=self.azure_training_instance_var,
+            state="readonly",
+            width=24,
+        )
+        self.azure_instance_combo.grid(row=5, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
 
         self.local_device_label = ttk.Label(train_frame, text="Local Device:")
         self.local_device_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
@@ -255,10 +298,10 @@ class LogProcessorApp:
             text="Show Model Parameters",
             command=self.toggle_training_config_panel,
         )
-        self.training_config_toggle_btn.grid(row=5, column=0, columnspan=3, sticky="w", padx=5, pady=(8, 2))
+        self.training_config_toggle_btn.grid(row=6, column=0, columnspan=3, sticky="w", padx=5, pady=(8, 2))
 
         self.training_config_frame = ttk.LabelFrame(train_frame, text="Training Config", padding=(8, 6))
-        self.training_config_frame.grid(row=6, column=0, columnspan=3, sticky="ew", padx=5, pady=(2, 6))
+        self.training_config_frame.grid(row=7, column=0, columnspan=3, sticky="ew", padx=5, pady=(2, 6))
         self.training_config_frame.columnconfigure(1, weight=1)
         self.training_config_frame.columnconfigure(3, weight=1)
 
@@ -335,7 +378,7 @@ class LogProcessorApp:
         self.tune_max_lengths_entry.grid(row=8, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
 
         self.get_model_btn = ttk.Button(train_frame, text="Get Model (Train)", command=self.start_training_thread)
-        self.get_model_btn.grid(row=7, column=0, columnspan=2, sticky="ew", padx=5, pady=10)
+        self.get_model_btn.grid(row=8, column=0, columnspan=2, sticky="ew", padx=5, pady=10)
 
         self.stop_training_btn = ttk.Button(
             train_frame,
@@ -343,7 +386,7 @@ class LogProcessorApp:
             command=self.stop_training,
             state="disabled",
         )
-        self.stop_training_btn.grid(row=7, column=2, sticky="ew", padx=5, pady=10)
+        self.stop_training_btn.grid(row=8, column=2, sticky="ew", padx=5, pady=10)
 
         self.training_config_frame.grid_remove()
 
@@ -375,7 +418,23 @@ class LogProcessorApp:
         self.hosted_model_browse_btn = ttk.Button(hosting_frame, text="Browse", command=self.browse_hosted_model)
         self.hosted_model_browse_btn.grid(row=2, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Host Target:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Available Models:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        self.available_models_combo = ttk.Combobox(
+            hosting_frame,
+            textvariable=self.available_model_choice_var,
+            state="readonly",
+            width=30,
+        )
+        self.available_models_combo.grid(row=3, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.available_models_combo.bind("<<ComboboxSelected>>", self.on_available_model_selected)
+        self.refresh_models_btn = ttk.Button(
+            hosting_frame,
+            text="Refresh Models",
+            command=self.refresh_hosted_model_inventory,
+        )
+        self.refresh_models_btn.grid(row=3, column=3, padx=5, pady=5)
+
+        ttk.Label(hosting_frame, text="Host Target:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
         self.host_local_radio = ttk.Radiobutton(
             hosting_frame,
             text="Local",
@@ -383,7 +442,7 @@ class LogProcessorApp:
             value="local",
             command=self.on_hosting_mode_change,
         )
-        self.host_local_radio.grid(row=3, column=1, sticky="w", padx=5, pady=5)
+        self.host_local_radio.grid(row=4, column=1, sticky="w", padx=5, pady=5)
         self.host_azure_radio = ttk.Radiobutton(
             hosting_frame,
             text="Azure",
@@ -391,20 +450,39 @@ class LogProcessorApp:
             value="azure",
             command=self.on_hosting_mode_change,
         )
-        self.host_azure_radio.grid(row=3, column=2, sticky="w", padx=5, pady=5)
+        self.host_azure_radio.grid(row=4, column=2, sticky="w", padx=5, pady=5)
+
+        self.azure_host_service_label = ttk.Label(hosting_frame, text="Azure Service:")
+        self.azure_host_service_label.grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        self.azure_host_online_radio = ttk.Radiobutton(
+            hosting_frame,
+            text="Real-time endpoint",
+            variable=self.azure_host_service_var,
+            value="online",
+            command=self.on_hosting_mode_change,
+        )
+        self.azure_host_online_radio.grid(row=5, column=1, sticky="w", padx=5, pady=5)
+        self.azure_host_queue_batch_radio = ttk.Radiobutton(
+            hosting_frame,
+            text="Queued batch API (daily)",
+            variable=self.azure_host_service_var,
+            value="queued_batch",
+            command=self.on_hosting_mode_change,
+        )
+        self.azure_host_queue_batch_radio.grid(row=5, column=2, columnspan=2, sticky="w", padx=5, pady=5)
 
         self.azure_host_sub_label = ttk.Label(hosting_frame, text="Azure Host Sub ID:")
-        self.azure_host_sub_label.grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        self.azure_host_sub_label.grid(row=7, column=0, sticky="w", padx=5, pady=5)
         self.azure_host_sub_entry = ttk.Entry(hosting_frame, textvariable=self.azure_host_sub_var, width=30)
-        self.azure_host_sub_entry.grid(row=4, column=1, sticky="ew", padx=5, pady=5)
+        self.azure_host_sub_entry.grid(row=7, column=1, sticky="ew", padx=5, pady=5)
 
         self.azure_host_tenant_label = ttk.Label(hosting_frame, text="Azure Host Tenant:")
-        self.azure_host_tenant_label.grid(row=4, column=2, sticky="w", padx=5, pady=5)
+        self.azure_host_tenant_label.grid(row=7, column=2, sticky="w", padx=5, pady=5)
         self.azure_host_tenant_entry = ttk.Entry(hosting_frame, textvariable=self.azure_host_tenant_var, width=20)
-        self.azure_host_tenant_entry.grid(row=4, column=3, sticky="ew", padx=5, pady=5)
+        self.azure_host_tenant_entry.grid(row=7, column=3, sticky="ew", padx=5, pady=5)
 
         self.azure_host_compute_label = ttk.Label(hosting_frame, text="Azure Host Compute:")
-        self.azure_host_compute_label.grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        self.azure_host_compute_label.grid(row=8, column=0, sticky="w", padx=5, pady=5)
         self.azure_host_compute_combo = ttk.Combobox(
             hosting_frame,
             textvariable=self.azure_host_compute_var,
@@ -412,79 +490,121 @@ class LogProcessorApp:
             values=["cpu", "gpu"],
             width=16,
         )
-        self.azure_host_compute_combo.grid(row=5, column=1, sticky="w", padx=5, pady=5)
+        self.azure_host_compute_combo.grid(row=8, column=1, sticky="w", padx=5, pady=5)
+        self.azure_host_compute_combo.bind("<<ComboboxSelected>>", self.on_azure_host_compute_change)
+
+        self.azure_host_instance_label = ttk.Label(hosting_frame, text="Azure VM Size:")
+        self.azure_host_instance_label.grid(row=8, column=2, sticky="w", padx=5, pady=5)
+        self.azure_host_instance_combo = ttk.Combobox(
+            hosting_frame,
+            textvariable=self.azure_host_instance_var,
+            state="readonly",
+            width=20,
+        )
+        self.azure_host_instance_combo.grid(row=8, column=3, sticky="ew", padx=5, pady=5)
+
+        self.azure_batch_time_label = ttk.Label(hosting_frame, text="Daily Time (HH:MM):")
+        self.azure_batch_time_label.grid(row=9, column=0, sticky="w", padx=5, pady=5)
+        self.azure_batch_time_entry = ttk.Entry(
+            hosting_frame,
+            textvariable=self.azure_batch_time_var,
+            width=12,
+        )
+        self.azure_batch_time_entry.grid(row=9, column=1, sticky="w", padx=5, pady=5)
+
+        self.azure_batch_timezone_label = ttk.Label(hosting_frame, text="Time Zone:")
+        self.azure_batch_timezone_label.grid(row=9, column=2, sticky="w", padx=5, pady=5)
+        self.azure_batch_timezone_combo = ttk.Combobox(
+            hosting_frame,
+            textvariable=self.azure_batch_timezone_var,
+            state="readonly",
+            values=self.get_azure_batch_timezone_options(),
+            width=20,
+        )
+        self.azure_batch_timezone_combo.grid(row=9, column=3, sticky="ew", padx=5, pady=5)
+
+        self.azure_batch_note_label = ttk.Label(
+            hosting_frame,
+            text=(
+                "Queued batch hosting deploys an Azure Function log API, Service Bus queue, Blob Storage, "
+                "and a daily Azure ML batch launcher. Logs can arrive anytime and are processed once per day."
+            ),
+            wraplength=460,
+            justify="left",
+        )
+        self.azure_batch_note_label.grid(row=10, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
 
         self.host_service_btn = ttk.Button(
             hosting_frame,
             text="Host Service",
             command=self.start_hosting_thread,
         )
-        self.host_service_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=10)
+        self.host_service_btn.grid(row=11, column=0, columnspan=2, sticky="ew", padx=5, pady=10)
 
         self.stop_hosting_btn = ttk.Button(
             hosting_frame,
-            text="Stop Hosted API",
+            text="Stop Local Stack",
             command=self.stop_hosting,
             state="disabled",
         )
-        self.stop_hosting_btn.grid(row=6, column=2, columnspan=2, sticky="ew", padx=5, pady=10)
+        self.stop_hosting_btn.grid(row=11, column=2, columnspan=2, sticky="ew", padx=5, pady=10)
 
-        ttk.Label(hosting_frame, text="POST API URL:").grid(row=7, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Endpoint URL:").grid(row=12, column=0, sticky="w", padx=5, pady=5)
         self.hosting_api_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.hosting_api_url_var,
             width=30,
             state="readonly",
         )
-        self.hosting_api_url_entry.grid(row=7, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.hosting_api_url_entry.grid(row=12, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_hosting_api_btn = ttk.Button(
             hosting_frame,
-            text="Open API URL",
-            command=lambda: self.open_url_value(self.hosting_api_url_var.get(), "Prediction API"),
+            text="Open Endpoint",
+            command=lambda: self.open_url_value(self.hosting_api_url_var.get(), "Endpoint"),
         )
-        self.open_hosting_api_btn.grid(row=7, column=3, padx=5, pady=5)
+        self.open_hosting_api_btn.grid(row=12, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Hosting Status:").grid(row=8, column=0, sticky="nw", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Hosting Status:").grid(row=13, column=0, sticky="nw", padx=5, pady=5)
         self.hosting_status_label = ttk.Label(
             hosting_frame,
             textvariable=self.hosting_mode_summary_var,
             wraplength=460,
             justify="left",
         )
-        self.hosting_status_label.grid(row=8, column=1, columnspan=3, sticky="w", padx=5, pady=5)
+        self.hosting_status_label.grid(row=13, column=1, columnspan=3, sticky="w", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Azure MLOps URL:").grid(row=9, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Azure MLOps URL:").grid(row=14, column=0, sticky="w", padx=5, pady=5)
         self.azure_mlops_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.azure_mlops_url_var,
             width=30,
             state="readonly",
         )
-        self.azure_mlops_url_entry.grid(row=9, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_mlops_url_entry.grid(row=14, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_azure_mlops_btn = ttk.Button(
             hosting_frame,
             text="Open MLOps",
             command=lambda: self.open_url_value(self.azure_mlops_url_var.get(), "Azure MLOps dashboard"),
         )
-        self.open_azure_mlops_btn.grid(row=9, column=3, padx=5, pady=5)
+        self.open_azure_mlops_btn.grid(row=14, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Azure LLMOps URL:").grid(row=10, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Azure LLMOps URL:").grid(row=15, column=0, sticky="w", padx=5, pady=5)
         self.azure_llmops_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.azure_llmops_url_var,
             width=30,
             state="readonly",
         )
-        self.azure_llmops_url_entry.grid(row=10, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_llmops_url_entry.grid(row=15, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_azure_llmops_btn = ttk.Button(
             hosting_frame,
             text="Open LLMOps",
             command=lambda: self.open_url_value(self.azure_llmops_url_var.get(), "Azure LLMOps dashboard"),
         )
-        self.open_azure_llmops_btn.grid(row=10, column=3, padx=5, pady=5)
+        self.open_azure_llmops_btn.grid(row=15, column=3, padx=5, pady=5)
 
         ttk.Separator(hosting_frame, orient="horizontal").grid(
-            row=11,
+            row=16,
             column=0,
             columnspan=4,
             sticky="ew",
@@ -492,16 +612,16 @@ class LogProcessorApp:
             pady=(4, 8),
         )
 
-        ttk.Label(hosting_frame, text="MLflow Enabled:").grid(row=12, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="MLflow Enabled:").grid(row=17, column=0, sticky="w", padx=5, pady=5)
         self.mlflow_enabled_var = tk.BooleanVar(value=True)
         self.mlflow_enabled_check = ttk.Checkbutton(
             hosting_frame,
             variable=self.mlflow_enabled_var,
             command=self.on_mlflow_enabled_change,
         )
-        self.mlflow_enabled_check.grid(row=12, column=1, sticky="w", padx=5, pady=5)
+        self.mlflow_enabled_check.grid(row=17, column=1, sticky="w", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="MLflow Backend:").grid(row=12, column=2, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="MLflow Backend:").grid(row=17, column=2, sticky="w", padx=5, pady=5)
         self.mlflow_backend_var = tk.StringVar(value="local")
         self.mlflow_backend_combo = ttk.Combobox(
             hosting_frame,
@@ -510,10 +630,10 @@ class LogProcessorApp:
             values=["local", "azure", "custom_uri"],
             width=15,
         )
-        self.mlflow_backend_combo.grid(row=12, column=3, sticky="ew", padx=5, pady=5)
+        self.mlflow_backend_combo.grid(row=17, column=3, sticky="ew", padx=5, pady=5)
         self.mlflow_backend_combo.bind("<<ComboboxSelected>>", self.on_mlflow_backend_change)
 
-        ttk.Label(hosting_frame, text="Tracking URI:").grid(row=13, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Tracking URI:").grid(row=18, column=0, sticky="w", padx=5, pady=5)
         self.mlflow_tracking_uri_var = tk.StringVar(value=self.local_mlflow_tracking_uri)
         self.mlflow_tracking_uri_entry = ttk.Entry(
             hosting_frame,
@@ -521,39 +641,39 @@ class LogProcessorApp:
             width=30,
             state="readonly",
         )
-        self.mlflow_tracking_uri_entry.grid(row=13, column=1, columnspan=3, sticky="ew", padx=5, pady=5)
+        self.mlflow_tracking_uri_entry.grid(row=18, column=1, columnspan=3, sticky="ew", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Experiment Name:").grid(row=14, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Experiment Name:").grid(row=19, column=0, sticky="w", padx=5, pady=5)
         self.mlflow_experiment_var = tk.StringVar(value="")
         self.mlflow_experiment_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.mlflow_experiment_var,
             width=24,
         )
-        self.mlflow_experiment_entry.grid(row=14, column=1, sticky="ew", padx=5, pady=5)
+        self.mlflow_experiment_entry.grid(row=19, column=1, sticky="ew", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Registered Model:").grid(row=14, column=2, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Registered Model:").grid(row=19, column=2, sticky="w", padx=5, pady=5)
         self.mlflow_registered_model_var = tk.StringVar(value="")
         self.mlflow_registered_model_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.mlflow_registered_model_var,
             width=24,
         )
-        self.mlflow_registered_model_entry.grid(row=14, column=3, sticky="ew", padx=5, pady=5)
+        self.mlflow_registered_model_entry.grid(row=19, column=3, sticky="ew", padx=5, pady=5)
 
         self.open_mlflow_btn = ttk.Button(
             hosting_frame,
             text="Open Dashboard",
             command=self.open_mlflow_console,
         )
-        self.open_mlflow_btn.grid(row=15, column=0, columnspan=2, sticky="ew", padx=5, pady=8)
+        self.open_mlflow_btn.grid(row=20, column=0, columnspan=2, sticky="ew", padx=5, pady=8)
 
         self.register_model_btn = ttk.Button(
             hosting_frame,
             text="Register Last Model",
             command=self.register_last_model_version,
         )
-        self.register_model_btn.grid(row=15, column=2, columnspan=2, sticky="ew", padx=5, pady=8)
+        self.register_model_btn.grid(row=20, column=2, columnspan=2, sticky="ew", padx=5, pady=8)
 
         # Status Bar
         self.status_var = tk.StringVar()
@@ -566,6 +686,7 @@ class LogProcessorApp:
         self.on_training_strategy_change()
         self.on_train_mode_change()
         self.on_hosting_mode_change()
+        self.refresh_hosted_model_inventory()
 
     def _on_content_frame_configure(self, event=None):
         self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
@@ -667,6 +788,245 @@ class LogProcessorApp:
         )
         if selected_dir:
             self.hosted_model_path_var.set(selected_dir)
+            self.refresh_hosted_model_inventory(preferred_path=selected_dir)
+
+    def refresh_azure_training_instance_options(self, preferred: str = ""):
+        candidates = self.get_azure_training_instance_candidates(self.azure_compute_var.get())
+        self.azure_instance_combo["values"] = candidates
+        preferred_value = clean_optional_string(preferred) or clean_optional_string(self.azure_training_instance_var.get())
+        if preferred_value in candidates:
+            self.azure_training_instance_var.set(preferred_value)
+        elif candidates:
+            self.azure_training_instance_var.set(candidates[0])
+        else:
+            self.azure_training_instance_var.set("")
+
+    def on_azure_training_compute_change(self, event=None):
+        self.refresh_azure_training_instance_options()
+
+    def refresh_azure_host_instance_options(self, preferred: str = ""):
+        candidates = self.get_azure_host_instance_candidates(self.azure_host_compute_var.get())
+        self.azure_host_instance_combo["values"] = candidates
+        preferred_value = clean_optional_string(preferred) or clean_optional_string(self.azure_host_instance_var.get())
+        if preferred_value in candidates:
+            self.azure_host_instance_var.set(preferred_value)
+        elif candidates:
+            self.azure_host_instance_var.set(candidates[0])
+        else:
+            self.azure_host_instance_var.set("")
+
+    def on_azure_host_compute_change(self, event=None):
+        self.refresh_azure_host_instance_options()
+
+    def is_supported_model_dir(self, candidate: Path) -> bool:
+        return candidate.is_dir() and (candidate / "config.json").exists() and (
+            (candidate / "pytorch_model.bin").exists()
+            or (candidate / "model.safetensors").exists()
+            or (candidate / "tf_model.h5").exists()
+        )
+
+    def archive_data_version(self, csv_path: str, metadata: dict | None = None) -> dict:
+        resolved_csv = Path(csv_path).expanduser().resolve()
+        if not resolved_csv.exists():
+            return {}
+
+        dataset_hash = compute_file_sha256(str(resolved_csv))
+        version_root = Path(self.project_dir) / "outputs" / "data_versions" / dataset_hash
+        version_root.mkdir(parents=True, exist_ok=True)
+
+        archived_dataset_path = version_root / "dataset.csv"
+        try:
+            same_target = archived_dataset_path.resolve() == resolved_csv
+        except Exception:
+            same_target = False
+        if not same_target:
+            shutil.copy2(str(resolved_csv), str(archived_dataset_path))
+
+        metadata_path = version_root / "metadata.json"
+        existing_metadata = read_json(str(metadata_path)) or {}
+        payload = {
+            "data_version_id": dataset_hash,
+            "dataset_hash": dataset_hash,
+            "source_dataset_path": str(resolved_csv),
+            "archived_dataset_path": str(archived_dataset_path),
+            "source_filename": resolved_csv.name,
+            "created_at": clean_optional_string(existing_metadata.get("created_at")) or now_utc_iso(),
+        }
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    cleaned = clean_optional_string(value)
+                    if not cleaned:
+                        continue
+                    payload[key] = cleaned
+                else:
+                    payload[key] = value
+        write_json(str(metadata_path), payload)
+        return {
+            "data_version_id": dataset_hash,
+            "data_version_dir": str(version_root),
+            "data_version_path": str(archived_dataset_path),
+        }
+
+    def iter_model_dirs_under(self, root: Path) -> list[Path]:
+        discovered: list[Path] = []
+        seen: set[str] = set()
+        if not root.exists():
+            return discovered
+
+        def add_candidate(candidate: Path) -> None:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+            key = str(resolved)
+            if key in seen or not self.is_supported_model_dir(resolved):
+                return
+            seen.add(key)
+            discovered.append(resolved)
+
+        add_candidate(root)
+        if not root.is_dir():
+            return discovered
+
+        try:
+            config_matches = sorted(root.rglob("config.json"))
+        except Exception:
+            config_matches = []
+        for config_path in config_matches:
+            add_candidate(config_path.parent)
+        return discovered
+
+    def find_training_metadata_for_model_dir(self, model_dir: Path) -> dict:
+        current = model_dir
+        for _ in range(6):
+            metadata_path = current / "last_training_mlflow.json"
+            if metadata_path.exists():
+                payload = read_json(str(metadata_path)) or {}
+                if payload:
+                    payload["_metadata_path"] = str(metadata_path)
+                    return payload
+            if current.parent == current:
+                break
+            current = current.parent
+        return {}
+
+    def build_model_inventory_label(self, source_label: str, model_dir: Path, metadata: dict) -> str:
+        created_at = clean_optional_string(metadata.get("created_at"))
+        created_label = created_at.replace("T", " ")[:19] if created_at else "no timestamp"
+        version_id = clean_optional_string(metadata.get("model_version_id"))
+        run_id = clean_optional_string(metadata.get("run_id"))
+        accuracy = ""
+        test_metrics = metadata.get("test_metrics")
+        if isinstance(test_metrics, dict) and test_metrics.get("accuracy") is not None:
+            try:
+                accuracy = f"acc {float(test_metrics['accuracy']):.4f}"
+            except Exception:
+                accuracy = f"acc {test_metrics['accuracy']}"
+
+        parts = [source_label, created_label]
+        if version_id:
+            parts.append(f"ver {version_id[:18]}")
+        elif run_id:
+            parts.append(f"run {run_id[:8]}")
+        if accuracy:
+            parts.append(accuracy)
+        parent_name = model_dir.parent.name if model_dir.name == "final_model" else model_dir.name
+        if parent_name:
+            parts.append(parent_name)
+        return " | ".join(parts)
+
+    def discover_available_hosted_models(self) -> list[dict]:
+        inventory: list[dict] = []
+        seen: set[str] = set()
+
+        def add_entry(candidate_path: Path, source_label: str) -> None:
+            try:
+                resolved_model_dir = Path(discover_model_dir(str(candidate_path))).resolve()
+            except Exception:
+                return
+            key = str(resolved_model_dir)
+            if key in seen:
+                return
+            seen.add(key)
+            metadata = self.find_training_metadata_for_model_dir(resolved_model_dir)
+            created_at = clean_optional_string(metadata.get("created_at"))
+            version_id = clean_optional_string(metadata.get("model_version_id"))
+            run_id = clean_optional_string(metadata.get("run_id"))
+            entry = {
+                "path": str(resolved_model_dir),
+                "source": source_label,
+                "created_at": created_at,
+                "model_version_id": version_id,
+                "run_id": run_id,
+                "label": self.build_model_inventory_label(source_label, resolved_model_dir, metadata),
+            }
+            inventory.append(entry)
+
+        latest_local_model = Path(self.project_dir) / "outputs" / "final_model"
+        add_entry(latest_local_model, "Latest local")
+
+        archived_models_root = Path(self.project_dir) / "outputs" / "model_versions"
+        if archived_models_root.exists():
+            for version_dir in sorted(archived_models_root.iterdir(), reverse=True):
+                add_entry(version_dir / "final_model", "Archived")
+
+        project_download_root = Path(self.project_dir) / "downloaded_model"
+        if project_download_root.exists():
+            for model_dir in self.iter_model_dirs_under(project_download_root):
+                add_entry(model_dir, "Downloaded")
+
+        current_selection = clean_optional_string(self.hosted_model_path_var.get())
+        if current_selection:
+            add_entry(Path(current_selection), "Selected")
+
+        def sort_key(entry: dict):
+            created_at = clean_optional_string(entry.get("created_at"))
+            version_id = clean_optional_string(entry.get("model_version_id"))
+            return (created_at, version_id, clean_optional_string(entry.get("path")))
+
+        return sorted(inventory, key=sort_key, reverse=True)
+
+    def refresh_hosted_model_inventory(self, preferred_path: str = ""):
+        inventory = self.discover_available_hosted_models()
+        self.hosted_model_inventory = inventory
+        values = [entry.get("label", "") for entry in inventory]
+        self.available_models_combo["values"] = values
+
+        preferred_model_path = clean_optional_string(preferred_path) or clean_optional_string(self.hosted_model_path_var.get())
+        resolved_preferred = ""
+        if preferred_model_path:
+            try:
+                resolved_preferred = str(Path(discover_model_dir(preferred_model_path)).resolve())
+            except Exception:
+                resolved_preferred = ""
+
+        selected_index = -1
+        if resolved_preferred:
+            for index, entry in enumerate(inventory):
+                if clean_optional_string(entry.get("path")) == resolved_preferred:
+                    selected_index = index
+                    break
+
+        if selected_index < 0 and inventory:
+            selected_index = 0
+
+        if selected_index >= 0:
+            self.available_models_combo.current(selected_index)
+            self.on_available_model_selected()
+        else:
+            self.available_model_choice_var.set("")
+
+    def on_available_model_selected(self, event=None):
+        current_index = self.available_models_combo.current()
+        if current_index < 0 or current_index >= len(self.hosted_model_inventory):
+            return
+        selected_entry = self.hosted_model_inventory[current_index]
+        selected_path = clean_optional_string(selected_entry.get("path"))
+        if selected_path:
+            self.hosted_model_path_var.set(selected_path)
 
     def on_hosting_mode_change(self):
         if not clean_optional_string(self.azure_host_sub_var.get()):
@@ -675,22 +1035,51 @@ class LogProcessorApp:
             self.azure_host_tenant_var.set(clean_optional_string(self.azure_tenant_entry.get()))
         if not clean_optional_string(self.azure_host_compute_var.get()):
             self.azure_host_compute_var.set(clean_optional_string(self.azure_compute_var.get()) or "cpu")
+        if not clean_optional_string(self.azure_host_instance_var.get()):
+            inherited_instance = clean_optional_string(self.azure_training_instance_var.get())
+            if inherited_instance:
+                self.azure_host_instance_var.set(inherited_instance)
+        if not clean_optional_string(self.azure_batch_timezone_var.get()):
+            self.azure_batch_timezone_var.set("UTC")
 
         is_azure = self.hosting_mode_var.get().strip() == "azure"
+        azure_service = self.azure_host_service_var.get().strip()
+        is_queued_batch = is_azure and azure_service == "queued_batch"
+        show_batch_schedule = is_queued_batch
         azure_widgets = [
+            self.azure_host_service_label,
+            self.azure_host_online_radio,
+            self.azure_host_queue_batch_radio,
             self.azure_host_sub_label,
             self.azure_host_sub_entry,
             self.azure_host_tenant_label,
             self.azure_host_tenant_entry,
             self.azure_host_compute_label,
             self.azure_host_compute_combo,
+            self.azure_host_instance_label,
+            self.azure_host_instance_combo,
         ]
         for widget in azure_widgets:
             if is_azure:
                 widget.grid()
             else:
                 widget.grid_remove()
+        for widget in (self.azure_batch_time_label, self.azure_batch_time_entry, self.azure_batch_timezone_label, self.azure_batch_timezone_combo, self.azure_batch_note_label):
+            if show_batch_schedule:
+                widget.grid()
+            else:
+                widget.grid_remove()
 
+        if is_queued_batch:
+            self.azure_batch_note_label.config(
+                text=(
+                    "Queued batch hosting deploys an Azure Function log API, Service Bus queue, "
+                    "Blob Storage, and a daily Azure ML batch launcher. Logs can arrive anytime; "
+                    "they are flushed and classified once per day at the scheduled time."
+                )
+            )
+
+        self.refresh_azure_host_instance_options()
         self.refresh_azure_dashboard_links()
         self._refresh_scroll_region()
 
@@ -713,9 +1102,9 @@ class LogProcessorApp:
     def finish_hosting_action(self):
         with self.hosting_state_lock:
             self.hosting_active = False
-            process = self.hosting_process
+            processes = [self.hosting_process, self.prometheus_process, self.grafana_process]
         self.host_service_btn.config(state="normal")
-        local_running = process is not None and process.poll() is None
+        local_running = any(process is not None and process.poll() is None for process in processes)
         self.stop_hosting_btn.config(state="normal" if local_running else "disabled")
 
     def is_iis_available(self) -> bool:
@@ -730,11 +1119,908 @@ class LogProcessorApp:
             sock.listen(1)
             return int(sock.getsockname()[1])
 
+    def terminate_process(self, process, timeout_seconds: int = 5) -> None:
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def read_process_output(self, process, limit: int = 4000) -> str:
+        if process is None or process.stdout is None or process.poll() is None:
+            return ""
+        try:
+            output = process.stdout.read() or ""
+        except Exception:
+            return ""
+        output = output.strip()
+        if len(output) > limit:
+            output = output[-limit:]
+        return output
+
+    def read_file_tail(self, path: str, limit: int = 6000) -> str:
+        target = Path(clean_optional_string(path))
+        if not target.exists() or not target.is_file():
+            return ""
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        text = text.strip()
+        if len(text) > limit:
+            text = text[-limit:]
+        return text
+
+    def shutdown_local_hosting_stack(self) -> None:
+        with self.hosting_state_lock:
+            processes = [
+                self.grafana_process,
+                self.prometheus_process,
+                self.hosting_process,
+            ]
+            self.grafana_process = None
+            self.prometheus_process = None
+            self.hosting_process = None
+        for process in processes:
+            self.terminate_process(process)
+
+    def find_local_executable(self, candidates: list[str]) -> str:
+        for candidate in candidates:
+            clean_candidate = clean_optional_string(candidate)
+            if not clean_candidate:
+                continue
+            resolved = shutil.which(clean_candidate)
+            if resolved:
+                return resolved
+            path_candidate = Path(clean_candidate).expanduser()
+            if path_candidate.is_file():
+                return str(path_candidate)
+        return ""
+
+    def get_local_observability_tools_root(self) -> Path:
+        platform_name = "windows" if sys.platform == "win32" else "linux"
+        return self.get_local_observability_root() / "tools" / platform_name
+
+    def get_local_observability_downloads_root(self) -> Path:
+        platform_name = "windows" if sys.platform == "win32" else "linux"
+        return self.get_local_observability_root() / "downloads" / platform_name
+
+    def get_observability_binary_names(self, tool_name: str) -> list[str]:
+        if tool_name == "grafana-server":
+            if sys.platform == "win32":
+                return ["grafana-server.exe", "grafana.exe"]
+            return ["grafana-server", "grafana"]
+        if tool_name == "prometheus":
+            return ["prometheus.exe"] if sys.platform == "win32" else ["prometheus"]
+        default_name = tool_name + (".exe" if sys.platform == "win32" else "")
+        return [default_name]
+
+    def find_vendored_observability_binary(self, tool_name: str) -> str:
+        root = self.get_local_observability_tools_root()
+        if not root.exists():
+            return ""
+
+        binary_names = self.get_observability_binary_names(tool_name)
+        preferred_root = root / tool_name / "current"
+        search_roots = [preferred_root, root]
+        seen: set[str] = set()
+        for search_root in search_roots:
+            try:
+                resolved_root = search_root.resolve()
+            except Exception:
+                resolved_root = search_root
+            key = str(resolved_root)
+            if key in seen or not search_root.exists():
+                continue
+            seen.add(key)
+            for binary_name in binary_names:
+                try:
+                    matches = list(search_root.rglob(binary_name))
+                except Exception:
+                    matches = []
+                matches = [path for path in matches if path.is_file()]
+                if matches:
+                    return str(max(matches, key=lambda path: len(path.parts)))
+        return ""
+
+    def get_os_release_info(self) -> dict:
+        target = Path("/etc/os-release")
+        if not target.exists():
+            return {}
+        payload: dict[str, str] = {}
+        try:
+            for raw_line in target.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or "=" not in line or line.startswith("#"):
+                    continue
+                key, value = line.split("=", 1)
+                payload[key.strip().lower()] = value.strip().strip('"')
+        except Exception:
+            return {}
+        return payload
+
+    def can_auto_install_local_observability(self) -> bool:
+        if sys.platform == "win32":
+            machine = platform.machine().lower()
+            return machine in {"amd64", "x86_64", "arm64"}
+        if not sys.platform.startswith("linux"):
+            return False
+        if not shutil.which("apt-get") or not shutil.which("pkexec"):
+            return False
+        release_info = self.get_os_release_info()
+        distro_id = clean_optional_string(release_info.get("id", "")).lower()
+        distro_like = clean_optional_string(release_info.get("id_like", "")).lower()
+        supported_ids = {"ubuntu", "debian"}
+        if distro_id in supported_ids:
+            return True
+        return any(token in supported_ids for token in distro_like.split())
+
+    def get_missing_local_observability_tools(self) -> list[str]:
+        missing: list[str] = []
+        if not self.get_prometheus_binary():
+            missing.append("prometheus")
+        if not self.get_grafana_server_binary():
+            missing.append("grafana-server")
+        return missing
+
+    def get_local_observability_install_script(self) -> str:
+        script_path = Path(self.project_dir) / "scripts" / "install_local_observability.sh"
+        if not script_path.exists():
+            raise RuntimeError("The local observability install script is missing from this project.")
+        return str(script_path)
+
+    def install_local_observability_dependencies(self) -> None:
+        if sys.platform == "win32":
+            self.install_windows_local_observability_dependencies()
+            return
+        if not self.can_auto_install_local_observability():
+            raise RuntimeError(
+                "Automatic installation is only supported on Debian/Ubuntu-style Linux systems with `pkexec` and `apt-get` available."
+            )
+
+        script_path = self.get_local_observability_install_script()
+        process = subprocess.Popen(
+            ["pkexec", "/bin/bash", script_path],
+            cwd=self.project_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        output, _ = process.communicate()
+        clean_output = (output or "").strip()
+        if process.returncode != 0:
+            if not clean_output:
+                clean_output = "Installation was canceled or the system denied the authorization request."
+            raise RuntimeError(
+                "Automatic installation of Grafana and Prometheus did not complete successfully.\n\n"
+                f"{clean_output[-4000:]}"
+            )
+
+        missing = self.get_missing_local_observability_tools()
+        if missing:
+            raise RuntimeError(
+                "The installation finished, but the required binaries are still missing: "
+                + ", ".join(missing)
+            )
+
+    def get_prometheus_binary(self) -> str:
+        return self.find_local_executable(
+            [
+                os.environ.get("PROMETHEUS_BIN", ""),
+                self.find_vendored_observability_binary("prometheus"),
+                "prometheus",
+                "/usr/bin/prometheus",
+                "/usr/local/bin/prometheus",
+            ]
+        )
+
+    def get_grafana_server_binary(self) -> str:
+        return self.find_local_executable(
+            [
+                os.environ.get("GRAFANA_SERVER_BIN", ""),
+                self.find_vendored_observability_binary("grafana-server"),
+                "grafana-server",
+                "grafana",
+                "/usr/sbin/grafana-server",
+                "/usr/bin/grafana-server",
+                "/usr/share/grafana/bin/grafana-server",
+                "/usr/local/bin/grafana-server",
+            ]
+        )
+
+    def fetch_text_url(self, url: str, timeout_seconds: int = 60) -> str:
+        response = requests.get(url, timeout=timeout_seconds)
+        response.raise_for_status()
+        return response.text
+
+    def download_url_to_file(self, url: str, destination_path: Path) -> None:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        with requests.get(url, stream=True, timeout=(30, 300)) as response:
+            response.raise_for_status()
+            with open(destination_path, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+
+    def clear_directory(self, target: Path) -> None:
+        if target.exists():
+            shutil.rmtree(target)
+        target.mkdir(parents=True, exist_ok=True)
+
+    def extract_zip_safely(self, archive_path: Path, destination_dir: Path) -> None:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        base_dir = destination_dir.resolve()
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                member_path = (destination_dir / member.filename).resolve()
+                if member.filename and member_path != base_dir and base_dir not in member_path.parents:
+                    raise RuntimeError(f"Unsafe ZIP archive entry: {member.filename}")
+            archive.extractall(destination_dir)
+
+    def extract_tar_safely(self, archive_path: Path, destination_dir: Path) -> None:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        base_dir = destination_dir.resolve()
+        with tarfile.open(archive_path, "r:*") as archive:
+            for member in archive.getmembers():
+                member_path = (destination_dir / member.name).resolve()
+                if member.name and member_path != base_dir and base_dir not in member_path.parents:
+                    raise RuntimeError(f"Unsafe TAR archive entry: {member.name}")
+            archive.extractall(destination_dir)
+
+    def fetch_grafana_windows_download_url(self) -> str:
+        page_text = self.fetch_text_url("https://grafana.com/grafana/download?platform=windows")
+        match = re.search(r"https://dl\.grafana\.com/[^\s\"']+windows_amd64\.(?:zip|tar\.gz)", page_text)
+        if not match:
+            raise RuntimeError("Could not find the official Grafana Windows standalone download URL.")
+        return match.group(0)
+
+    def fetch_prometheus_windows_download_url(self) -> str:
+        page_text = self.fetch_text_url("https://prometheus.io/download/")
+        match = re.search(
+            r"https://github\.com/prometheus/prometheus/releases/download/[^\s\"']+/prometheus-[^\s\"']+windows-amd64\.zip",
+            page_text,
+        )
+        if not match:
+            raise RuntimeError("Could not find the official Prometheus Windows download URL.")
+        return match.group(0)
+
+    def download_and_extract_observability_package(self, url: str, tool_name: str) -> str:
+        downloads_root = self.get_local_observability_downloads_root()
+        tools_root = self.get_local_observability_tools_root()
+        archive_name = Path(urlparse(url).path).name or f"{tool_name}.archive"
+        archive_path = downloads_root / archive_name
+        extract_root = tools_root / tool_name
+        current_root = extract_root / "current"
+
+        self.download_url_to_file(url, archive_path)
+        self.clear_directory(current_root)
+        if archive_name.endswith(".zip"):
+            self.extract_zip_safely(archive_path, current_root)
+        elif archive_name.endswith(".tar.gz") or archive_name.endswith(".tgz"):
+            self.extract_tar_safely(archive_path, current_root)
+        else:
+            raise RuntimeError(f"Unsupported archive format for {tool_name}: {archive_name}")
+
+        binary_path = self.find_vendored_observability_binary(tool_name)
+        if not binary_path:
+            expected_names = ", ".join(self.get_observability_binary_names(tool_name))
+            raise RuntimeError(
+                f"The {tool_name} archive was extracted, but the expected binary was not found.\n\n"
+                f"Looked for: {expected_names}"
+            )
+        return binary_path
+
+    def install_windows_local_observability_dependencies(self) -> None:
+        if not self.can_auto_install_local_observability():
+            raise RuntimeError(
+                "Automatic Windows installation is only supported on 64-bit Windows environments."
+            )
+
+        grafana_url = self.fetch_grafana_windows_download_url()
+        prometheus_url = self.fetch_prometheus_windows_download_url()
+
+        self.root.after(0, lambda: self.status_var.set("Downloading Prometheus for Windows..."))
+        self.download_and_extract_observability_package(prometheus_url, "prometheus")
+        self.root.after(0, lambda: self.status_var.set("Downloading Grafana for Windows..."))
+        self.download_and_extract_observability_package(grafana_url, "grafana-server")
+
+    def get_grafana_home(self, grafana_binary: str) -> str:
+        explicit_home = clean_optional_string(os.environ.get("GRAFANA_HOME", ""))
+        candidates: list[Path] = []
+        if explicit_home:
+            candidates.append(Path(explicit_home).expanduser())
+        binary_path = Path(grafana_binary).expanduser()
+        candidates.extend(
+            [
+                binary_path.parent.parent,
+                Path("/usr/share/grafana"),
+                Path("/usr/local/share/grafana"),
+            ]
+        )
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+            if (resolved / "conf" / "defaults.ini").exists() and (resolved / "public").exists():
+                return str(resolved)
+        return ""
+
+    def get_local_observability_root(self) -> Path:
+        return Path(self.project_dir) / "outputs" / "local_observability"
+
+    def yaml_quote(self, value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def wait_for_http_endpoint(
+        self,
+        url: str,
+        timeout_seconds: int = 60,
+        ready_statuses: tuple[int, ...] = (200, 302, 401, 403),
+    ) -> bool:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                response = requests.get(url, timeout=2, allow_redirects=False)
+                if response.status_code in ready_statuses:
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
+
+    def wait_for_process_http_endpoint(
+        self,
+        process,
+        url: str,
+        timeout_seconds: int = 60,
+        ready_statuses: tuple[int, ...] = (200, 302, 401, 403),
+    ) -> bool:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if process is not None and process.poll() is not None:
+                return False
+            try:
+                response = requests.get(url, timeout=2, allow_redirects=False)
+                if response.status_code in ready_statuses:
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
+
+    def wait_for_process_http_endpoints(
+        self,
+        process,
+        urls: list[str],
+        timeout_seconds: int = 60,
+        ready_statuses: tuple[int, ...] = (200, 302, 401, 403),
+    ) -> bool:
+        deadline = time.time() + timeout_seconds
+        candidate_urls = [clean_optional_string(url) for url in urls if clean_optional_string(url)]
+        while time.time() < deadline:
+            if process is not None and process.poll() is not None:
+                return False
+            for url in candidate_urls:
+                try:
+                    response = requests.get(url, timeout=2, allow_redirects=False)
+                    if response.status_code in ready_statuses:
+                        return True
+                except Exception:
+                    pass
+            time.sleep(1)
+        return False
+
+    def resolve_dashboard_tracking_console(self, launch_live_console: bool = True) -> tuple[str, str]:
+        training_meta = self.find_latest_training_mlflow_metadata() or {}
+        backend = self.mlflow_backend_var.get().strip() or "local"
+        tracking_uri = clean_optional_string(training_meta.get("tracking_uri")) or clean_optional_string(self.mlflow_tracking_uri_var.get())
+
+        if backend == "local":
+            if mlflow is None:
+                return "", "The local MLflow UI is unavailable because the `mlflow` package is not installed in this Python environment."
+            if launch_live_console:
+                try:
+                    return self.start_local_mlflow_ui(self.local_mlflow_tracking_uri), ""
+                except Exception as exc:
+                    return "", str(exc)
+            return "http://127.0.0.1:5001", ""
+
+        if backend == "custom_uri":
+            if tracking_uri.startswith("http://") or tracking_uri.startswith("https://"):
+                return tracking_uri, ""
+            return "", "The custom tracking URI is not an HTTP URL, so it cannot be opened in the browser."
+
+        sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
+        tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
+        studio_url = self.build_azure_studio_url(sub_id, tenant_id)
+        if studio_url:
+            return studio_url, ""
+        return "", "Azure dashboard URL is unavailable because the Azure subscription ID is empty."
+
+    def build_local_grafana_dashboard_json(
+        self,
+        hosting_meta: dict,
+        training_meta: dict,
+        tracking_console_url: str = "",
+        tracking_console_note: str = "",
+    ) -> str:
+        datasource = {"type": "prometheus", "uid": "local-prometheus"}
+        api_url = clean_optional_string(hosting_meta.get("api_url"))
+        api_home_url = api_url[:-8] if api_url.endswith("/predict") else api_url
+        health_url = clean_optional_string(hosting_meta.get("health_url"))
+        metrics_url = clean_optional_string(hosting_meta.get("metrics_url"))
+        prometheus_url = clean_optional_string(hosting_meta.get("prometheus_url"))
+        grafana_url = clean_optional_string(hosting_meta.get("grafana_url"))
+        model_version_id = clean_optional_string(hosting_meta.get("model_version_id")) or clean_optional_string(
+            training_meta.get("model_version_id")
+        )
+        run_id = clean_optional_string(training_meta.get("run_id"))
+        experiment_name = clean_optional_string(training_meta.get("experiment_name")) or clean_optional_string(
+            self.mlflow_experiment_var.get()
+        )
+        backend = self.mlflow_backend_var.get().strip() or "local"
+        sample_request = json.dumps({"errorMessage": "timeout while opening socket"}, indent=2)
+
+        details_lines = [
+            "# Log Monitor Local Hosting",
+            "",
+            f"- Prediction endpoint: [{api_url}]({api_url})" if api_url else "- Prediction endpoint: not available",
+            f"- API home: [{api_home_url}]({api_home_url})" if api_home_url else "- API home: not available",
+            f"- Health check: [{health_url}]({health_url})" if health_url else "- Health check: not available",
+            f"- Metrics: [{metrics_url}]({metrics_url})" if metrics_url else "- Metrics: not available",
+            f"- Prometheus: [{prometheus_url}]({prometheus_url})" if prometheus_url else "- Prometheus: not available",
+            f"- Grafana: [{grafana_url}]({grafana_url})" if grafana_url else "- Grafana: not available",
+            f"- Model version: `{model_version_id or 'Not available'}`",
+            f"- Training run: `{run_id or 'Not available'}`",
+            f"- Experiment: `{experiment_name or 'Not available'}`",
+            f"- Tracking backend: `{backend}`",
+        ]
+        if tracking_console_url:
+            details_lines.append(f"- Tracking console: [{tracking_console_url}]({tracking_console_url})")
+        elif tracking_console_note:
+            details_lines.append(f"- Tracking console: {tracking_console_note}")
+        details_lines.extend(
+            [
+                "",
+                "## Request Example",
+                "",
+                "```json",
+                sample_request,
+                "```",
+            ]
+        )
+        details_markdown = "\n".join(details_lines)
+
+        panels = [
+            {
+                "id": 1,
+                "type": "stat",
+                "title": "Prediction Requests",
+                "datasource": datasource,
+                "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+                "targets": [{"expr": "sum(log_monitor_predictions_total)", "instant": True, "refId": "A"}],
+                "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+                "options": {
+                    "reduceOptions": {"values": False, "calcs": ["lastNotNull"], "fields": ""},
+                    "orientation": "auto",
+                    "textMode": "value_and_name",
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "auto",
+                },
+            },
+            {
+                "id": 2,
+                "type": "stat",
+                "title": "Average Predict Latency",
+                "datasource": datasource,
+                "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+                "targets": [
+                    {
+                        "expr": "1000 * sum(log_monitor_request_duration_seconds_sum{path=\"/predict\"}) / clamp_min(sum(log_monitor_request_duration_seconds_count{path=\"/predict\"}), 1)",
+                        "instant": True,
+                        "refId": "A",
+                    }
+                ],
+                "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+                "options": {
+                    "reduceOptions": {"values": False, "calcs": ["lastNotNull"], "fields": ""},
+                    "orientation": "auto",
+                    "textMode": "value_and_name",
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "auto",
+                },
+            },
+            {
+                "id": 3,
+                "type": "stat",
+                "title": "API Uptime",
+                "datasource": datasource,
+                "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+                "targets": [{"expr": "log_monitor_process_uptime_seconds", "instant": True, "refId": "A"}],
+                "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+                "options": {
+                    "reduceOptions": {"values": False, "calcs": ["lastNotNull"], "fields": ""},
+                    "orientation": "auto",
+                    "textMode": "value_and_name",
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "auto",
+                },
+            },
+            {
+                "id": 4,
+                "type": "stat",
+                "title": "Model Loaded",
+                "datasource": datasource,
+                "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+                "targets": [{"expr": "log_monitor_model_loaded", "instant": True, "refId": "A"}],
+                "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+                "options": {
+                    "reduceOptions": {"values": False, "calcs": ["lastNotNull"], "fields": ""},
+                    "orientation": "auto",
+                    "textMode": "value_and_name",
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "auto",
+                },
+            },
+            {
+                "id": 5,
+                "type": "timeseries",
+                "title": "Request Rate By Path",
+                "datasource": datasource,
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+                "targets": [
+                    {
+                        "expr": "sum by (path) (rate(log_monitor_http_requests_total{path!=\"/metrics\"}[5m]))",
+                        "legendFormat": "{{path}}",
+                        "refId": "A",
+                    }
+                ],
+                "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+                "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+            },
+            {
+                "id": 6,
+                "type": "timeseries",
+                "title": "Response Codes",
+                "datasource": datasource,
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+                "targets": [
+                    {
+                        "expr": "sum by (status) (rate(log_monitor_http_requests_total{path!=\"/metrics\"}[5m]))",
+                        "legendFormat": "HTTP {{status}}",
+                        "refId": "A",
+                    }
+                ],
+                "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+                "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+            },
+            {
+                "id": 7,
+                "type": "table",
+                "title": "Prediction Totals By Label",
+                "datasource": datasource,
+                "gridPos": {"h": 8, "w": 10, "x": 0, "y": 12},
+                "targets": [
+                    {
+                        "expr": "sum by (prediction) (log_monitor_predictions_total)",
+                        "format": "table",
+                        "instant": True,
+                        "refId": "A",
+                    }
+                ],
+                "options": {"showHeader": True},
+                "fieldConfig": {"defaults": {}, "overrides": []},
+            },
+            {
+                "id": 8,
+                "type": "text",
+                "title": "Service Notes",
+                "gridPos": {"h": 8, "w": 14, "x": 10, "y": 12},
+                "options": {"mode": "markdown", "content": details_markdown},
+            },
+        ]
+
+        dashboard = {
+            "id": None,
+            "uid": "log-monitor-local",
+            "title": "Log Monitor Local Hosting",
+            "tags": ["log-monitor", "local", "grafana"],
+            "timezone": "browser",
+            "schemaVersion": 39,
+            "version": 1,
+            "refresh": "10s",
+            "time": {"from": "now-6h", "to": "now"},
+            "annotations": {"list": []},
+            "editable": False,
+            "fiscalYearStartMonth": 0,
+            "graphTooltip": 0,
+            "panels": panels,
+            "templating": {"list": []},
+        }
+        return json.dumps(dashboard, indent=2)
+
+    def write_local_observability_files(
+        self,
+        hosting_meta: dict,
+        training_meta: dict,
+        tracking_console_url: str = "",
+        tracking_console_note: str = "",
+    ) -> dict:
+        root = self.get_local_observability_root()
+        prometheus_root = root / "prometheus"
+        grafana_root = root / "grafana"
+        provisioning_root = grafana_root / "provisioning"
+        datasources_root = provisioning_root / "datasources"
+        dashboards_root = provisioning_root / "dashboards"
+        dashboard_files_root = grafana_root / "dashboards"
+        grafana_data_root = grafana_root / "data"
+        grafana_logs_root = grafana_root / "logs"
+        grafana_plugins_root = grafana_root / "plugins"
+        prometheus_data_root = prometheus_root / "data"
+
+        for path in [
+            prometheus_root,
+            prometheus_data_root,
+            datasources_root,
+            dashboards_root,
+            dashboard_files_root,
+            grafana_data_root,
+            grafana_logs_root,
+            grafana_plugins_root,
+        ]:
+            path.mkdir(parents=True, exist_ok=True)
+
+        metrics_url = clean_optional_string(hosting_meta.get("metrics_url"))
+        metrics_target = urlparse(metrics_url).netloc or "127.0.0.1:8000"
+        prometheus_url = clean_optional_string(hosting_meta.get("prometheus_url"))
+
+        prometheus_config_path = prometheus_root / "prometheus.yml"
+        prometheus_config_path.write_text(
+            (
+                "global:\n"
+                "  scrape_interval: 5s\n"
+                "  evaluation_interval: 5s\n\n"
+                "scrape_configs:\n"
+                "  - job_name: 'log-monitor-local-api'\n"
+                "    metrics_path: /metrics\n"
+                "    static_configs:\n"
+                f"      - targets: [{self.yaml_quote(metrics_target)}]\n"
+                "        labels:\n"
+                "          service: 'log-monitor-local-api'\n"
+            ),
+            encoding="utf-8",
+        )
+
+        datasource_path = datasources_root / "local-prometheus.yml"
+        datasource_path.write_text(
+            (
+                "apiVersion: 1\n"
+                "datasources:\n"
+                "  - name: Local Prometheus\n"
+                "    uid: local-prometheus\n"
+                "    type: prometheus\n"
+                "    access: proxy\n"
+                f"    url: {self.yaml_quote(prometheus_url)}\n"
+                "    isDefault: true\n"
+                "    editable: false\n"
+            ),
+            encoding="utf-8",
+        )
+
+        dashboard_provider_path = dashboards_root / "log-monitor-local.yml"
+        dashboard_provider_path.write_text(
+            (
+                "apiVersion: 1\n"
+                "providers:\n"
+                "  - name: Log Monitor Local\n"
+                "    orgId: 1\n"
+                "    type: file\n"
+                "    disableDeletion: false\n"
+                "    updateIntervalSeconds: 5\n"
+                "    allowUiUpdates: false\n"
+                "    options:\n"
+                f"      path: {self.yaml_quote(str(dashboard_files_root.resolve()))}\n"
+            ),
+            encoding="utf-8",
+        )
+
+        dashboard_path = dashboard_files_root / "log-monitor-local-hosting.json"
+        dashboard_path.write_text(
+            self.build_local_grafana_dashboard_json(
+                hosting_meta=hosting_meta,
+                training_meta=training_meta,
+                tracking_console_url=tracking_console_url,
+                tracking_console_note=tracking_console_note,
+            ),
+            encoding="utf-8",
+        )
+
+        return {
+            "root": str(root.resolve()),
+            "prometheus_config_path": str(prometheus_config_path.resolve()),
+            "prometheus_data_path": str(prometheus_data_root.resolve()),
+            "prometheus_launch_log_path": str((prometheus_root / "prometheus.log").resolve()),
+            "grafana_provisioning_path": str(provisioning_root.resolve()),
+            "grafana_dashboard_path": str(dashboard_path.resolve()),
+            "grafana_data_path": str(grafana_data_root.resolve()),
+            "grafana_logs_path": str(grafana_logs_root.resolve()),
+            "grafana_plugins_path": str(grafana_plugins_root.resolve()),
+            "grafana_launch_log_path": str((grafana_logs_root / "grafana-startup.log").resolve()),
+        }
+
+    def refresh_local_grafana_dashboard(self, launch_live_console: bool = True) -> None:
+        hosting_meta = self.read_last_hosting_metadata()
+        if clean_optional_string(hosting_meta.get("mode")) != "local":
+            return
+        training_meta = self.find_latest_training_mlflow_metadata() or {}
+        tracking_console_url, tracking_console_note = self.resolve_dashboard_tracking_console(
+            launch_live_console=launch_live_console
+        )
+        self.write_local_observability_files(
+            hosting_meta=hosting_meta,
+            training_meta=training_meta,
+            tracking_console_url=tracking_console_url,
+            tracking_console_note=tracking_console_note,
+        )
+
+    def start_local_prometheus(self, config_path: str, data_path: str, port: int, log_path: str = ""):
+        prometheus_binary = self.get_prometheus_binary()
+        if not prometheus_binary:
+            raise RuntimeError(
+                "Prometheus is required for local Grafana hosting, but the `prometheus` binary was not found.\n\n"
+                "Install Prometheus and ensure it is available on PATH, or set the `PROMETHEUS_BIN` environment variable."
+            )
+
+        log_handle = None
+        if log_path:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(log_path).write_text("", encoding="utf-8")
+            log_handle = open(log_path, "a", encoding="utf-8")
+
+        process = subprocess.Popen(
+            [
+                prometheus_binary,
+                f"--config.file={config_path}",
+                f"--storage.tsdb.path={data_path}",
+                f"--web.listen-address=127.0.0.1:{port}",
+                "--web.enable-lifecycle",
+            ],
+            cwd=self.project_dir,
+            stdout=log_handle if log_handle is not None else subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=log_handle is None,
+            bufsize=1 if log_handle is None else -1,
+        )
+        if log_handle is not None:
+            log_handle.close()
+        ready_url = f"http://127.0.0.1:{port}/-/ready"
+        if not self.wait_for_process_http_endpoint(process, ready_url, timeout_seconds=60, ready_statuses=(200,)):
+            output = self.read_file_tail(log_path) if log_path else self.read_process_output(process)
+            self.terminate_process(process)
+            if output:
+                raise RuntimeError(
+                    "Prometheus failed to start.\n\n"
+                    + (f"Startup log: {log_path}\n\n" if log_path else "")
+                    + output
+                )
+            raise TimeoutError(
+                "Timed out waiting for Prometheus to become ready."
+                + (f"\n\nStartup log: {log_path}" if log_path else "")
+            )
+        return process
+
+    def start_local_grafana(
+        self,
+        provisioning_path: str,
+        dashboard_path: str,
+        data_path: str,
+        logs_path: str,
+        plugins_path: str,
+        port: int,
+        log_path: str = "",
+    ):
+        grafana_binary = self.get_grafana_server_binary()
+        if not grafana_binary:
+            raise RuntimeError(
+                "Grafana is required for local hosting, but the `grafana-server` binary was not found.\n\n"
+                "Install Grafana and ensure it is available on PATH, or set the `GRAFANA_SERVER_BIN` environment variable."
+            )
+
+        grafana_home = self.get_grafana_home(grafana_binary)
+        if not grafana_home:
+            raise RuntimeError(
+                "The Grafana server binary was found, but the app could not determine Grafana's home directory.\n\n"
+                "Set the `GRAFANA_HOME` environment variable to the folder that contains Grafana's `conf` and `public` directories."
+            )
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "GF_PATHS_DATA": data_path,
+                "GF_PATHS_LOGS": logs_path,
+                "GF_PATHS_PLUGINS": plugins_path,
+                "GF_PATHS_PROVISIONING": provisioning_path,
+                "GF_SERVER_HTTP_ADDR": "127.0.0.1",
+                "GF_SERVER_HTTP_PORT": str(port),
+                "GF_SERVER_ROOT_URL": f"http://127.0.0.1:{port}/",
+                "GF_LOG_MODE": "console file",
+                "GF_AUTH_ANONYMOUS_ENABLED": "true",
+                "GF_AUTH_ANONYMOUS_ORG_NAME": "Main Org.",
+                "GF_AUTH_ANONYMOUS_ORG_ROLE": "Viewer",
+                "GF_AUTH_BASIC_ENABLED": "false",
+                "GF_AUTH_DISABLE_LOGIN_FORM": "true",
+                "GF_USERS_ALLOW_SIGN_UP": "false",
+                "GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH": dashboard_path,
+            }
+        )
+
+        grafana_command = [grafana_binary]
+        if Path(grafana_binary).stem.lower() == "grafana":
+            grafana_command.append("server")
+        grafana_command.extend(["--homepath", grafana_home])
+
+        log_handle = None
+        if log_path:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(log_path).write_text("", encoding="utf-8")
+            log_handle = open(log_path, "a", encoding="utf-8")
+
+        process = subprocess.Popen(
+            grafana_command,
+            cwd=grafana_home,
+            env=env,
+            stdout=log_handle if log_handle is not None else subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=log_handle is None,
+            bufsize=1 if log_handle is None else -1,
+        )
+        if log_handle is not None:
+            log_handle.close()
+        readiness_urls = [
+            f"http://127.0.0.1:{port}/api/health",
+            f"http://127.0.0.1:{port}/login",
+            f"http://127.0.0.1:{port}/",
+        ]
+        if not self.wait_for_process_http_endpoints(process, readiness_urls, timeout_seconds=300, ready_statuses=(200, 302, 401, 403)):
+            output = self.read_file_tail(log_path) if log_path else self.read_process_output(process)
+            self.terminate_process(process)
+            if output:
+                raise RuntimeError(
+                    "Grafana failed to start.\n\n"
+                    + (f"Startup log: {log_path}\n\n" if log_path else "")
+                    + output
+                )
+            raise TimeoutError(
+                "Timed out waiting for Grafana to become ready."
+                + (f"\n\nStartup log: {log_path}" if log_path else "")
+            )
+        return process
+
     def sanitize_azure_name(self, raw_value: str, max_length: int = 32) -> str:
         cleaned = re.sub(r"[^a-z0-9-]", "-", clean_optional_string(raw_value).lower())
         cleaned = re.sub(r"-+", "-", cleaned).strip("-")
         cleaned = cleaned[:max_length].strip("-")
         return cleaned or "log-monitor"
+
+    def sanitize_azure_storage_name(self, raw_value: str, max_length: int = 24) -> str:
+        cleaned = re.sub(r"[^a-z0-9]", "", clean_optional_string(raw_value).lower())
+        cleaned = cleaned[:max_length]
+        if len(cleaned) < 3:
+            cleaned = (cleaned + "logmonitor")[:max_length]
+        return cleaned or "logmonitorstore"
 
     def build_azure_workspace_id(self, sub_id: str) -> str:
         return (
@@ -742,22 +2028,73 @@ class LogProcessorApp:
             f"/providers/Microsoft.MachineLearningServices/workspaces/{self.WORKSPACE_NAME}"
         )
 
-    def build_azure_studio_url(self, sub_id: str) -> str:
+    def build_azure_studio_workspace_id(self, sub_id: str) -> str:
+        return (
+            f"/subscriptions/{sub_id}/resourcegroups/{self.RESOURCE_GROUP}"
+            f"/workspaces/{self.WORKSPACE_NAME}"
+        )
+
+    def build_azure_studio_query(self, sub_id: str, tenant_id: str = "") -> str:
         clean_sub_id = clean_optional_string(sub_id)
         if not clean_sub_id:
             return ""
-        wsid = self.build_azure_workspace_id(clean_sub_id)
-        return f"https://ml.azure.com/experiments?wsid={url_quote(wsid, safe='')}"
+        studio_wsid = self.build_azure_studio_workspace_id(clean_sub_id)
+        query = f"wsid={url_quote(studio_wsid, safe='')}"
+        clean_tenant_id = clean_optional_string(tenant_id)
+        if clean_tenant_id:
+            query += f"&tid={url_quote(clean_tenant_id, safe='')}"
+        return query
 
-    def build_azure_dashboard_urls(self, sub_id: str) -> tuple[str, str]:
-        clean_sub_id = clean_optional_string(sub_id)
-        if not clean_sub_id:
+    def build_azure_studio_url(self, sub_id: str, tenant_id: str = "") -> str:
+        query = self.build_azure_studio_query(sub_id, tenant_id)
+        if not query:
+            return ""
+        return f"https://ml.azure.com/experiments?{query}"
+
+    def build_azure_dashboard_urls(self, sub_id: str, tenant_id: str = "") -> tuple[str, str]:
+        query = self.build_azure_studio_query(sub_id, tenant_id)
+        if not query:
             return "", ""
-        wsid = self.build_azure_workspace_id(clean_sub_id)
-        encoded_wsid = url_quote(wsid, safe="")
-        mlops_url = f"https://ml.azure.com/models?wsid={encoded_wsid}"
-        llmops_url = f"https://ml.azure.com/experiments?wsid={encoded_wsid}"
+        mlops_url = f"https://ml.azure.com/experiments?{query}"
+        llmops_url = f"https://ml.azure.com/experiments?{query}"
         return mlops_url, llmops_url
+
+    def dedupe_instance_candidates(self, candidates: list[str]) -> list[str]:
+        unique_candidates: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            clean_candidate = clean_optional_string(candidate)
+            if not clean_candidate or clean_candidate in seen:
+                continue
+            seen.add(clean_candidate)
+            unique_candidates.append(clean_candidate)
+        return unique_candidates
+
+    def prioritize_instance_candidates(self, candidates: list[str], preferred: str) -> list[str]:
+        ordered = self.dedupe_instance_candidates(candidates)
+        preferred_clean = clean_optional_string(preferred)
+        if preferred_clean and preferred_clean in ordered:
+            ordered.remove(preferred_clean)
+            ordered.insert(0, preferred_clean)
+        return ordered
+
+    def get_azure_training_instance_candidates(self, azure_compute: str) -> list[str]:
+        compute_mode = clean_optional_string(azure_compute).lower() or "cpu"
+        if compute_mode == "gpu":
+            candidates = [
+                "Standard_NC4as_T4_v3",
+                "Standard_NC6s_v3",
+            ]
+        else:
+            candidates = [
+                "Standard_D2as_v4",
+                "Standard_DS2_v2",
+                "Standard_DS1_v2",
+                "Standard_F2s_v2",
+                "Standard_E2s_v3",
+                "Standard_E4s_v3",
+            ]
+        return self.dedupe_instance_candidates(candidates)
 
     def get_azure_host_instance_candidates(self, azure_compute: str) -> list[str]:
         compute_mode = clean_optional_string(azure_compute).lower() or "cpu"
@@ -772,17 +2109,49 @@ class LogProcessorApp:
                 "Standard_DS2_v2",
                 "Standard_DS1_v2",
                 "Standard_F2s_v2",
+                "Standard_E2s_v3",
+                "Standard_E4s_v3",
                 "Standard_DS3_v2",
             ]
+        return self.dedupe_instance_candidates(candidates)
 
-        unique_candidates: list[str] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            unique_candidates.append(candidate)
-        return unique_candidates
+    def get_azure_batch_timezone_options(self) -> list[str]:
+        return [
+            "UTC",
+            "Eastern Standard Time",
+            "Central Standard Time",
+            "Mountain Standard Time",
+            "Pacific Standard Time",
+        ]
+
+    def get_azure_batch_timezone_iana(self, timezone_name: str) -> str:
+        mapping = {
+            "UTC": "UTC",
+            "Eastern Standard Time": "America/New_York",
+            "Central Standard Time": "America/Chicago",
+            "Mountain Standard Time": "America/Denver",
+            "Pacific Standard Time": "America/Los_Angeles",
+        }
+        return mapping.get(clean_optional_string(timezone_name), "UTC")
+
+    def parse_daily_time(self, raw_value: str) -> tuple[int, int]:
+        clean_value = clean_optional_string(raw_value)
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", clean_value)
+        if not match:
+            raise ValueError("Enter the batch time as HH:MM using 24-hour time, for example 02:00 or 14:30.")
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("Batch time must use hours 00-23 and minutes 00-59.")
+        return hour, minute
+
+    def is_cloud_accessible_batch_input(self, raw_value: str) -> bool:
+        clean_value = clean_optional_string(raw_value)
+        if not clean_value:
+            return False
+        if clean_value.startswith("/subscriptions/") or clean_value.startswith("azureml:"):
+            return True
+        return re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", clean_value) is not None
 
     def is_azure_quota_error(self, exc: Exception) -> bool:
         message = clean_optional_string(str(exc)).lower()
@@ -800,7 +2169,7 @@ class LogProcessorApp:
             attempted_text = ", ".join(attempted_instance_types or [])
             guidance = (
                 "Azure hosting failed because this subscription does not have enough quota in "
-                f"`eastus` for the online endpoint VM sizes we tried.\n\n"
+                f"`eastus` for the VM sizes we tried.\n\n"
             )
             if attempted_text:
                 guidance += f"Tried instance types:\n- {attempted_text.replace(', ', chr(10) + '- ')}\n\n"
@@ -809,15 +2178,466 @@ class LogProcessorApp:
                 "- Request a quota increase in Azure for one of those VM families.\n"
                 "- Use a different Azure subscription with available quota.\n"
                 "- Change the workspace region from `eastus` if you want to target a region with quota.\n"
+                "- Pick a smaller VM size in the hosting form and try again.\n"
             )
             return guidance
         return message
 
     def refresh_azure_dashboard_links(self):
         sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
-        mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id)
+        tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
+        mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id, tenant_id)
         self.azure_mlops_url_var.set(mlops_url)
         self.azure_llmops_url_var.set(llmops_url)
+
+    def normalize_arm_template_outputs(self, outputs) -> dict:
+        if outputs is None:
+            return {}
+        if hasattr(outputs, "items"):
+            raw_items = outputs.items()
+        else:
+            return {}
+        normalized: dict[str, str] = {}
+        for key, value in raw_items:
+            if isinstance(value, dict) and "value" in value:
+                normalized[key] = value.get("value")
+            else:
+                normalized[key] = value
+        return normalized
+
+    def get_azure_management_token(self, credential) -> str:
+        token = credential.get_token("https://management.azure.com/.default")
+        return clean_optional_string(getattr(token, "token", ""))
+
+    def azure_management_json_request(
+        self,
+        credential,
+        method: str,
+        url: str,
+        payload: dict | None = None,
+        expected_statuses: tuple[int, ...] = (200, 201, 202),
+    ) -> dict:
+        headers = {
+            "Authorization": f"Bearer {self.get_azure_management_token(credential)}",
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            headers=headers,
+            json=payload,
+            timeout=180,
+        )
+        body_text = response.text.strip()
+        if response.status_code not in expected_statuses:
+            detail = body_text
+            try:
+                parsed = response.json()
+                detail = json.dumps(parsed, indent=2, ensure_ascii=True)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Azure management request failed ({response.status_code} {response.reason}).\n\n{detail[:4000]}"
+            )
+
+        if not body_text:
+            return {}
+        try:
+            return response.json()
+        except Exception:
+            try:
+                parsed, _ = json.JSONDecoder().raw_decode(body_text)
+                return parsed
+            except Exception:
+                return {"raw_body": body_text}
+
+    def load_azure_function_bridge_template(self) -> dict:
+        template_path = Path(self.project_dir) / "azure_function_bridge_infra.json"
+        template = read_json(str(template_path))
+        if not isinstance(template, dict):
+            raise RuntimeError("Could not load the Azure Function bridge ARM template.")
+        return template
+
+    def wait_for_resource_group_deployment(
+        self,
+        credential,
+        sub_id: str,
+        deployment_name: str,
+        timeout_seconds: int = 1800,
+    ) -> dict:
+        url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
+            f"/providers/Microsoft.Resources/deployments/{deployment_name}"
+            "?api-version=2025-04-01"
+        )
+        deadline = time.time() + timeout_seconds
+        last_state = ""
+        while time.time() < deadline:
+            payload = self.azure_management_json_request(
+                credential,
+                "GET",
+                url,
+                expected_statuses=(200,),
+            )
+            properties = payload.get("properties") if isinstance(payload.get("properties"), dict) else {}
+            provisioning_state = clean_optional_string(properties.get("provisioningState"))
+            if provisioning_state:
+                last_state = provisioning_state
+            if provisioning_state == "Succeeded":
+                return payload
+            if provisioning_state in {"Failed", "Canceled"}:
+                error_payload = properties.get("error")
+                detail = json.dumps(error_payload, indent=2, ensure_ascii=True) if error_payload else json.dumps(payload, indent=2, ensure_ascii=True)
+                raise RuntimeError(
+                    f"Azure infrastructure deployment {provisioning_state.lower()}.\n\n{detail[:4000]}"
+                )
+            time.sleep(10)
+        raise TimeoutError(
+            "Timed out waiting for the Azure infrastructure deployment to finish."
+            + (f" Last known state: {last_state}." if last_state else "")
+        )
+
+    def deploy_azure_function_bridge_infrastructure(
+        self,
+        credential,
+        sub_id: str,
+        function_app_name: str,
+        function_plan_name: str,
+        storage_account_name: str,
+        service_bus_namespace_name: str,
+        service_bus_queue_name: str,
+    ) -> dict:
+        deployment_name = self.sanitize_azure_name(f"log-monitor-bridge-{function_app_name}", max_length=50)
+        workspace_resource_id = self.build_azure_workspace_id(sub_id)
+        template = self.load_azure_function_bridge_template()
+        parameters = {
+            "location": {"value": "eastus"},
+            "workspaceResourceId": {"value": workspace_resource_id},
+            "functionPlanName": {"value": function_plan_name},
+            "functionAppName": {"value": function_app_name},
+            "storageAccountName": {"value": storage_account_name},
+            "serviceBusNamespaceName": {"value": service_bus_namespace_name},
+            "serviceBusQueueName": {"value": service_bus_queue_name},
+        }
+        deployment_properties = {
+            "mode": "Incremental",
+            "template": template,
+            "parameters": parameters,
+        }
+        url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
+            f"/providers/Microsoft.Resources/deployments/{deployment_name}"
+            "?api-version=2025-04-01"
+        )
+        self.azure_management_json_request(
+            credential,
+            "PUT",
+            url,
+            payload={"properties": deployment_properties},
+            expected_statuses=(200, 201, 202),
+        )
+        deployment = self.wait_for_resource_group_deployment(
+            credential=credential,
+            sub_id=sub_id,
+            deployment_name=deployment_name,
+        )
+        properties = deployment.get("properties") if isinstance(deployment.get("properties"), dict) else {}
+        outputs = properties.get("outputs")
+        normalized = self.normalize_arm_template_outputs(outputs)
+        if not normalized:
+            raise RuntimeError("Azure infrastructure deployment completed but did not return the expected outputs.")
+        return normalized
+
+    def build_function_bridge_package(self, package_name: str) -> str:
+        bridge_root = Path(self.project_dir) / "azure_function_bridge"
+        if not bridge_root.exists():
+            raise RuntimeError("The Azure Function bridge files are missing from this project.")
+        package_path = Path(tempfile.gettempdir()) / f"{package_name}.zip"
+        if package_path.exists():
+            package_path.unlink()
+        with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for file_path in bridge_root.rglob("*"):
+                if not file_path.is_file() or "__pycache__" in file_path.parts:
+                    continue
+                archive.write(file_path, arcname=str(file_path.relative_to(bridge_root)))
+        return str(package_path)
+
+    def upload_function_bridge_package(
+        self,
+        storage_connection_string: str,
+        storage_account_name: str,
+        storage_account_key: str,
+        package_path: str,
+        package_container_name: str = "functionpkgs",
+    ) -> str:
+        from azure.storage.blob import BlobSasPermissions, BlobServiceClient, generate_blob_sas
+
+        blob_service = BlobServiceClient.from_connection_string(storage_connection_string)
+        container_client = blob_service.get_container_client(package_container_name)
+        package_blob_name = f"releases/{Path(package_path).name}"
+        with open(package_path, "rb") as handle:
+            container_client.upload_blob(name=package_blob_name, data=handle, overwrite=True)
+
+        sas_token = generate_blob_sas(
+            account_name=storage_account_name,
+            container_name=package_container_name,
+            blob_name=package_blob_name,
+            account_key=storage_account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+        return (
+            f"https://{storage_account_name}.blob.core.windows.net/"
+            f"{package_container_name}/{package_blob_name}?{sas_token}"
+        )
+
+    def set_function_app_settings(
+        self,
+        credential,
+        sub_id: str,
+        function_app_name: str,
+        settings: dict,
+    ) -> None:
+        url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
+            f"/providers/Microsoft.Web/sites/{function_app_name}/config/appsettings"
+            "?api-version=2025-03-01"
+        )
+        self.azure_management_json_request(
+            credential,
+            "PUT",
+            url,
+            payload={"properties": settings},
+            expected_statuses=(200,),
+        )
+
+    def trigger_function_app_onedeploy(
+        self,
+        credential,
+        sub_id: str,
+        function_app_name: str,
+        package_uri: str,
+    ) -> None:
+        url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
+            f"/providers/Microsoft.Web/sites/{function_app_name}/extensions/onedeploy"
+            "?api-version=2025-03-01"
+        )
+        self.azure_management_json_request(
+            credential,
+            "PUT",
+            url,
+            payload={
+                "properties": {
+                    "packageUri": package_uri,
+                    "remoteBuild": True,
+                },
+                "type": "zip",
+            },
+            expected_statuses=(200, 202),
+        )
+
+    def wait_for_function_bridge_endpoint(
+        self,
+        credential,
+        sub_id: str,
+        function_app_name: str,
+        function_host_name: str,
+        function_name: str = "ingest_log",
+    ) -> tuple[str, str]:
+        host_keys_url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
+            f"/providers/Microsoft.Web/sites/{function_app_name}/host/default/listkeys"
+            "?api-version=2025-03-01"
+        )
+        function_secrets_url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
+            f"/providers/Microsoft.Web/sites/{function_app_name}/functions/{function_name}/listsecrets"
+            "?api-version=2025-05-01"
+        )
+        deadline = time.time() + 900
+        last_error = ""
+        while time.time() < deadline:
+            try:
+                payload = self.azure_management_json_request(
+                    credential,
+                    "POST",
+                    host_keys_url,
+                    payload={},
+                    expected_statuses=(200,),
+                )
+                function_keys = payload.get("functionKeys") if isinstance(payload.get("functionKeys"), dict) else {}
+                function_key = clean_optional_string(function_keys.get("default"))
+                if not function_key and function_keys:
+                    function_key = clean_optional_string(next(iter(function_keys.values()), ""))
+                if function_key:
+                    return f"https://{function_host_name}/api/logs?code={function_key}", function_key
+            except Exception as exc:
+                last_error = str(exc)
+
+            try:
+                payload = self.azure_management_json_request(
+                    credential,
+                    "POST",
+                    function_secrets_url,
+                    payload={},
+                    expected_statuses=(200,),
+                )
+                trigger_url = clean_optional_string(payload.get("trigger_url"))
+                function_key = clean_optional_string(payload.get("key"))
+                if trigger_url:
+                    return trigger_url, function_key
+                if function_key:
+                    return f"https://{function_host_name}/api/logs?code={function_key}", function_key
+            except Exception as exc:
+                last_error = str(exc)
+            time.sleep(10)
+        raise RuntimeError(
+            "The Azure Function API was deployed, but the app could not retrieve the trigger URL in time.\n\n"
+            f"Last error:\n{last_error}"
+        )
+
+    def ensure_azure_blob_datastore(
+        self,
+        ml_client,
+        datastore_name: str,
+        storage_account_name: str,
+        container_name: str,
+        storage_account_key: str,
+    ):
+        datastore = AzureBlobDatastore(
+            name=datastore_name,
+            account_name=storage_account_name,
+            container_name=container_name,
+            credentials=AccountKeyConfiguration(account_key=storage_account_key),
+            description="Queued log batches for Azure ML inference.",
+        )
+        return ml_client.datastores.create_or_update(datastore)
+
+    def deploy_azure_batch_endpoint(
+        self,
+        ml_client,
+        model_dir: str,
+        azure_compute: str,
+        preferred_instance_type: str,
+        endpoint_name: str,
+        environment_name: str,
+        model_name: str,
+        endpoint_auth_mode: str = "aad_token",
+    ) -> dict:
+        attempted_instance_types: list[str] = []
+        deployment_name = "default"
+        compute_name = "log-monitor-batch-gpu" if clean_optional_string(azure_compute).lower() == "gpu" else "log-monitor-batch-cpu"
+        instance_candidates = self.prioritize_instance_candidates(
+            self.get_azure_host_instance_candidates(azure_compute),
+            preferred_instance_type,
+        )
+        selected_instance_type = ""
+
+        self.root.after(0, lambda: self.status_var.set("Registering model in Azure ML..."))
+        model_asset = Model(
+            path=model_dir.replace("\\", "/"),
+            name=model_name,
+            type=AssetTypes.CUSTOM_MODEL,
+            description="Log Monitor generated DeBERTa model",
+        )
+        registered_model = ml_client.models.create_or_update(model_asset)
+
+        self.root.after(0, lambda: self.status_var.set("Creating Azure batch inference environment..."))
+        environment = Environment(
+            name=environment_name,
+            image="mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04:latest",
+            conda_file=os.path.join(self.project_dir, "azure_batch_inference_conda.yml"),
+            description="Batch inference environment for Log Monitor hosted API",
+        )
+        environment = ml_client.environments.create_or_update(environment)
+
+        last_deployment_error = None
+        for instance_type in instance_candidates:
+            attempted_instance_types.append(instance_type)
+            self.root.after(
+                0,
+                lambda size=instance_type: self.status_var.set(f"Ensuring Azure batch compute ({size})..."),
+            )
+            try:
+                compute = AmlCompute(
+                    name=compute_name,
+                    type="amlcompute",
+                    size=instance_type,
+                    min_instances=0,
+                    max_instances=1,
+                    idle_time_before_scale_down=120,
+                )
+                ml_client.compute.begin_create_or_update(compute).result()
+                selected_instance_type = instance_type
+                break
+            except Exception as exc:
+                last_deployment_error = exc
+                if self.is_azure_quota_error(exc) and instance_type != instance_candidates[-1]:
+                    print(
+                        f"[AZURE-HOST] Instance type {instance_type} is unavailable due to quota. "
+                        "Trying the next fallback size."
+                    )
+                    continue
+                raise
+
+        if not selected_instance_type:
+            if last_deployment_error is not None:
+                raise last_deployment_error
+            raise RuntimeError("Azure hosting could not provision any batch compute for scoring.")
+
+        self.root.after(0, lambda: self.status_var.set("Creating Azure batch endpoint..."))
+        endpoint = BatchEndpoint(
+            name=endpoint_name,
+            auth_mode=endpoint_auth_mode,
+            description="Asynchronous batch prediction endpoint for Log Monitor",
+        )
+        ml_client.batch_endpoints.begin_create_or_update(endpoint).result()
+
+        self.root.after(0, lambda: self.status_var.set("Creating Azure batch deployment..."))
+        deployment = ModelBatchDeployment(
+            name=deployment_name,
+            endpoint_name=endpoint_name,
+            model=registered_model,
+            environment=environment,
+            compute=compute_name,
+            code_configuration=CodeConfiguration(
+                code=self.project_dir,
+                scoring_script="azure_batch_score.py",
+            ),
+            settings=ModelBatchDeploymentSettings(
+                mini_batch_size=1,
+                instance_count=1,
+            ),
+        )
+        ml_client.batch_deployments.begin_create_or_update(deployment).result()
+
+        endpoint = ml_client.batch_endpoints.get(endpoint_name)
+        try:
+            endpoint.default_deployment_name = deployment_name
+        except Exception:
+            pass
+        try:
+            if getattr(endpoint, "defaults", None) is not None:
+                endpoint.defaults.deployment_name = deployment_name
+        except Exception:
+            pass
+        ml_client.batch_endpoints.begin_create_or_update(endpoint).result()
+        endpoint_details = ml_client.batch_endpoints.get(endpoint_name)
+        scoring_uri = clean_optional_string(getattr(endpoint_details, "scoring_uri", ""))
+        if not scoring_uri:
+            raise RuntimeError("Azure deployment completed but no scoring URI was returned.")
+
+        return {
+            "endpoint_name": endpoint_name,
+            "deployment_name": deployment_name,
+            "instance_type": selected_instance_type,
+            "compute_name": compute_name,
+            "api_url": scoring_uri,
+            "attempted_instance_types": attempted_instance_types,
+        }
 
     def start_local_mlflow_ui(self, tracking_uri: str = "") -> str:
         if mlflow is None:
@@ -849,13 +2669,14 @@ class LogProcessorApp:
     def open_hosting_dashboard_on_success(self, hosting_mode: str, mlops_url: str = "") -> bool:
         try:
             mode = clean_optional_string(hosting_mode) or clean_optional_string(self.hosting_mode_var.get())
-            if mode == "azure":
+            if mode in {"azure", "azure_batch", "azure_queue_batch"}:
                 dashboard_url = clean_optional_string(mlops_url) or clean_optional_string(self.azure_mlops_url_var.get())
                 if dashboard_url:
                     webbrowser.open(dashboard_url)
                     return True
                 sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
-                studio_url = self.build_azure_studio_url(sub_id)
+                tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
+                studio_url = self.build_azure_studio_url(sub_id, tenant_id)
                 if studio_url:
                     webbrowser.open(studio_url)
                     return True
@@ -944,8 +2765,14 @@ class LogProcessorApp:
         training_meta = self.find_latest_training_mlflow_metadata() or {}
 
         api_url = clean_optional_string(hosting_meta.get("api_url")) or clean_optional_string(self.hosting_api_url_var.get())
+        hosting_mode = clean_optional_string(hosting_meta.get("mode")) or clean_optional_string(self.hosting_mode_var.get()) or "local"
+        is_azure_batch = hosting_mode == "azure_batch"
+        is_azure_queue_batch = hosting_mode == "azure_queue_batch"
+        is_azure_online = hosting_mode == "azure"
         health_url = clean_optional_string(hosting_meta.get("health_url"))
-        api_browser_url = api_url[:-8] if api_url.endswith("/predict") else api_url
+        api_browser_url = ""
+        if not (is_azure_batch or is_azure_queue_batch):
+            api_browser_url = api_url[:-8] if api_url.endswith("/predict") else api_url
 
         backend = self.mlflow_backend_var.get().strip() or "local"
         tracking_uri = clean_optional_string(training_meta.get("tracking_uri")) or clean_optional_string(self.mlflow_tracking_uri_var.get())
@@ -984,7 +2811,8 @@ class LogProcessorApp:
                 console_note = "The custom tracking URI is not an HTTP URL, so it cannot be opened in the browser."
         else:
             sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
-            console_url = self.build_azure_studio_url(sub_id)
+            tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
+            console_url = self.build_azure_studio_url(sub_id, tenant_id)
             if not console_url:
                 console_note = "Azure dashboard URL is unavailable because the Azure subscription ID is empty."
 
@@ -1025,8 +2853,129 @@ class LogProcessorApp:
         if not selection_html:
             selection_html = "<p class='muted'>No selected training configuration was recorded.</p>"
 
-        payload_example = json.dumps({"errorMessage": ""}, indent=2)
-        response_example = json.dumps({"prediction": ""}, indent=2)
+        available_models = self.discover_available_hosted_models()
+        available_models_html = ""
+        for entry in available_models[:12]:
+            available_models_html += (
+                "<div class='kv'>"
+                f"<span>{html.escape(clean_optional_string(entry.get('label')) or 'Available model')}</span>"
+                f"<strong>{self._dashboard_value_html(entry.get('path'))}</strong>"
+                "</div>"
+            )
+        if not available_models_html:
+            available_models_html = "<p class='muted'>No versioned or downloaded models were discovered yet.</p>"
+
+        if is_azure_queue_batch:
+            payload_example = json.dumps(
+                {
+                    "timestamp": now_utc_iso(),
+                    "level": "ERROR",
+                    "source": "desktop-app",
+                    "message": "timeout while opening socket",
+                },
+                indent=2,
+            )
+            response_example = json.dumps(
+                {
+                    "accepted": True,
+                    "queued": True,
+                    "received_at": now_utc_iso(),
+                },
+                indent=2,
+            )
+            contract_title = "Queued Log API"
+            contract_note = (
+                "The public endpoint is an Azure Function that accepts one log at a time, stores it in Service Bus, "
+                "and then launches the Azure ML batch job once per day at the scheduled time."
+            )
+            endpoint_label = "Log Ingestion API"
+            invocation_style = "Queued HTTP API with daily background batch processing"
+            browser_row_html = ""
+            health_row_html = ""
+            extra_hosting_html = (
+                "<div class='kv'><span>Function App</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('function_app_name'))}</strong></div>"
+                "<div class='kv'><span>Service Bus Queue</span>"
+                f"<strong>{self._dashboard_value_html((clean_optional_string(hosting_meta.get('service_bus_namespace')) + '/' + clean_optional_string(hosting_meta.get('service_bus_queue'))).strip('/'))}</strong></div>"
+                "<div class='kv'><span>Batch Endpoint</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('endpoint_name'))}</strong></div>"
+                "<div class='kv'><span>Compute Cluster</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('compute_name'))}</strong></div>"
+                "<div class='kv'><span>VM Size</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('instance_type'))}</strong></div>"
+                "<div class='kv'><span>Daily Schedule</span>"
+                f"<strong>{self._dashboard_value_html((clean_optional_string(hosting_meta.get('schedule_time')) + ' ' + clean_optional_string(hosting_meta.get('schedule_time_zone'))).strip())}</strong></div>"
+                "<div class='kv'><span>Blob Datastore</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('datastore_name'))}</strong></div>"
+            )
+            api_action_url = api_url
+            api_action_label = "Open Log API URL"
+        elif is_azure_batch:
+            payload_example = """sample.csv
+LogMessage
+processed Canceled
+timeout while opening socket"""
+            response_example = """{"source_file":"sample.csv","row_index":0,"errorMessage":"processed Canceled","prediction":"Noise"}
+{"source_file":"sample.csv","row_index":1,"errorMessage":"timeout while opening socket","prediction":"Error"}"""
+            contract_title = "Batch Input And Output"
+            contract_note = (
+                "Azure batch endpoints are asynchronous. Submit files, folders, or Azure ML data assets to the "
+                "endpoint; prediction rows are written to Azure Storage when the job finishes."
+            )
+            endpoint_label = "Batch Endpoint"
+            invocation_style = "Asynchronous batch job"
+            browser_row_html = ""
+            health_row_html = ""
+            extra_hosting_html = (
+                "<div class='kv'><span>Compute Cluster</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('compute_name'))}</strong></div>"
+                "<div class='kv'><span>VM Size</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('instance_type'))}</strong></div>"
+                "<div class='kv'><span>Daily Schedule</span>"
+                f"<strong>{self._dashboard_value_html((clean_optional_string(hosting_meta.get('schedule_time')) + ' ' + clean_optional_string(hosting_meta.get('schedule_time_zone'))).strip())}</strong></div>"
+                "<div class='kv'><span>Batch Input URI</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('batch_input_uri'))}</strong></div>"
+                "<div class='kv'><span>Schedule Name</span>"
+                f"<strong>{self._dashboard_value_html(hosting_meta.get('schedule_name'))}</strong></div>"
+            )
+            api_action_url = api_url
+            api_action_label = "Open Endpoint URL"
+        else:
+            payload_example = json.dumps({"errorMessage": ""}, indent=2)
+            response_example = json.dumps({"prediction": ""}, indent=2)
+            contract_title = "Prediction Contract"
+            contract_note = ""
+            endpoint_label = "Prediction Endpoint"
+            invocation_style = "Synchronous HTTP API"
+            if is_azure_online:
+                browser_row_html = ""
+                health_row_html = ""
+                extra_hosting_html = (
+                    "<div class='kv'><span>VM Size</span>"
+                    f"<strong>{self._dashboard_value_html(hosting_meta.get('instance_type'))}</strong></div>"
+                    "<div class='kv'><span>Authentication</span>"
+                    f"<strong>{self._dashboard_value_html(hosting_meta.get('endpoint_auth_mode'))}</strong></div>"
+                )
+                api_action_label = "Open Endpoint URL"
+            else:
+                browser_row_html = (
+                    "<div class='kv'><span>Browser URL</span>"
+                    f"<strong>{self._dashboard_link_html(api_browser_url)}</strong></div>"
+                    if api_browser_url
+                    else ""
+                )
+                health_row_html = (
+                    "<div class='kv'><span>Health Check</span>"
+                    f"<strong>{self._dashboard_link_html(health_url)}</strong></div>"
+                    if health_url
+                    else ""
+                )
+                extra_hosting_html = (
+                    "<div class='kv'><span>VM Size</span>"
+                    f"<strong>{self._dashboard_value_html(hosting_meta.get('instance_type'))}</strong></div>"
+                )
+                api_action_label = "Open Local API Home"
+            api_action_url = api_browser_url
         training_json = json.dumps(training_meta, indent=2, sort_keys=True)
         hosting_json = json.dumps(hosting_meta, indent=2, sort_keys=True)
         tracking_action = (
@@ -1034,15 +2983,16 @@ class LogProcessorApp:
             if console_url else ""
         )
         api_action = (
-            f"<a class='action' href='{html.escape(api_browser_url, quote=True)}' target='_blank' rel='noreferrer'>Open Local API Home</a>"
-            if api_browser_url else ""
+            f"<a class='action' href='{html.escape(api_action_url, quote=True)}' target='_blank' rel='noreferrer'>{html.escape(api_action_label)}</a>"
+            if api_action_url else ""
         )
         health_action = (
             f"<a class='action' href='{html.escape(health_url, quote=True)}' target='_blank' rel='noreferrer'>Open Health Check</a>"
-            if health_url else ""
+            if health_url and not (is_azure_batch or is_azure_queue_batch) else ""
         )
         console_note_html = f"<p class='muted' style='margin-top:16px'>{html.escape(console_note)}</p>" if console_note else ""
         metadata_note_html = f"<p class='muted' style='margin-top:12px'>{html.escape(metadata_note)}</p>" if metadata_note else ""
+        contract_note_html = f"<p class='muted' style='margin-top:12px'>{html.escape(contract_note)}</p>" if contract_note else ""
 
         return f"""<!doctype html>
 <html lang="en">
@@ -1232,18 +3182,22 @@ class LogProcessorApp:
       {console_note_html}
     </section>
 
-    <div class="grid">
-      <section class="panel">
-        <h2>Hosted API</h2>
-        <div class="kv"><span>Prediction Endpoint</span><strong>{self._dashboard_link_html(api_url)}</strong></div>
-        <div class="kv"><span>Browser URL</span><strong>{self._dashboard_link_html(api_browser_url)}</strong></div>
-        <div class="kv"><span>Health Check</span><strong>{self._dashboard_link_html(health_url)}</strong></div>
-        <div class="kv"><span>Hosting Mode</span><strong>{self._dashboard_value_html(hosting_meta.get("mode"))}</strong></div>
-        <div class="kv"><span>Generated</span><strong>{self._dashboard_value_html(created_at)}</strong></div>
-        <h3>Prediction Contract</h3>
-        <pre>{html.escape(payload_example)}</pre>
-        <pre>{html.escape(response_example)}</pre>
-      </section>
+	    <div class="grid">
+	      <section class="panel">
+	        <h2>Hosted Service</h2>
+	        <div class="kv"><span>{html.escape(endpoint_label)}</span><strong>{self._dashboard_link_html(api_url)}</strong></div>
+	        {browser_row_html}
+	        {health_row_html}
+	        <div class="kv"><span>Hosting Mode</span><strong>{self._dashboard_value_html(hosting_mode)}</strong></div>
+	        <div class="kv"><span>Invocation Style</span><strong>{html.escape(invocation_style)}</strong></div>
+	        <div class="kv"><span>Hosted Model Version</span><strong>{self._dashboard_value_html(hosting_meta.get("model_version_id"))}</strong></div>
+	        {extra_hosting_html}
+	        <div class="kv"><span>Generated</span><strong>{self._dashboard_value_html(created_at)}</strong></div>
+	        <h3>{html.escape(contract_title)}</h3>
+	        {contract_note_html}
+	        <pre>{html.escape(payload_example)}</pre>
+	        <pre>{html.escape(response_example)}</pre>
+	      </section>
 
       <section class="panel">
         <h2>MLOps</h2>
@@ -1252,6 +3206,7 @@ class LogProcessorApp:
         <div class="kv"><span>Tracking URI</span><strong>{self._dashboard_value_html(tracking_uri)}</strong></div>
         <div class="kv"><span>Run ID</span><strong>{self._dashboard_value_html(run_id)}</strong></div>
         <div class="kv"><span>Model URI</span><strong>{self._dashboard_value_html(model_uri)}</strong></div>
+        <div class="kv"><span>Model Version ID</span><strong>{self._dashboard_value_html(training_meta.get("model_version_id"))}</strong></div>
         <div class="kv"><span>Metadata File</span><strong>{self._dashboard_value_html(metadata_path)}</strong></div>
         <div class="metric-grid">{metrics_html}</div>
         {metadata_note_html}
@@ -1272,10 +3227,16 @@ class LogProcessorApp:
         <div class="kv"><span>Parent Run ID</span><strong>{self._dashboard_value_html(training_meta.get("parent_run_id"))}</strong></div>
         <div class="kv"><span>Data Prep Run ID</span><strong>{self._dashboard_value_html(training_meta.get("data_prep_run_id"))}</strong></div>
         <div class="kv"><span>Data Prep Experiment</span><strong>{self._dashboard_value_html(training_meta.get("data_prep_experiment_name"))}</strong></div>
+        <div class="kv"><span>Data Version ID</span><strong>{self._dashboard_value_html(training_meta.get("data_version_id"))}</strong></div>
       </section>
     </div>
 
     <div class="stack">
+      <section class="panel">
+        <h2>Available Models</h2>
+        {available_models_html}
+      </section>
+
       <section class="panel">
         <h2>Training Metadata</h2>
         <details open>
@@ -1298,23 +3259,23 @@ class LogProcessorApp:
 """
 
     def open_local_dashboard_page(self, launch_live_console: bool = True) -> str:
-        output_dir = Path(self.project_dir) / "outputs"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        dashboard_path = output_dir / "local_dashboard.html"
-        dashboard_path.write_text(
-            self.build_local_dashboard_html(launch_live_console=launch_live_console),
-            encoding="utf-8",
+        self.refresh_local_grafana_dashboard(launch_live_console=launch_live_console)
+        hosting_meta = self.read_last_hosting_metadata()
+        dashboard_url = clean_optional_string(hosting_meta.get("dashboard_url")) or clean_optional_string(
+            hosting_meta.get("grafana_url")
         )
-        dashboard_uri = dashboard_path.resolve().as_uri()
-        webbrowser.open(dashboard_uri)
-        return dashboard_uri
+        if not dashboard_url:
+            raise RuntimeError("Grafana dashboard URL is not available yet. Start local hosting first.")
+        webbrowser.open(dashboard_url)
+        return dashboard_url
 
-    def ensure_azure_workspace(self, sub_id: str, tenant_id: str) -> MLClient:
+    def ensure_azure_workspace(self, sub_id: str, tenant_id: str, credential=None) -> MLClient:
         resource_group = self.RESOURCE_GROUP
         workspace_name = self.WORKSPACE_NAME
 
-        self.root.after(0, lambda: self.status_var.set("Please log in to Azure in your web browser..."))
-        credential = InteractiveBrowserCredential(tenant_id=tenant_id)
+        if credential is None:
+            self.root.after(0, lambda: self.status_var.set("Please log in to Azure in your web browser..."))
+            credential = InteractiveBrowserCredential(tenant_id=tenant_id)
         ml_client = MLClient(credential, sub_id, resource_group, workspace_name)
         resource_client = ResourceManagementClient(credential, sub_id)
 
@@ -1357,6 +3318,7 @@ class LogProcessorApp:
             return
 
         self.hosted_model_path_var.set(resolved_model_dir)
+        self.refresh_hosted_model_inventory(preferred_path=resolved_model_dir)
         self.hosting_api_url_var.set("")
         self.hosting_mode_summary_var.set("")
 
@@ -1369,9 +3331,50 @@ class LogProcessorApp:
             sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
             tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
             azure_compute = clean_optional_string(self.azure_host_compute_var.get()) or "cpu"
+            azure_instance_type = clean_optional_string(self.azure_host_instance_var.get())
+            azure_service = clean_optional_string(self.azure_host_service_var.get()) or "queued_batch"
+            batch_input_uri = clean_optional_string(self.azure_batch_input_var.get())
+            batch_time = clean_optional_string(self.azure_batch_time_var.get())
+            batch_timezone = clean_optional_string(self.azure_batch_timezone_var.get()) or "UTC"
             self.azure_host_sub_var.set(sub_id)
             self.azure_host_tenant_var.set(tenant_id)
             self.azure_host_compute_var.set(azure_compute)
+            valid_host_sizes = self.get_azure_host_instance_candidates(azure_compute)
+            if not azure_instance_type:
+                azure_instance_type = valid_host_sizes[0] if valid_host_sizes else ""
+                self.azure_host_instance_var.set(azure_instance_type)
+            if valid_host_sizes and azure_instance_type not in valid_host_sizes:
+                self.finish_hosting_action()
+                messagebox.showwarning("Hosting", "Please select a supported Azure VM size for hosting.")
+                return
+            if azure_service == "batch":
+                if not batch_input_uri:
+                    self.finish_hosting_action()
+                    messagebox.showwarning("Hosting", "Please provide a batch input URI for the daily batch schedule.")
+                    return
+                if not self.is_cloud_accessible_batch_input(batch_input_uri):
+                    self.finish_hosting_action()
+                    messagebox.showwarning(
+                        "Hosting",
+                        "Batch schedules need an Azure-accessible URI such as azureml://..., https://..., or a workspace data asset ID.",
+                    )
+                    return
+                try:
+                    batch_hour, batch_minute = self.parse_daily_time(batch_time)
+                except Exception as exc:
+                    self.finish_hosting_action()
+                    messagebox.showwarning("Hosting", str(exc))
+                    return
+            elif azure_service == "queued_batch":
+                try:
+                    batch_hour, batch_minute = self.parse_daily_time(batch_time)
+                except Exception as exc:
+                    self.finish_hosting_action()
+                    messagebox.showwarning("Hosting", str(exc))
+                    return
+            else:
+                batch_hour = 0
+                batch_minute = 0
             self.refresh_azure_dashboard_links()
 
             if not sub_id:
@@ -1385,62 +3388,110 @@ class LogProcessorApp:
 
             threading.Thread(
                 target=self.run_azure_hosting,
-                args=(resolved_model_dir, sub_id, tenant_id, azure_compute),
+                args=(
+                    resolved_model_dir,
+                    sub_id,
+                    tenant_id,
+                    azure_compute,
+                    azure_instance_type,
+                    azure_service,
+                    batch_input_uri,
+                    batch_hour,
+                    batch_minute,
+                    batch_timezone,
+                ),
                 daemon=True,
             ).start()
             return
 
+        auto_install_missing_tools = False
+        missing_tools = self.get_missing_local_observability_tools()
+        if missing_tools:
+            if not self.can_auto_install_local_observability():
+                self.finish_hosting_action()
+                messagebox.showerror(
+                    "Local Hosting",
+                    (
+                        "Local Grafana hosting needs extra dependencies, but automatic installation is only "
+                        "supported on 64-bit Windows or Debian/Ubuntu-style Linux systems with `pkexec`.\n\n"
+                        "Missing tools:\n- "
+                        + "\n- ".join(missing_tools)
+                    ),
+                )
+                return
+
+            install_message = (
+                "Local hosting now uses Grafana and Prometheus.\n\n"
+                "The required dependencies are missing:\n- "
+                + "\n- ".join(missing_tools)
+            )
+            if sys.platform == "win32":
+                install_message += (
+                    "\n\nThe app can download the official Windows portable builds into this project automatically. Continue?"
+                )
+            else:
+                install_message += (
+                    "\n\nThe app can install them automatically using your system administrator password. Continue?"
+                )
+
+            should_install = messagebox.askyesno(
+                "Install Grafana And Prometheus",
+                install_message,
+            )
+            if not should_install:
+                self.finish_hosting_action()
+                self.status_var.set("Local hosting canceled.")
+                return
+            auto_install_missing_tools = True
+
         threading.Thread(
             target=self.run_local_hosting,
-            args=(resolved_model_dir,),
+            args=(resolved_model_dir, auto_install_missing_tools),
             daemon=True,
         ).start()
 
     def stop_hosting(self):
-        process = None
         with self.hosting_state_lock:
-            process = self.hosting_process
+            processes = [self.hosting_process, self.prometheus_process, self.grafana_process]
 
-        if process is None or process.poll() is not None:
+        if not any(process is not None and process.poll() is None for process in processes):
             self.stop_hosting_btn.config(state="disabled")
-            self.status_var.set("No local hosted API is currently running.")
+            self.status_var.set("No local hosted stack is currently running.")
             return
 
         try:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            self.shutdown_local_hosting_stack()
         finally:
-            with self.hosting_state_lock:
-                self.hosting_process = None
             self.hosting_api_url_var.set("")
-            self.hosting_mode_summary_var.set("Local prediction API stopped.")
+            self.hosting_mode_summary_var.set("Local Grafana hosting stack stopped.")
             self.stop_hosting_btn.config(state="disabled")
-            self.status_var.set("Local hosted API stopped.")
+            self.status_var.set("Local hosted stack stopped.")
 
-    def run_local_hosting(self, model_dir: str):
+    def run_local_hosting(self, model_dir: str, install_missing_dependencies: bool = False):
         process = None
+        prometheus_process = None
+        grafana_process = None
         try:
             serve_script = os.path.join(self.project_dir, "serve_model.py")
             if not os.path.exists(serve_script):
                 raise FileNotFoundError("Could not find 'serve_model.py' in the app directory.")
 
-            existing_process = None
-            with self.hosting_state_lock:
-                existing_process = self.hosting_process
-            if existing_process and existing_process.poll() is None:
-                existing_process.terminate()
-                try:
-                    existing_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    existing_process.kill()
+            self.shutdown_local_hosting_stack()
+
+            if install_missing_dependencies:
+                self.root.after(0, lambda: self.status_var.set("Installing Grafana and Prometheus..."))
+                self.install_local_observability_dependencies()
 
             port = self.find_free_port()
+            prometheus_port = self.find_free_port()
+            grafana_port = self.find_free_port()
             host = "127.0.0.1"
             api_url = f"http://{host}:{port}/predict"
             health_url = f"http://{host}:{port}/health"
+            metrics_url = f"http://{host}:{port}/metrics"
+            prometheus_url = f"http://127.0.0.1:{prometheus_port}"
+            grafana_url = f"http://127.0.0.1:{grafana_port}"
+            dashboard_url = f"{grafana_url}/d/log-monitor-local/log-monitor-local-hosting?orgId=1&refresh=10s"
             self.root.after(0, lambda: self.status_var.set("Starting local prediction API..."))
 
             process = subprocess.Popen(
@@ -1472,6 +3523,59 @@ class LogProcessorApp:
             if not ready:
                 raise TimeoutError("Timed out waiting for the local prediction API to become ready.")
 
+            training_metadata = self.find_training_metadata_for_model_dir(Path(model_dir))
+            local_hosting_meta = {
+                "mode": "local",
+                "service_kind": "grafana_local",
+                "model_dir": model_dir,
+                "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
+                "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
+                "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
+                "api_url": api_url,
+                "health_url": health_url,
+                "metrics_url": metrics_url,
+                "prometheus_url": prometheus_url,
+                "grafana_url": grafana_url,
+                "dashboard_url": dashboard_url,
+                "created_at": now_utc_iso(),
+            }
+            tracking_console_url, tracking_console_note = self.resolve_dashboard_tracking_console(
+                launch_live_console=True
+            )
+            observability_files = self.write_local_observability_files(
+                hosting_meta=local_hosting_meta,
+                training_meta=training_metadata,
+                tracking_console_url=tracking_console_url,
+                tracking_console_note=tracking_console_note,
+            )
+
+            self.root.after(0, lambda: self.status_var.set("Starting local Prometheus..."))
+            prometheus_process = self.start_local_prometheus(
+                config_path=observability_files["prometheus_config_path"],
+                data_path=observability_files["prometheus_data_path"],
+                port=prometheus_port,
+                log_path=observability_files["prometheus_launch_log_path"],
+            )
+            with self.hosting_state_lock:
+                self.prometheus_process = prometheus_process
+
+            self.root.after(0, lambda: self.status_var.set("Starting local Grafana..."))
+            grafana_process = self.start_local_grafana(
+                provisioning_path=observability_files["grafana_provisioning_path"],
+                dashboard_path=observability_files["grafana_dashboard_path"],
+                data_path=observability_files["grafana_data_path"],
+                logs_path=observability_files["grafana_logs_path"],
+                plugins_path=observability_files["grafana_plugins_path"],
+                port=grafana_port,
+                log_path=observability_files["grafana_launch_log_path"],
+            )
+            with self.hosting_state_lock:
+                self.grafana_process = grafana_process
+
+            if not self.wait_for_http_endpoint(dashboard_url, timeout_seconds=45, ready_statuses=(200,)):
+                dashboard_url = grafana_url
+                local_hosting_meta["dashboard_url"] = dashboard_url
+
             host_note = (
                 "IIS was detected on this machine; this implementation is serving the model directly "
                 "from the app host for a simpler local API workflow."
@@ -1479,49 +3583,100 @@ class LogProcessorApp:
                 else "Serving the model directly from this machine."
             )
             summary = (
-                f"Local prediction API is running.\n"
+                f"Local Grafana hosting stack is running.\n"
                 f"POST {api_url}\n"
+                f"Grafana: {dashboard_url}\n"
+                f"Prometheus: {prometheus_url}\n"
+                f"Metrics: {metrics_url}\n"
                 f"Body: {{\"errorMessage\": \"...\"}}\n"
                 f"Response: {{\"prediction\": \"...\"}}\n"
                 f"{host_note}"
             )
             metadata_path = self.save_last_hosting_metadata(
-                {
-                    "mode": "local",
-                    "model_dir": model_dir,
-                    "api_url": api_url,
-                    "health_url": health_url,
-                    "created_at": now_utc_iso(),
-                }
+                local_hosting_meta
             )
             self.root.after(0, lambda: self.hosting_api_url_var.set(api_url))
             self.root.after(0, lambda: self.hosting_mode_summary_var.set(summary))
-            self.root.after(0, lambda: self.status_var.set("Local prediction API is ready."))
+            self.root.after(0, lambda: self.status_var.set("Local Grafana hosting stack is ready."))
             self.root.after(
                 0,
                 lambda: messagebox.showinfo(
                     "Hosting Ready",
                     (
-                        f"Local prediction API is ready.\n\n"
+                        f"Local Grafana hosting stack is ready.\n\n"
                         f"Prediction URL:\n{api_url}\n\n"
-                        "The app will try to open the dashboard in your browser.\n\n"
+                        f"Grafana Dashboard:\n{dashboard_url}\n\n"
+                        f"Prometheus:\n{prometheus_url}\n\n"
+                        "The app will try to open Grafana in your browser.\n\n"
                         f"Hosting metadata saved to:\n{metadata_path}"
                     ),
                 ),
             )
             self.root.after(100, lambda: self.open_hosting_dashboard_on_success("local"))
         except Exception as exc:
-            if process and process.poll() is None:
-                process.terminate()
-            with self.hosting_state_lock:
-                if self.hosting_process is process:
-                    self.hosting_process = None
+            self.shutdown_local_hosting_stack()
             self.root.after(0, lambda err=str(exc): messagebox.showerror("Hosting Error", err))
             self.root.after(0, lambda: self.status_var.set("Local hosting failed."))
         finally:
             self.root.after(0, self.finish_hosting_action)
 
-    def run_azure_hosting(self, model_dir: str, sub_id: str, tenant_id: str, azure_compute: str):
+    def run_azure_hosting(
+        self,
+        model_dir: str,
+        sub_id: str,
+        tenant_id: str,
+        azure_compute: str,
+        preferred_instance_type: str,
+        azure_service: str,
+        batch_input_uri: str,
+        batch_hour: int,
+        batch_minute: int,
+        batch_timezone: str,
+    ):
+        service_kind = clean_optional_string(azure_service) or "queued_batch"
+        if service_kind == "online":
+            self.run_azure_online_hosting(
+                model_dir,
+                sub_id,
+                tenant_id,
+                azure_compute,
+                preferred_instance_type,
+            )
+            return
+
+        if service_kind == "queued_batch":
+            self.run_azure_queued_batch_hosting(
+                model_dir,
+                sub_id,
+                tenant_id,
+                azure_compute,
+                preferred_instance_type,
+                batch_hour,
+                batch_minute,
+                batch_timezone,
+            )
+            return
+
+        self.run_azure_batch_hosting(
+            model_dir,
+            sub_id,
+            tenant_id,
+            azure_compute,
+            preferred_instance_type,
+            batch_input_uri,
+            batch_hour,
+            batch_minute,
+            batch_timezone,
+        )
+
+    def run_azure_online_hosting(
+        self,
+        model_dir: str,
+        sub_id: str,
+        tenant_id: str,
+        azure_compute: str,
+        preferred_instance_type: str,
+    ):
         attempted_instance_types: list[str] = []
         try:
             self.root.after(0, lambda: self.status_var.set("Preparing Azure hosting..."))
@@ -1532,7 +3687,10 @@ class LogProcessorApp:
             endpoint_name = self.sanitize_azure_name(f"log-monitor-endpoint-{timestamp}")
             deployment_name = "blue"
             env_name = self.sanitize_azure_name(f"log-monitor-inference-env-{timestamp}")
-            instance_candidates = self.get_azure_host_instance_candidates(azure_compute)
+            instance_candidates = self.prioritize_instance_candidates(
+                self.get_azure_host_instance_candidates(azure_compute),
+                preferred_instance_type,
+            )
             selected_instance_type = ""
 
             self.root.after(0, lambda: self.status_var.set("Registering model in Azure ML..."))
@@ -1608,14 +3766,20 @@ class LogProcessorApp:
             if not scoring_uri:
                 raise RuntimeError("Azure deployment completed but no scoring URI was returned.")
 
-            mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id)
+            mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id, tenant_id)
+            training_metadata = self.find_training_metadata_for_model_dir(Path(model_dir))
             metadata_path = self.save_last_hosting_metadata(
                 {
                     "mode": "azure",
+                    "service_kind": "online",
                     "model_dir": model_dir,
+                    "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
+                    "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
+                    "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
                     "endpoint_name": endpoint_name,
                     "deployment_name": deployment_name,
                     "instance_type": selected_instance_type,
+                    "endpoint_auth_mode": "key",
                     "api_url": scoring_uri,
                     "azure_subscription_id": sub_id,
                     "azure_tenant_id": tenant_id,
@@ -1627,12 +3791,12 @@ class LogProcessorApp:
             )
 
             summary = (
-                f"Azure prediction endpoint is ready.\n"
+                f"Azure real-time endpoint is ready.\n"
                 f"POST {scoring_uri}\n"
                 f"Instance Type: {selected_instance_type}\n"
                 f"Body: {{\"errorMessage\": \"...\"}}\n"
                 f"Response: {{\"prediction\": \"...\"}}\n"
-                f"Azure ML online endpoints typically require endpoint key authentication."
+                "Authentication: endpoint keys."
             )
 
             self.root.after(0, lambda: self.azure_hosted_endpoint_name_var.set(endpoint_name))
@@ -1640,13 +3804,13 @@ class LogProcessorApp:
             self.root.after(0, lambda: self.azure_mlops_url_var.set(mlops_url))
             self.root.after(0, lambda: self.azure_llmops_url_var.set(llmops_url))
             self.root.after(0, lambda: self.hosting_mode_summary_var.set(summary))
-            self.root.after(0, lambda: self.status_var.set("Azure prediction endpoint is ready."))
+            self.root.after(0, lambda: self.status_var.set("Azure real-time endpoint is ready."))
             self.root.after(
                 0,
                 lambda: messagebox.showinfo(
                     "Hosting Ready",
                     (
-                        f"Azure prediction endpoint is ready.\n\n"
+                        f"Azure real-time endpoint is ready.\n\n"
                         f"Prediction URL:\n{scoring_uri}\n\n"
                         f"Instance Type:\n{selected_instance_type}\n\n"
                         f"MLOps Dashboard:\n{mlops_url}\n\n"
@@ -1664,18 +3828,351 @@ class LogProcessorApp:
         finally:
             self.root.after(0, self.finish_hosting_action)
 
-    def on_app_close(self):
-        with self.hosting_state_lock:
-            process = self.hosting_process
-        if process and process.poll() is None:
+    def run_azure_batch_hosting(
+        self,
+        model_dir: str,
+        sub_id: str,
+        tenant_id: str,
+        azure_compute: str,
+        preferred_instance_type: str,
+        batch_input_uri: str,
+        batch_hour: int,
+        batch_minute: int,
+        batch_timezone: str,
+    ):
+        attempted_instance_types: list[str] = []
+        try:
+            self.root.after(0, lambda: self.status_var.set("Preparing Azure hosting..."))
+            ml_client = self.ensure_azure_workspace(sub_id, tenant_id)
+
+            timestamp = int(time.time())
+            model_name = self.sanitize_azure_name(f"log-monitor-model-{Path(model_dir).name}-{timestamp}")
+            endpoint_name = self.sanitize_azure_name(f"log-monitor-batch-endpoint-{timestamp}")
+            schedule_name = self.sanitize_azure_name(f"log-monitor-batch-schedule-{timestamp}")
+            env_name = self.sanitize_azure_name(f"log-monitor-batch-env-{timestamp}")
+            deployment_meta = self.deploy_azure_batch_endpoint(
+                ml_client=ml_client,
+                model_dir=model_dir,
+                azure_compute=azure_compute,
+                preferred_instance_type=preferred_instance_type,
+                endpoint_name=endpoint_name,
+                environment_name=env_name,
+                model_name=model_name,
+                endpoint_auth_mode="aad_token",
+            )
+            deployment_name = clean_optional_string(deployment_meta.get("deployment_name")) or "default"
+            compute_name = clean_optional_string(deployment_meta.get("compute_name"))
+            selected_instance_type = clean_optional_string(deployment_meta.get("instance_type"))
+            scoring_uri = clean_optional_string(deployment_meta.get("api_url"))
+            attempted_instance_types = list(deployment_meta.get("attempted_instance_types") or [])
+
+            self.root.after(0, lambda: self.status_var.set("Creating daily Azure batch schedule..."))
+            seed_job = ml_client.batch_endpoints.invoke(
+                endpoint_name=endpoint_name,
+                deployment_name=deployment_name,
+                input=Input(path=batch_input_uri),
+                experiment_name="log-monitor-batch-schedules",
+            )
+            seed_job_name = clean_optional_string(getattr(seed_job, "name", ""))
+            if not seed_job_name:
+                raise RuntimeError("Azure batch invocation did not return a job name for schedule creation.")
+
+            schedule = JobSchedule(
+                name=schedule_name,
+                display_name="Log Monitor Daily Batch Schedule",
+                description="Runs the Log Monitor batch endpoint once per day.",
+                trigger=RecurrenceTrigger(
+                    frequency="day",
+                    interval=1,
+                    schedule=RecurrencePattern(hours=batch_hour, minutes=batch_minute),
+                    time_zone=batch_timezone or "UTC",
+                ),
+                create_job=seed_job_name,
+            )
+            ml_client.schedules.begin_create_or_update(schedule=schedule).result()
+
             try:
-                process.terminate()
-                process.wait(timeout=3)
+                ml_client.jobs.begin_cancel(seed_job_name).result()
             except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+                print("[AZURE-HOST] Seed batch job could not be canceled after schedule creation.")
+                traceback.print_exc()
+
+            mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id, tenant_id)
+            training_metadata = self.find_training_metadata_for_model_dir(Path(model_dir))
+            metadata_path = self.save_last_hosting_metadata(
+                {
+                    "mode": "azure_batch",
+                    "service_kind": "batch",
+                    "model_dir": model_dir,
+                    "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
+                    "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
+                    "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
+                    "endpoint_name": endpoint_name,
+                    "deployment_name": deployment_name,
+                    "schedule_name": schedule_name,
+                    "schedule_time": f"{batch_hour:02d}:{batch_minute:02d}",
+                    "schedule_time_zone": batch_timezone or "UTC",
+                    "batch_input_uri": batch_input_uri,
+                    "seed_job_name": seed_job_name,
+                    "instance_type": selected_instance_type,
+                    "compute_name": compute_name,
+                    "endpoint_auth_mode": "aad_token",
+                    "api_url": scoring_uri,
+                    "azure_subscription_id": sub_id,
+                    "azure_tenant_id": tenant_id,
+                    "azure_compute": azure_compute,
+                    "mlops_url": mlops_url,
+                    "llmops_url": llmops_url,
+                    "created_at": now_utc_iso(),
+                }
+            )
+
+            summary = (
+                f"Azure batch endpoint is ready.\n"
+                f"Invoke: {scoring_uri}\n"
+                f"Cluster: {compute_name} ({selected_instance_type}, min nodes 0)\n"
+                f"Schedule: every day at {batch_hour:02d}:{batch_minute:02d} {batch_timezone or 'UTC'}\n"
+                f"Input: {batch_input_uri}\n"
+                "Output: prediction rows are written to Azure Storage when each batch job finishes.\n"
+                "Authentication: Microsoft Entra ID."
+            )
+
+            self.root.after(0, lambda: self.azure_hosted_endpoint_name_var.set(endpoint_name))
+            self.root.after(0, lambda: self.hosting_api_url_var.set(scoring_uri))
+            self.root.after(0, lambda: self.azure_mlops_url_var.set(mlops_url))
+            self.root.after(0, lambda: self.azure_llmops_url_var.set(llmops_url))
+            self.root.after(0, lambda: self.hosting_mode_summary_var.set(summary))
+            self.root.after(0, lambda: self.status_var.set("Azure batch endpoint and daily schedule are ready."))
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Hosting Ready",
+                    (
+                        f"Azure batch endpoint is ready.\n\n"
+                        f"Endpoint URL:\n{scoring_uri}\n\n"
+                        f"Compute Cluster:\n{compute_name}\n\n"
+                        f"Instance Type:\n{selected_instance_type}\n\n"
+                        f"Daily Schedule:\n{batch_hour:02d}:{batch_minute:02d} {batch_timezone or 'UTC'}\n\n"
+                        f"Batch Input URI:\n{batch_input_uri}\n\n"
+                        f"MLOps Dashboard:\n{mlops_url}\n\n"
+                        f"LLMOps Dashboard:\n{llmops_url}\n\n"
+                        "The app will try to open the MLOps dashboard in your browser.\n\n"
+                        f"Hosting metadata saved to:\n{metadata_path}"
+                    ),
+                ),
+            )
+            self.root.after(100, lambda: self.open_hosting_dashboard_on_success("azure_batch", mlops_url))
+        except Exception as exc:
+            error_message = self.format_azure_hosting_error(exc, attempted_instance_types)
+            self.root.after(0, lambda err=error_message: messagebox.showerror("Hosting Error", err))
+            self.root.after(0, lambda: self.status_var.set("Azure hosting failed."))
+        finally:
+            self.root.after(0, self.finish_hosting_action)
+
+    def run_azure_queued_batch_hosting(
+        self,
+        model_dir: str,
+        sub_id: str,
+        tenant_id: str,
+        azure_compute: str,
+        preferred_instance_type: str,
+        batch_hour: int,
+        batch_minute: int,
+        batch_timezone: str,
+    ):
+        attempted_instance_types: list[str] = []
+        try:
+            self.root.after(0, lambda: self.status_var.set("Preparing Azure queued batch hosting..."))
+            credential = InteractiveBrowserCredential(tenant_id=tenant_id)
+            ml_client = self.ensure_azure_workspace(sub_id, tenant_id, credential=credential)
+
+            timestamp = int(time.time())
+            function_app_name = self.sanitize_azure_name(f"log-monitor-func-{timestamp}", max_length=60)
+            function_plan_name = self.sanitize_azure_name(f"log-monitor-flex-{timestamp}", max_length=40)
+            storage_account_name = self.sanitize_azure_storage_name(f"logmonitor{timestamp}")
+            service_bus_namespace_name = self.sanitize_azure_name(f"log-monitor-sb-{timestamp}", max_length=50)
+            service_bus_queue_name = "logs"
+            datastore_name = self.sanitize_azure_name(f"log-monitor-batches-{timestamp}", max_length=30).replace("-", "")
+            batch_endpoint_name = self.sanitize_azure_name(f"log-monitor-batch-endpoint-{timestamp}")
+            batch_env_name = self.sanitize_azure_name(f"log-monitor-batch-env-{timestamp}")
+            model_name = self.sanitize_azure_name(f"log-monitor-model-{Path(model_dir).name}-{timestamp}")
+            batch_timezone_iana = self.get_azure_batch_timezone_iana(batch_timezone)
+
+            self.root.after(0, lambda: self.status_var.set("Creating Azure queue, storage, and Function App..."))
+            infra_outputs = self.deploy_azure_function_bridge_infrastructure(
+                credential=credential,
+                sub_id=sub_id,
+                function_app_name=function_app_name,
+                function_plan_name=function_plan_name,
+                storage_account_name=storage_account_name,
+                service_bus_namespace_name=service_bus_namespace_name,
+                service_bus_queue_name=service_bus_queue_name,
+            )
+            storage_connection_string = clean_optional_string(infra_outputs.get("storageConnectionString"))
+            storage_account_key = clean_optional_string(infra_outputs.get("storageAccountKey"))
+            service_bus_connection_string = clean_optional_string(infra_outputs.get("serviceBusConnectionString"))
+            function_host_name = clean_optional_string(infra_outputs.get("functionAppHostName"))
+
+            if not storage_connection_string or not storage_account_key or not service_bus_connection_string or not function_host_name:
+                raise RuntimeError("Azure infrastructure deployment did not return the required connection details.")
+
+            self.root.after(0, lambda: self.status_var.set("Registering Azure Blob datastore for queued batches..."))
+            self.ensure_azure_blob_datastore(
+                ml_client=ml_client,
+                datastore_name=datastore_name,
+                storage_account_name=storage_account_name,
+                container_name="log-batches",
+                storage_account_key=storage_account_key,
+            )
+
+            deployment_meta = self.deploy_azure_batch_endpoint(
+                ml_client=ml_client,
+                model_dir=model_dir,
+                azure_compute=azure_compute,
+                preferred_instance_type=preferred_instance_type,
+                endpoint_name=batch_endpoint_name,
+                environment_name=batch_env_name,
+                model_name=model_name,
+                endpoint_auth_mode="aad_token",
+            )
+            attempted_instance_types = list(deployment_meta.get("attempted_instance_types") or [])
+            compute_name = clean_optional_string(deployment_meta.get("compute_name"))
+            selected_instance_type = clean_optional_string(deployment_meta.get("instance_type"))
+            batch_scoring_uri = clean_optional_string(deployment_meta.get("api_url"))
+            deployment_name = clean_optional_string(deployment_meta.get("deployment_name")) or "default"
+
+            self.root.after(0, lambda: self.status_var.set("Updating Azure Function settings..."))
+            self.set_function_app_settings(
+                credential=credential,
+                sub_id=sub_id,
+                function_app_name=function_app_name,
+                settings={
+                    "AzureWebJobsStorage__accountName": storage_account_name,
+                    "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
+                    "LOGMONITOR_BLOB_CONTAINER": "log-batches",
+                    "LOGMONITOR_SERVICEBUS_CONNECTION": service_bus_connection_string,
+                    "LOGMONITOR_QUEUE_NAME": service_bus_queue_name,
+                    "LOGMONITOR_BATCH_TIME": f"{batch_hour:02d}:{batch_minute:02d}",
+                    "LOGMONITOR_BATCH_TIME_ZONE": batch_timezone_iana,
+                    "LOGMONITOR_BATCH_ENDPOINT_NAME": batch_endpoint_name,
+                    "LOGMONITOR_BATCH_DEPLOYMENT_NAME": deployment_name,
+                    "LOGMONITOR_AML_SUBSCRIPTION_ID": sub_id,
+                    "LOGMONITOR_AML_RESOURCE_GROUP": self.RESOURCE_GROUP,
+                    "LOGMONITOR_AML_WORKSPACE_NAME": self.WORKSPACE_NAME,
+                    "LOGMONITOR_DATASTORE_NAME": datastore_name,
+                    "LOGMONITOR_INPUT_PREFIX": "queue-batches",
+                    "LOGMONITOR_STATE_BLOB": "queue-state/scheduler-state.json",
+                },
+            )
+
+            self.root.after(0, lambda: self.status_var.set("Packaging the Azure Function bridge..."))
+            package_path = self.build_function_bridge_package(f"log-monitor-function-{timestamp}")
+            package_uri = self.upload_function_bridge_package(
+                storage_connection_string=storage_connection_string,
+                storage_account_name=storage_account_name,
+                storage_account_key=storage_account_key,
+                package_path=package_path,
+                package_container_name="functionpkgs",
+            )
+
+            self.root.after(0, lambda: self.status_var.set("Deploying the Azure Function bridge..."))
+            self.trigger_function_app_onedeploy(
+                credential=credential,
+                sub_id=sub_id,
+                function_app_name=function_app_name,
+                package_uri=package_uri,
+            )
+
+            self.root.after(0, lambda: self.status_var.set("Waiting for the Azure log API to become ready..."))
+            log_api_url, function_key = self.wait_for_function_bridge_endpoint(
+                credential=credential,
+                sub_id=sub_id,
+                function_app_name=function_app_name,
+                function_host_name=function_host_name,
+            )
+
+            mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id, tenant_id)
+            training_metadata = self.find_training_metadata_for_model_dir(Path(model_dir))
+            metadata_path = self.save_last_hosting_metadata(
+                {
+                    "mode": "azure_queue_batch",
+                    "service_kind": "queued_batch",
+                    "model_dir": model_dir,
+                    "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
+                    "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
+                    "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
+                    "api_url": log_api_url,
+                    "function_key": function_key,
+                    "function_app_name": function_app_name,
+                    "function_host_name": function_host_name,
+                    "service_bus_namespace": service_bus_namespace_name,
+                    "service_bus_queue": service_bus_queue_name,
+                    "storage_account_name": storage_account_name,
+                    "log_container_name": "log-batches",
+                    "datastore_name": datastore_name,
+                    "endpoint_name": batch_endpoint_name,
+                    "deployment_name": deployment_name,
+                    "batch_endpoint_url": batch_scoring_uri,
+                    "schedule_time": f"{batch_hour:02d}:{batch_minute:02d}",
+                    "schedule_time_zone": batch_timezone,
+                    "schedule_time_zone_iana": batch_timezone_iana,
+                    "instance_type": selected_instance_type,
+                    "compute_name": compute_name,
+                    "endpoint_auth_mode": "aad_token",
+                    "azure_subscription_id": sub_id,
+                    "azure_tenant_id": tenant_id,
+                    "azure_compute": azure_compute,
+                    "mlops_url": mlops_url,
+                    "llmops_url": llmops_url,
+                    "created_at": now_utc_iso(),
+                }
+            )
+
+            summary = (
+                f"Azure queued batch pipeline is ready.\n"
+                f"Log API: {log_api_url}\n"
+                f"Queue: {service_bus_namespace_name}/{service_bus_queue_name}\n"
+                f"Batch Endpoint: {batch_endpoint_name}\n"
+                f"Schedule: every day at {batch_hour:02d}:{batch_minute:02d} {batch_timezone}\n"
+                f"Cluster: {compute_name} ({selected_instance_type}, min nodes 0)\n"
+                "Flow: POST logs to the Function API, queue them, and process the accumulated logs once per day in the background."
+            )
+
+            self.root.after(0, lambda: self.azure_hosted_endpoint_name_var.set(batch_endpoint_name))
+            self.root.after(0, lambda: self.hosting_api_url_var.set(log_api_url))
+            self.root.after(0, lambda: self.azure_mlops_url_var.set(mlops_url))
+            self.root.after(0, lambda: self.azure_llmops_url_var.set(llmops_url))
+            self.root.after(0, lambda: self.hosting_mode_summary_var.set(summary))
+            self.root.after(0, lambda: self.status_var.set("Azure queued batch pipeline is ready."))
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Hosting Ready",
+                    (
+                        f"Azure queued batch pipeline is ready.\n\n"
+                        f"Log API URL:\n{log_api_url}\n\n"
+                        f"Function App:\n{function_app_name}\n\n"
+                        f"Service Bus Queue:\n{service_bus_namespace_name}/{service_bus_queue_name}\n\n"
+                        f"Batch Endpoint:\n{batch_endpoint_name}\n\n"
+                        f"Daily Schedule:\n{batch_hour:02d}:{batch_minute:02d} {batch_timezone}\n\n"
+                        f"MLOps Dashboard:\n{mlops_url}\n\n"
+                        f"LLMOps Dashboard:\n{llmops_url}\n\n"
+                        "The app will try to open the MLOps dashboard in your browser.\n\n"
+                        f"Hosting metadata saved to:\n{metadata_path}"
+                    ),
+                ),
+            )
+            self.root.after(100, lambda: self.open_hosting_dashboard_on_success("azure_queue_batch", mlops_url))
+        except Exception as exc:
+            error_message = self.format_azure_hosting_error(exc, attempted_instance_types)
+            self.root.after(0, lambda err=error_message: messagebox.showerror("Hosting Error", err))
+            self.root.after(0, lambda: self.status_var.set("Azure queued batch hosting failed."))
+        finally:
+            self.root.after(0, self.finish_hosting_action)
+
+    def on_app_close(self):
+        self.shutdown_local_hosting_stack()
+        self.terminate_process(self.mlflow_ui_process, timeout_seconds=3)
         self.root.destroy()
 
     # --- File Processing & LLM Methods ---
@@ -1894,6 +4391,15 @@ class LogProcessorApp:
         data_prep_experiment_name = clean_optional_string(pipeline_context.get("data_prep_experiment_name", ""))
         if data_prep_experiment_name:
             tags["data_prep_experiment_name"] = data_prep_experiment_name
+        data_version_id = clean_optional_string(pipeline_context.get("data_version_id", ""))
+        if data_version_id:
+            tags["data_version_id"] = data_version_id
+        data_version_dir = clean_optional_string(pipeline_context.get("data_version_dir", ""))
+        if data_version_dir:
+            tags["data_version_dir"] = data_version_dir
+        data_version_path = clean_optional_string(pipeline_context.get("data_version_path", ""))
+        if data_version_path:
+            tags["data_version_path"] = data_version_path
 
         env["MLFLOW_PIPELINE_ID"] = str(pipeline_context.get("pipeline_id", ""))
         env["MLFLOW_PARENT_RUN_ID"] = str(pipeline_context.get("parent_run_id", ""))
@@ -1955,6 +4461,9 @@ class LogProcessorApp:
 
     def prepare_training_pipeline_context(self, csv_path: str, mlflow_config: dict, run_source: str) -> dict:
         sidecar = read_sidecar_for_csv(csv_path) or {}
+        data_version_info = self.archive_data_version(csv_path, sidecar)
+        if data_version_info:
+            sidecar.update(data_version_info)
         pipeline_id = clean_optional_string(sidecar.get("pipeline_id")) or str(uuid.uuid4())
         parent_run_id = clean_optional_string(sidecar.get("parent_run_id"))
 
@@ -1976,6 +4485,9 @@ class LogProcessorApp:
             "input_dataset_hash": clean_optional_string(sidecar.get("input_dataset_hash")),
             "output_dataset_hash": clean_optional_string(sidecar.get("output_dataset_hash")),
             "llm_model": clean_optional_string(sidecar.get("llm_model")),
+            "data_version_id": clean_optional_string(sidecar.get("data_version_id")),
+            "data_version_dir": clean_optional_string(sidecar.get("data_version_dir")),
+            "data_version_path": clean_optional_string(sidecar.get("data_version_path")),
             "data_prep_tracking_uri": clean_optional_string(
                 sidecar.get("data_prep_tracking_uri") or sidecar.get("tracking_uri")
             ),
@@ -1992,6 +4504,9 @@ class LogProcessorApp:
             "input_dataset_hash": context["input_dataset_hash"],
             "output_dataset_hash": context["output_dataset_hash"],
             "llm_model": context["llm_model"],
+            "data_version_id": context["data_version_id"],
+            "data_version_dir": context["data_version_dir"],
+            "data_version_path": context["data_version_path"],
             "created_at": clean_optional_string(sidecar.get("created_at")) or now_utc_iso(),
             "tracking_uri": clean_optional_string(sidecar.get("tracking_uri"))
             or clean_optional_string(mlflow_config.get("tracking_uri", "")),
@@ -2023,6 +4538,7 @@ class LogProcessorApp:
         input_hash: str,
         output_hash: str,
         usage_totals: dict[str, int],
+        data_version_info: dict | None = None,
     ) -> dict:
         payload = {
             "pipeline_id": str(uuid.uuid4()),
@@ -2037,6 +4553,9 @@ class LogProcessorApp:
             "experiment_name": clean_optional_string(mlflow_config.get("experiment_name", "")),
             "data_prep_tracking_uri": clean_optional_string(mlflow_config.get("tracking_uri", "")),
             "data_prep_experiment_name": clean_optional_string(mlflow_config.get("experiment_name", "")),
+            "data_version_id": clean_optional_string((data_version_info or {}).get("data_version_id", "")),
+            "data_version_dir": clean_optional_string((data_version_info or {}).get("data_version_dir", "")),
+            "data_version_path": clean_optional_string((data_version_info or {}).get("data_version_path", "")),
         }
 
         if not bool(mlflow_config.get("enabled")):
@@ -2079,6 +4598,10 @@ class LogProcessorApp:
                     mlflow.log_param("prompt_hash", payload["prompt_hash"])
                     mlflow.log_param("input_dataset_hash", payload["input_dataset_hash"])
                     mlflow.log_param("output_dataset_hash", payload["output_dataset_hash"])
+                    if payload["data_version_id"]:
+                        mlflow.log_param("data_version_id", payload["data_version_id"])
+                    if payload["data_version_path"]:
+                        mlflow.log_param("data_version_path", payload["data_version_path"])
 
                     mlflow.log_metric("input_rows", int(input_meta.get("row_count", 0)))
                     mlflow.log_metric("output_rows", int(output_meta.get("row_count", 0)))
@@ -2100,6 +4623,8 @@ class LogProcessorApp:
                                 "prompt_hash": payload["prompt_hash"],
                                 "input_dataset_hash": payload["input_dataset_hash"],
                                 "output_dataset_hash": payload["output_dataset_hash"],
+                                "data_version_id": payload["data_version_id"],
+                                "data_version_path": payload["data_version_path"],
                                 "usage_totals": usage_totals,
                                 "input_metadata": input_meta,
                                 "output_metadata": output_meta,
@@ -2205,7 +4730,8 @@ class LogProcessorApp:
         if not sub_id:
             messagebox.showwarning("MLflow", "Azure Subscription ID is required to open Azure ML Studio.")
             return
-        studio_url = self.build_azure_studio_url(sub_id)
+        tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
+        studio_url = self.build_azure_studio_url(sub_id, tenant_id)
         webbrowser.open(studio_url)
 
     def register_last_model_version(self):
@@ -2263,6 +4789,7 @@ class LogProcessorApp:
         is_azure = self.train_mode.get() == "azure"
         azure_state = "normal" if is_azure else "disabled"
         azure_compute_state = "readonly" if is_azure else "disabled"
+        azure_instance_state = "readonly" if is_azure else "disabled"
         local_state = "disabled" if is_azure else "readonly"
 
         if is_azure:
@@ -2272,6 +4799,8 @@ class LogProcessorApp:
             self.azure_tenant_entry.grid()
             self.azure_compute_label.grid()
             self.azure_compute_combo.grid()
+            self.azure_instance_label.grid()
+            self.azure_instance_combo.grid()
         else:
             self.azure_sub_label.grid_remove()
             self.azure_sub_entry.grid_remove()
@@ -2279,11 +4808,15 @@ class LogProcessorApp:
             self.azure_tenant_entry.grid_remove()
             self.azure_compute_label.grid_remove()
             self.azure_compute_combo.grid_remove()
+            self.azure_instance_label.grid_remove()
+            self.azure_instance_combo.grid_remove()
 
         self.azure_sub_entry.config(state=azure_state)
         self.azure_tenant_entry.config(state=azure_state)
         self.azure_compute_combo.config(state=azure_compute_state)
+        self.azure_instance_combo.config(state=azure_instance_state)
         self.local_device_combo.config(state=local_state)
+        self.refresh_azure_training_instance_options()
 
         if is_azure:
             self.local_device_label.grid_remove()
@@ -2716,6 +5249,17 @@ class LogProcessorApp:
             output_df.to_csv(save_path, index=False)
 
             output_file_hash = compute_file_sha256(save_path)
+            data_version_info = self.archive_data_version(
+                save_path,
+                {
+                    "llm_model": clean_optional_string(model_name),
+                    "prompt_hash": prompt_sha256(system_prompt),
+                    "input_dataset_hash": input_file_hash,
+                    "output_dataset_hash": output_file_hash,
+                    "source_input_path": input_path,
+                    "generated_output_path": save_path,
+                },
+            )
             mlops_lineage = self.log_data_prep_mlflow(
                 mlflow_config=mlflow_config,
                 input_path=input_path,
@@ -2727,6 +5271,7 @@ class LogProcessorApp:
                 input_hash=input_file_hash,
                 output_hash=output_file_hash,
                 usage_totals=usage_totals,
+                data_version_info=data_version_info,
             )
 
             sidecar_payload = {
@@ -2742,6 +5287,9 @@ class LogProcessorApp:
                 "experiment_name": mlops_lineage.get("experiment_name", ""),
                 "data_prep_tracking_uri": mlops_lineage.get("data_prep_tracking_uri", ""),
                 "data_prep_experiment_name": mlops_lineage.get("data_prep_experiment_name", ""),
+                "data_version_id": data_version_info.get("data_version_id", ""),
+                "data_version_dir": data_version_info.get("data_version_dir", ""),
+                "data_version_path": data_version_info.get("data_version_path", ""),
             }
             write_sidecar_for_csv(save_path, sidecar_payload)
             
@@ -2767,6 +5315,7 @@ class LogProcessorApp:
         sub_id = self.azure_sub_entry.get().strip()
         tenant_id = self.azure_tenant_entry.get().strip()
         azure_compute = self.azure_compute_var.get().strip().lower() or "cpu"
+        azure_instance_type = clean_optional_string(self.azure_training_instance_var.get())
         local_device = self.local_device_var.get().strip() or "auto"
         local_runtime = self.local_runtime_var.get().strip() or "host"
         train_mode = self.train_mode.get().strip()
@@ -2777,6 +5326,7 @@ class LogProcessorApp:
         print(f"[DEBUG] Sub ID: {sub_id}")
         print(f"[DEBUG] Tenant ID: {tenant_id}")
         print(f"[DEBUG] Azure Compute: {azure_compute}")
+        print(f"[DEBUG] Azure VM Size: {azure_instance_type}")
         print(f"[DEBUG] Train Mode: {self.train_mode.get()}")
         print(f"[DEBUG] Local Device: {local_device}")
         print(f"[DEBUG] Local Runtime: {local_runtime}")
@@ -2803,6 +5353,17 @@ class LogProcessorApp:
         if training_options is None:
             messagebox.showerror("Training Configuration Error", "Training configuration could not be resolved.")
             return
+        if train_mode == "azure":
+            valid_training_sizes = self.get_azure_training_instance_candidates(azure_compute)
+            if not azure_instance_type:
+                azure_instance_type = valid_training_sizes[0] if valid_training_sizes else ""
+                self.azure_training_instance_var.set(azure_instance_type)
+            if valid_training_sizes and azure_instance_type not in valid_training_sizes:
+                messagebox.showerror(
+                    "Azure Configuration Error",
+                    "Please select a supported Azure VM size for training.",
+                )
+                return
 
         mlflow_config, mlflow_error = self.resolve_mlflow_config(
             require_tracking_uri=False,
@@ -2854,7 +5415,7 @@ class LogProcessorApp:
             try:
                 threading.Thread(
                     target=self.run_azure_training,
-                    args=(csv_path, sub_id, tenant_id, azure_compute, mlflow_config, pipeline_context, training_options),
+                    args=(csv_path, sub_id, tenant_id, azure_compute, azure_instance_type, mlflow_config, pipeline_context, training_options),
                     daemon=True,
                 ).start()
             except Exception:
@@ -2988,12 +5549,24 @@ class LogProcessorApp:
                 raise RuntimeError(f"Local training failed with exit code {return_code}.")
 
             model_path = os.path.abspath(os.path.join(project_dir, "outputs", "final_model"))
+            training_metadata = read_json(os.path.join(project_dir, "outputs", "last_training_mlflow.json")) or {}
+            archived_model_dir = clean_optional_string(training_metadata.get("model_version_model_dir"))
+            selected_model_dir = archived_model_dir or model_path
             self.root.after(0, lambda: self.status_var.set("Local training completed successfully."))
+            self.root.after(0, lambda path=selected_model_dir: self.refresh_hosted_model_inventory(path))
             self.root.after(
                 0,
-                lambda: messagebox.showinfo(
+                lambda latest=model_path, archived=archived_model_dir: messagebox.showinfo(
                     "Success",
-                    f"Local {backend} model training completed.\n\nModel saved to:\n{model_path}",
+                    (
+                        f"Local {backend} model training completed.\n\n"
+                        f"Latest model path:\n{latest}\n\n"
+                        + (
+                            f"Versioned model path:\n{archived}"
+                            if archived
+                            else "No immutable model version path was recorded."
+                        )
+                    ),
                 ),
             )
         except TrainingInterrupted:
@@ -3032,17 +5605,17 @@ class LogProcessorApp:
                 self.local_training_process = None
             self.root.after(0, self.finish_training_session)
 
-    def run_azure_training(self, csv_path, sub_id, tenant_id, azure_compute, mlflow_config, pipeline_context, training_options):
+    def run_azure_training(self, csv_path, sub_id, tenant_id, azure_compute, preferred_instance_type, mlflow_config, pipeline_context, training_options):
         ml_client = None
         returned_job_name = ""
         job_status = ""
         compute_mode = "gpu" if azure_compute == "gpu" else "cpu"
         if compute_mode == "gpu":
             compute_name = "gpu-cluster-temp"
-            compute_size = "Standard_NC4as_T4_v3"
         else:
             compute_name = "cpu-cluster-temp"
-            compute_size = "Standard_D2as_v4"
+        compute_size = ""
+        attempted_compute_sizes: list[str] = []
         compute_created = False
         resource_group = self.RESOURCE_GROUP
         workspace_name = self.WORKSPACE_NAME
@@ -3157,23 +5730,47 @@ class LogProcessorApp:
             # --- Create Compute Cluster ---
             self._raise_if_training_cancelled()
             print(f"[DEBUG] Checking/Provisioning Compute Cluster: {compute_name}...")
-            self.root.after(
-                0,
-                lambda: self.status_var.set(
-                    f"Provisioning {compute_mode.upper()} cluster ({compute_size})..."
-                ),
+            compute_candidates = self.prioritize_instance_candidates(
+                self.get_azure_training_instance_candidates(compute_mode),
+                preferred_instance_type,
             )
-            compute = AmlCompute(
-                name=compute_name,
-                type="amlcompute",
-                size=compute_size,
-                min_instances=0,
-                max_instances=1,
-                idle_time_before_scale_down=120
-            )
-            ml_client.compute.begin_create_or_update(compute).result()
+            last_compute_error = None
+            for instance_type in compute_candidates:
+                attempted_compute_sizes.append(instance_type)
+                self.root.after(
+                    0,
+                    lambda size=instance_type: self.status_var.set(
+                        f"Provisioning {compute_mode.upper()} cluster ({size})..."
+                    ),
+                )
+                try:
+                    compute = AmlCompute(
+                        name=compute_name,
+                        type="amlcompute",
+                        size=instance_type,
+                        min_instances=0,
+                        max_instances=1,
+                        idle_time_before_scale_down=120
+                    )
+                    ml_client.compute.begin_create_or_update(compute).result()
+                    compute_size = instance_type
+                    break
+                except Exception as exc:
+                    last_compute_error = exc
+                    if self.is_azure_quota_error(exc) and instance_type != compute_candidates[-1]:
+                        print(
+                            f"[AZURE-TRAIN] Compute size {instance_type} is unavailable due to quota. "
+                            "Trying the next fallback size."
+                        )
+                        continue
+                    raise
+
+            if not compute_size:
+                if last_compute_error is not None:
+                    raise last_compute_error
+                raise RuntimeError("No Azure training compute size could be provisioned.")
             compute_created = True
-            print(f"[DEBUG] SUCCESS: Compute cluster '{compute_name}' is ready.")
+            print(f"[DEBUG] SUCCESS: Compute cluster '{compute_name}' is ready with size '{compute_size}'.")
             self._raise_if_training_cancelled()
 
             # --- Define and Submit Job ---
@@ -3252,8 +5849,20 @@ class LogProcessorApp:
             ml_client.jobs.download(name=returned_job_name, download_path=download_path, all=False)
             print(f"[DEBUG] SUCCESS: Files downloaded to {download_path}")
             self.cache_downloaded_training_mlflow_metadata(download_path)
-            
-            self.root.after(0, lambda: messagebox.showinfo("Success", f"Model trained and downloaded to:\n{os.path.abspath(download_path)}"))
+            preferred_model_path = ""
+            try:
+                preferred_model_path = discover_model_dir(download_path)
+            except Exception:
+                preferred_model_path = ""
+
+            self.root.after(0, lambda path=preferred_model_path: self.refresh_hosted_model_inventory(path))
+            self.root.after(
+                0,
+                lambda size=compute_size: messagebox.showinfo(
+                    "Success",
+                    f"Model trained and downloaded to:\n{os.path.abspath(download_path)}\n\nAzure VM Size:\n{size}",
+                ),
+            )
 
         except TrainingInterrupted:
             if ml_client and returned_job_name:
@@ -3285,7 +5894,22 @@ class LogProcessorApp:
                 traceback.print_exc() 
                 print("--------------------------------------\n")
                 
-                self.root.after(0, lambda err=str(e): messagebox.showerror("Training Error", f"An error occurred. Check the terminal for full details.\n\n{err}"))
+                self.root.after(
+                    0,
+                    lambda err=str(e), attempted=list(attempted_compute_sizes): messagebox.showerror(
+                        "Training Error",
+                        (
+                            "An error occurred. Check the terminal for full details.\n\n"
+                            + (
+                                "Azure training could not provision a VM size from this list:\n- "
+                                + "\n- ".join(attempted)
+                                + f"\n\n{err}"
+                                if attempted and self.is_azure_quota_error(e)
+                                else err
+                            )
+                        ),
+                    ),
+                )
                 self.root.after(0, lambda: self.status_var.set("Process halted due to error."))
 
         finally:

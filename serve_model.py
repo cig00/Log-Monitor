@@ -1,12 +1,119 @@
 import argparse
 import json
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 from inference_utils import load_model_bundle, predict_error_message
 
 
+class MetricsStore:
+    def __init__(self):
+        self.started_at = time.time()
+        self._lock = threading.Lock()
+        self._request_counts = {}
+        self._request_duration_sums = {}
+        self._request_duration_counts = {}
+        self._prediction_counts = {}
+
+    @staticmethod
+    def _escape_label(value: str) -> str:
+        return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+    def _format_labels(self, labels: dict) -> str:
+        if not labels:
+            return ""
+        parts = []
+        for key, value in labels.items():
+            parts.append(f'{key}="{self._escape_label(value)}"')
+        return "{" + ",".join(parts) + "}"
+
+    def record_request(self, method: str, path: str, status: int, duration_seconds: float, prediction: str = "") -> None:
+        request_key = (method, path, str(status))
+        duration_key = (method, path)
+        clean_prediction = str(prediction).strip()
+        with self._lock:
+            self._request_counts[request_key] = self._request_counts.get(request_key, 0) + 1
+            self._request_duration_sums[duration_key] = self._request_duration_sums.get(duration_key, 0.0) + max(
+                float(duration_seconds),
+                0.0,
+            )
+            self._request_duration_counts[duration_key] = self._request_duration_counts.get(duration_key, 0) + 1
+            if clean_prediction:
+                prediction_key = (clean_prediction,)
+                self._prediction_counts[prediction_key] = self._prediction_counts.get(prediction_key, 0) + 1
+
+    def render(self, bundle_loaded: bool) -> str:
+        with self._lock:
+            request_counts = dict(self._request_counts)
+            request_duration_sums = dict(self._request_duration_sums)
+            request_duration_counts = dict(self._request_duration_counts)
+            prediction_counts = dict(self._prediction_counts)
+
+        lines = [
+            "# HELP log_monitor_http_requests_total Total HTTP requests served by the local prediction API.",
+            "# TYPE log_monitor_http_requests_total counter",
+        ]
+        for (method, path, status), count in sorted(request_counts.items()):
+            lines.append(
+                "log_monitor_http_requests_total"
+                f'{self._format_labels({"method": method, "path": path, "status": status})} {count}'
+            )
+
+        lines.extend(
+            [
+                "# HELP log_monitor_request_duration_seconds Request duration summary by method and path.",
+                "# TYPE log_monitor_request_duration_seconds summary",
+            ]
+        )
+        for key in sorted(request_duration_sums.keys()):
+            method, path = key
+            labels = self._format_labels({"method": method, "path": path})
+            lines.append(f"log_monitor_request_duration_seconds_sum{labels} {request_duration_sums[key]:.6f}")
+            lines.append(f"log_monitor_request_duration_seconds_count{labels} {request_duration_counts.get(key, 0)}")
+
+        lines.extend(
+            [
+                "# HELP log_monitor_predictions_total Total prediction responses returned by label.",
+                "# TYPE log_monitor_predictions_total counter",
+            ]
+        )
+        for (prediction,), count in sorted(prediction_counts.items()):
+            lines.append(
+                "log_monitor_predictions_total"
+                f'{self._format_labels({"prediction": prediction})} {count}'
+            )
+
+        uptime_seconds = max(time.time() - self.started_at, 0.0)
+        lines.extend(
+            [
+                "# HELP log_monitor_api_up Whether the local prediction API process is running.",
+                "# TYPE log_monitor_api_up gauge",
+                "log_monitor_api_up 1",
+                "# HELP log_monitor_model_loaded Whether the model bundle is loaded in memory.",
+                "# TYPE log_monitor_model_loaded gauge",
+                f"log_monitor_model_loaded {1 if bundle_loaded else 0}",
+                "# HELP log_monitor_process_uptime_seconds Seconds since the local prediction API started.",
+                "# TYPE log_monitor_process_uptime_seconds gauge",
+                f"log_monitor_process_uptime_seconds {uptime_seconds:.3f}",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+
+METRICS = MetricsStore()
+
+
 class PredictionHandler(BaseHTTPRequestHandler):
     bundle = None
+
+    def _normalized_path(self) -> str:
+        parsed = urlparse(self.path or "/")
+        path = parsed.path or "/"
+        if path != "/":
+            path = path.rstrip("/")
+        return path or "/"
 
     def _write_json(self, status_code: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -24,6 +131,14 @@ class PredictionHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _write_text(self, status_code: int, body: str, content_type: str = "text/plain; version=0.0.4; charset=utf-8") -> None:
+        encoded = body.encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def _write_method_error(self) -> None:
         self._write_json(
             405,
@@ -33,11 +148,22 @@ class PredictionHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _record_request(self, started_at: float, status_code: int, prediction: str = "") -> None:
+        METRICS.record_request(
+            method=self.command,
+            path=self._normalized_path(),
+            status=status_code,
+            duration_seconds=time.time() - started_at,
+            prediction=prediction,
+        )
+
     def log_message(self, format, *args):
         return
 
     def do_GET(self):
-        if self.path.rstrip("/") == "":
+        started_at = time.time()
+        path = self._normalized_path()
+        if path == "/":
             host = self.headers.get("Host", "127.0.0.1")
             self._write_html(
                 200,
@@ -84,6 +210,7 @@ class PredictionHandler(BaseHTTPRequestHandler):
       <h1>Local Prediction API</h1>
       <p>This service accepts a JSON <code>POST</code> request at <a href="http://{host}/predict">http://{host}/predict</a>.</p>
       <p>Health check: <a href="http://{host}/health">http://{host}/health</a></p>
+      <p>Prometheus metrics: <a href="http://{host}/metrics">http://{host}/metrics</a></p>
       <pre>{{
   "errorMessage": ""
 }}</pre>
@@ -95,18 +222,29 @@ class PredictionHandler(BaseHTTPRequestHandler):
 </body>
 </html>""",
             )
+            self._record_request(started_at, 200)
             return
-        if self.path.rstrip("/") == "/health":
+        if path == "/health":
             self._write_json(200, {"status": "ok"})
+            self._record_request(started_at, 200)
             return
-        if self.path.rstrip("/") == "/predict":
+        if path == "/metrics":
+            self._write_text(200, METRICS.render(bundle_loaded=self.bundle is not None))
+            self._record_request(started_at, 200)
+            return
+        if path == "/predict":
             self._write_method_error()
+            self._record_request(started_at, 405)
             return
         self._write_json(404, {"prediction": ""})
+        self._record_request(started_at, 404)
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/predict":
+        started_at = time.time()
+        path = self._normalized_path()
+        if path != "/predict":
             self._write_json(404, {"prediction": ""})
+            self._record_request(started_at, 404)
             return
 
         content_length = int(self.headers.get("Content-Length", "0") or 0)
@@ -116,15 +254,22 @@ class PredictionHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception:
             self._write_json(400, {"prediction": ""})
+            self._record_request(started_at, 400)
             return
 
         if not isinstance(payload, dict):
             self._write_json(400, {"prediction": ""})
+            self._record_request(started_at, 400)
             return
 
-        error_message = str(payload.get("errorMessage", ""))
-        prediction = predict_error_message(self.bundle, error_message)
-        self._write_json(200, {"prediction": prediction})
+        try:
+            error_message = str(payload.get("errorMessage", ""))
+            prediction = predict_error_message(self.bundle, error_message)
+            self._write_json(200, {"prediction": prediction})
+            self._record_request(started_at, 200, prediction=prediction)
+        except Exception:
+            self._write_json(500, {"prediction": "", "message": "Prediction failed."})
+            self._record_request(started_at, 500)
 
 
 def main():

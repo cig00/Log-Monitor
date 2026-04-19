@@ -110,6 +110,13 @@ def safe_mlflow_call(enabled: bool, fn, description: str) -> None:
         print(f"[MLOPS] {description} failed: {exc}")
 
 
+def build_model_version_id(created_at: str, run_id: str, dataset_hash: str) -> str:
+    timestamp_token = "".join(ch for ch in clean_optional_string(created_at) if ch.isalnum())
+    suffix_source = clean_optional_string(run_id) or clean_optional_string(dataset_hash) or "local"
+    suffix_token = "".join(ch for ch in suffix_source if ch.isalnum())[:12] or "local"
+    return f"{timestamp_token[:24]}_{suffix_token}"
+
+
 def parse_numeric_csv(raw: str, parser, field_name: str):
     cleaned = clean_optional_string(raw)
     if not cleaned:
@@ -788,6 +795,27 @@ def main():
 
     model_uri = f"runs:/{run_id}/final_model" if run_id else ""
     lineage_tags = mlflow_context.get("tags", {})
+    created_at = now_utc_iso()
+    model_version_id = build_model_version_id(created_at, run_id, input_data_hash)
+    model_versions_root = os.path.join(output_root, "model_versions")
+    version_root = os.path.join(model_versions_root, model_version_id)
+    while os.path.exists(version_root):
+        model_version_id = f"{model_version_id}_{random.randint(1000, 9999)}"
+        version_root = os.path.join(model_versions_root, model_version_id)
+    archived_model_dir = os.path.join(version_root, "final_model")
+
+    safe_mlflow_call(
+        mlflow_enabled,
+        lambda: mlflow.log_param("model_version_id", model_version_id),
+        "log model_version_id",
+    )
+    if clean_optional_string(lineage_tags.get("data_version_id", "")):
+        safe_mlflow_call(
+            mlflow_enabled,
+            lambda: mlflow.log_param("data_version_id", clean_optional_string(lineage_tags.get("data_version_id", ""))),
+            "log data_version_id",
+        )
+
     metadata_payload = {
         "run_id": run_id,
         "tracking_uri": clean_optional_string(mlflow_context.get("tracking_uri", "")),
@@ -804,19 +832,28 @@ def main():
         "data_prep_experiment_name": clean_optional_string(lineage_tags.get("data_prep_experiment_name", "")),
         "data_prep_input_dataset_hash": clean_optional_string(lineage_tags.get("data_prep_input_dataset_hash", "")),
         "data_prep_output_dataset_hash": clean_optional_string(lineage_tags.get("data_prep_output_dataset_hash", "")),
+        "data_version_id": clean_optional_string(lineage_tags.get("data_version_id", "")),
+        "data_version_dir": clean_optional_string(lineage_tags.get("data_version_dir", "")),
+        "data_version_path": clean_optional_string(lineage_tags.get("data_version_path", "")),
         "prompt_hash": clean_optional_string(lineage_tags.get("prompt_hash", "")),
         "llm_model": clean_optional_string(lineage_tags.get("llm_model", "")),
         "dataset_metadata": dataset_meta,
         "split_metadata": split_metadata,
         "selection_summary": selection_summary,
         "test_metrics": test_metrics,
-        "created_at": now_utc_iso(),
+        "created_at": created_at,
+        "model_version_id": model_version_id,
+        "model_version_dir": os.path.abspath(version_root),
+        "model_version_model_dir": os.path.abspath(archived_model_dir),
     }
 
     os.makedirs(output_root, exist_ok=True)
     top_level_metadata_path = os.path.join(output_root, "last_training_mlflow.json")
     write_json(top_level_metadata_path, metadata_payload)
     shutil.copy2(top_level_metadata_path, os.path.join(output_dir, "last_training_mlflow.json"))
+    os.makedirs(version_root, exist_ok=True)
+    shutil.copy2(top_level_metadata_path, os.path.join(version_root, "last_training_mlflow.json"))
+    shutil.copytree(output_dir, archived_model_dir)
     safe_mlflow_call(
         mlflow_enabled,
         lambda: mlflow.log_dict(metadata_payload, "training_run_metadata.json"),

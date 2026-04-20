@@ -1185,12 +1185,17 @@ class LogProcessorApp:
         return ""
 
     def get_local_observability_tools_root(self) -> Path:
-        platform_name = "windows" if sys.platform == "win32" else "linux"
-        return self.get_local_observability_root() / "tools" / platform_name
+        return self.get_local_observability_root() / "tools" / self.get_local_observability_platform_name()
 
     def get_local_observability_downloads_root(self) -> Path:
-        platform_name = "windows" if sys.platform == "win32" else "linux"
-        return self.get_local_observability_root() / "downloads" / platform_name
+        return self.get_local_observability_root() / "downloads" / self.get_local_observability_platform_name()
+
+    def get_local_observability_platform_name(self) -> str:
+        if sys.platform == "win32":
+            return "windows"
+        if sys.platform == "darwin":
+            return "macos"
+        return "linux"
 
     def get_observability_binary_names(self, tool_name: str) -> list[str]:
         if tool_name == "grafana-server":
@@ -1250,6 +1255,8 @@ class LogProcessorApp:
         if sys.platform == "win32":
             machine = platform.machine().lower()
             return machine in {"amd64", "x86_64", "arm64"}
+        if sys.platform == "darwin":
+            return bool(shutil.which("brew"))
         if not sys.platform.startswith("linux"):
             return False
         if not shutil.which("apt-get") or not shutil.which("pkexec"):
@@ -1280,12 +1287,42 @@ class LogProcessorApp:
         if sys.platform == "win32":
             self.install_windows_local_observability_dependencies()
             return
+        script_path = self.get_local_observability_install_script()
+        if sys.platform == "darwin":
+            if not self.can_auto_install_local_observability():
+                raise RuntimeError(
+                    "Automatic installation on macOS requires Homebrew (`brew`) to be installed and available on PATH."
+                )
+            process = subprocess.Popen(
+                ["/bin/bash", script_path],
+                cwd=self.project_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            output, _ = process.communicate()
+            clean_output = (output or "").strip()
+            if process.returncode != 0:
+                if not clean_output:
+                    clean_output = "Homebrew installation did not complete successfully."
+                raise RuntimeError(
+                    "Automatic installation of Grafana and Prometheus did not complete successfully.\n\n"
+                    f"{clean_output[-4000:]}"
+                )
+
+            missing = self.get_missing_local_observability_tools()
+            if missing:
+                raise RuntimeError(
+                    "The installation finished, but the required binaries are still missing: "
+                    + ", ".join(missing)
+                )
+            return
         if not self.can_auto_install_local_observability():
             raise RuntimeError(
-                "Automatic installation is only supported on Debian/Ubuntu-style Linux systems with `pkexec` and `apt-get` available."
+                "Automatic installation is only supported on macOS with Homebrew or Debian/Ubuntu-style Linux systems with `pkexec` and `apt-get` available."
             )
 
-        script_path = self.get_local_observability_install_script()
         process = subprocess.Popen(
             ["pkexec", "/bin/bash", script_path],
             cwd=self.project_dir,
@@ -1317,8 +1354,11 @@ class LogProcessorApp:
                 os.environ.get("PROMETHEUS_BIN", ""),
                 self.find_vendored_observability_binary("prometheus"),
                 "prometheus",
+                "/opt/homebrew/bin/prometheus",
+                "/opt/homebrew/opt/prometheus/bin/prometheus",
                 "/usr/bin/prometheus",
                 "/usr/local/bin/prometheus",
+                "/usr/local/opt/prometheus/bin/prometheus",
             ]
         )
 
@@ -1329,12 +1369,34 @@ class LogProcessorApp:
                 self.find_vendored_observability_binary("grafana-server"),
                 "grafana-server",
                 "grafana",
+                "/opt/homebrew/bin/grafana-server",
+                "/opt/homebrew/bin/grafana",
                 "/usr/sbin/grafana-server",
                 "/usr/bin/grafana-server",
                 "/usr/share/grafana/bin/grafana-server",
+                "/opt/homebrew/opt/grafana/bin/grafana-server",
+                "/opt/homebrew/opt/grafana/bin/grafana",
                 "/usr/local/bin/grafana-server",
+                "/usr/local/bin/grafana",
+                "/usr/local/opt/grafana/bin/grafana-server",
+                "/usr/local/opt/grafana/bin/grafana",
             ]
         )
+
+    def get_homebrew_prefix(self, formula_name: str) -> str:
+        brew_binary = shutil.which("brew")
+        if not brew_binary:
+            return ""
+        try:
+            result = subprocess.run(
+                [brew_binary, "--prefix", formula_name],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except Exception:
+            return ""
+        return clean_optional_string(result.stdout)
 
     def fetch_text_url(self, url: str, timeout_seconds: int = 60) -> str:
         response = requests.get(url, timeout=timeout_seconds)
@@ -1434,6 +1496,7 @@ class LogProcessorApp:
 
     def get_grafana_home(self, grafana_binary: str) -> str:
         explicit_home = clean_optional_string(os.environ.get("GRAFANA_HOME", ""))
+        homebrew_prefix = self.get_homebrew_prefix("grafana")
         candidates: list[Path] = []
         if explicit_home:
             candidates.append(Path(explicit_home).expanduser())
@@ -1441,10 +1504,16 @@ class LogProcessorApp:
         candidates.extend(
             [
                 binary_path.parent.parent,
+                binary_path.parent.parent / "share" / "grafana",
                 Path("/usr/share/grafana"),
                 Path("/usr/local/share/grafana"),
+                Path("/opt/homebrew/share/grafana"),
+                Path("/opt/homebrew/opt/grafana/share/grafana"),
+                Path("/usr/local/opt/grafana/share/grafana"),
             ]
         )
+        if homebrew_prefix:
+            candidates.append(Path(homebrew_prefix) / "share" / "grafana")
         for candidate in candidates:
             try:
                 resolved = candidate.resolve()
@@ -3413,7 +3482,7 @@ timeout while opening socket"""
                     "Local Hosting",
                     (
                         "Local Grafana hosting needs extra dependencies, but automatic installation is only "
-                        "supported on 64-bit Windows or Debian/Ubuntu-style Linux systems with `pkexec`.\n\n"
+                        "supported on 64-bit Windows, macOS with Homebrew, or Debian/Ubuntu-style Linux systems with `pkexec`.\n\n"
                         "Missing tools:\n- "
                         + "\n- ".join(missing_tools)
                     ),
@@ -3428,6 +3497,10 @@ timeout while opening socket"""
             if sys.platform == "win32":
                 install_message += (
                     "\n\nThe app can download the official Windows portable builds into this project automatically. Continue?"
+                )
+            elif sys.platform == "darwin":
+                install_message += (
+                    "\n\nThe app can install them automatically with Homebrew. Continue?"
                 )
             else:
                 install_message += (

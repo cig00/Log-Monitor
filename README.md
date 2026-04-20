@@ -578,6 +578,8 @@ Local hosting starts `serve_model.py` in a background process and exposes:
 
 - `POST /predict`
   - accepts the prediction request JSON
+- `GET /metrics`
+  - returns Prometheus-compatible metrics for the local API
 - `GET /predict`
   - returns `405 Method Not Allowed` with a usage hint
 
@@ -586,6 +588,7 @@ Behavior:
 - the app chooses a free localhost port dynamically
 - the hosted API binds to `127.0.0.1`
 - the app health-checks `/health` before marking hosting as ready
+- the app starts Prometheus and Grafana locally to visualize API health and prediction traffic
 - the app records which model version and training run were deployed when metadata is available
 - hosting metadata is saved to:
 
@@ -607,6 +610,16 @@ The local dashboard:
 - lists discovered available models from local version archives and downloaded bundles
 - searches the project `outputs`, the project `downloaded_model`, and the selected hosted model path
 - links to the local API and local MLflow UI when available
+
+Local observability dependency handling:
+
+- Windows:
+  - the app can download portable Grafana and Prometheus builds into the project automatically
+- macOS:
+  - the app can install Grafana and Prometheus automatically with Homebrew
+  - manual fallback paths include common Homebrew locations under `/opt/homebrew` and `/usr/local`
+- Debian/Ubuntu Linux:
+  - the app can install Grafana and Prometheus automatically with `pkexec` + `apt-get`
 
 ## Azure Hosting
 

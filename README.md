@@ -9,6 +9,8 @@ Log-Monitor is a Tkinter desktop application for the full log-classification lif
 5. host the trained model locally or on Azure
 6. expose either a local prediction API or an Azure batch inference endpoint
 
+The desktop app now uses a modular-monolith architecture: `app.py` remains the Tkinter UI and workflow orchestrator, while the business logic lives in internal service and runtime modules under `app_core/`.
+
 The project also includes Docker, Apptainer, and Slurm helpers for reproducible training outside the desktop UI.
 
 ## What The Project Does
@@ -58,6 +60,17 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 ## Repository Layout
 
 - `app.py`: Tkinter UI and workflow orchestrator.
+- `app_core/`: internal modular-monolith package used by `app.py`.
+  - `contracts.py`: typed request, status, artifact, and job dataclasses.
+  - `runtime.py`: shared `JobManager`, `StateStore` (SQLite), and `ArtifactStore`.
+  - `github_service.py`: GitHub repo and branch discovery service.
+  - `data_prep_service.py`: OpenAI-backed data-prep workflow service.
+  - `training_service.py`: local and Azure training orchestration service.
+  - `model_catalog_service.py`: model inventory and metadata lookup service.
+  - `hosting_service.py`: local and Azure hosting orchestration service.
+  - `observability_service.py`: Prometheus/Grafana install, launch, and provisioning service.
+  - `mlops_service.py`: MLflow config, lineage, UI, and registration service.
+  - `azure_platform_service.py`: Azure SDK adapter used by training and hosting.
 - `train.py`: model training script.
 - `mlops_utils.py`: shared helpers for hashes, sidecars, JSON, model discovery, and prompt metadata.
 - `inference_utils.py`: shared inference loader and prediction helper.
@@ -76,6 +89,7 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 - `scripts/apptainer_build_from_docker.sh`: build a `.sif` from the Docker image.
 - `scripts/apptainer_pull_from_registry.sh`: pull a `.sif` from a registry image.
 - `hpc/slurm_train_apptainer.sbatch`: Slurm example for Apptainer GPU jobs.
+- `tests/`: unit tests for the new runtime and service layer.
 
 ## Labels And Model
 
@@ -611,6 +625,16 @@ The local dashboard:
 - searches the project `outputs`, the project `downloaded_model`, and the selected hosted model path
 - links to the local API and local MLflow UI when available
 
+Internal runtime note:
+
+- background workflow metadata is also stored in:
+
+```text
+./outputs/runtime_state.sqlite3
+```
+
+- the SQLite runtime store backs job status and lightweight orchestration state for the modular service layer used by `app.py`
+
 Local observability dependency handling:
 
 - Windows:
@@ -838,6 +862,14 @@ Fix:
 
 ```bash
 pip install -r requirements.txt
+```
+
+### Service-Layer Changes Need Validation
+
+The UI is now a thin orchestrator over `app_core/`, so service/runtime regressions can be checked without launching Tkinter:
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
 ### `ImportError: cannot import name 'MLOPS_ENV_VARS'`

@@ -1,89 +1,32 @@
+from __future__ import annotations
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
-import requests
-import pandas as pd
-import json
 import os
-import subprocess
 import sys
-import time
 import traceback
-import tempfile
-import uuid
 import webbrowser
-import shutil
-import shlex
-import socket
-import re
-import html
-import tarfile
-import zipfile
-import platform
+from dataclasses import asdict
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote as url_quote, urlparse
+from typing import Any
 
-# Azure ML Imports
-from azure.identity import InteractiveBrowserCredential
-from azure.ai.ml import MLClient, command, Input
-from azure.ai.ml.constants import AssetTypes
-from azure.ai.ml.entities import (
-    AccountKeyConfiguration,
-    Workspace,
-    AmlCompute,
-    AzureBlobDatastore,
-    BatchEndpoint,
-    CodeConfiguration,
-    Environment,
-    JobSchedule,
-    ManagedOnlineDeployment,
-    ManagedOnlineEndpoint,
-    Model,
-    ModelBatchDeployment,
-    ModelBatchDeploymentSettings,
-    RecurrencePattern,
-    RecurrenceTrigger,
-)
-from azure.mgmt.resource import ResourceManagementClient
+from app_core.azure_platform_service import AZURE_AVAILABLE, AzurePlatformService
+from app_core.contracts import DataPrepRequest, MlflowConfig, TrainingRequest, HostingRequest
+from app_core.data_prep_service import DataPrepService
+from app_core.github_service import GitHubService
+from app_core.hosting_service import HostingService
+from app_core.mlops_service import MlopsService
+from app_core.model_catalog_service import ModelCatalogService
+from app_core.observability_service import ObservabilityService
+from app_core.runtime import ArtifactStore, JobManager, StateStore
+from app_core.training_service import TrainingService
 
 from mlops_utils import (
-    bool_from_env,
     clean_optional_string,
-    compute_file_sha256,
-    dataframe_metadata,
-    dataframe_sample,
     discover_model_dir,
     local_mlflow_tracking_uri,
-    now_utc_iso,
-    prompt_sha256,
-    read_json,
-    read_sidecar_for_csv,
-    safe_prompt_preview,
-    write_json,
-    write_sidecar_for_csv,
 )
-
-try:
-    import mlflow
-except Exception:
-    mlflow = None
-
-
-MLOPS_ENV_VARS = [
-    "MLOPS_ENABLED",
-    "MLFLOW_TRACKING_URI",
-    "MLFLOW_EXPERIMENT_NAME",
-    "MLFLOW_PIPELINE_ID",
-    "MLFLOW_PARENT_RUN_ID",
-    "MLFLOW_RUN_SOURCE",
-    "MLFLOW_TAGS_JSON",
-]
-
-
-class TrainingInterrupted(Exception):
-    """Raised when the user interrupts an active training workflow."""
-
 
 class LogProcessorApp:
     RESOURCE_GROUP = "LogClassifier-RG"
@@ -106,14 +49,53 @@ class LogProcessorApp:
         self.project_dir = os.path.dirname(os.path.abspath(__file__))
         self.azure_mlflow_tracking_uri = ""
         self.local_mlflow_tracking_uri = local_mlflow_tracking_uri()
+        self.artifact_store = ArtifactStore(self.project_dir)
+        self.state_store = StateStore(self.artifact_store.state_db_path)
+        self.job_manager = JobManager(self.state_store)
+        self.github_service = GitHubService()
+        self.model_catalog_service = ModelCatalogService(self.project_dir, self.artifact_store)
+        self.mlops_service = MlopsService(
+            self.project_dir,
+            self.artifact_store,
+            self.model_catalog_service,
+            resource_group=self.RESOURCE_GROUP,
+            workspace_name=self.WORKSPACE_NAME,
+            local_tracking_uri=self.local_mlflow_tracking_uri,
+        )
+        self.azure_platform_service = AzurePlatformService(
+            self.project_dir,
+            resource_group=self.RESOURCE_GROUP,
+            workspace_name=self.WORKSPACE_NAME,
+        )
+        self.observability_service = ObservabilityService(
+            self.project_dir,
+            self.artifact_store,
+            self.state_store,
+        )
+        self.data_prep_service = DataPrepService(self.job_manager, self.mlops_service, self.model_catalog_service)
+        self.training_service = TrainingService(
+            self.project_dir,
+            self.job_manager,
+            self.model_catalog_service,
+            self.mlops_service,
+            self.azure_platform_service,
+        )
+        self.hosting_service = HostingService(
+            self.project_dir,
+            self.job_manager,
+            self.model_catalog_service,
+            self.mlops_service,
+            self.azure_platform_service,
+            self.observability_service,
+        )
+        self.current_data_prep_job_id = ""
+        self.current_training_job_id = ""
+        self.current_hosting_job_id = ""
+        self.current_repo_job_id = ""
+        self.current_branch_job_id = ""
         self.mlflow_ui_process = None
-        self.training_cancel_event = threading.Event()
         self.training_state_lock = threading.Lock()
         self.training_active = False
-        self.local_training_process = None
-        self.azure_ml_client_for_cancel = None
-        self.azure_active_job_name = ""
-        self.azure_cancel_requested = False
         self.training_config_visible = False
         self.hosting_active = False
         self.hosting_state_lock = threading.Lock()
@@ -171,6 +153,7 @@ class LogProcessorApp:
 
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
+        self.root.after(250, self.poll_job_events)
 
     def create_widgets(self):
         # --- File Upload Section ---
@@ -714,29 +697,142 @@ class LogProcessorApp:
         self.root.update_idletasks()
         self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
 
+    def build_mlflow_config_from_ui(
+        self,
+        require_tracking_uri: bool,
+        soft_disable: bool = False,
+        ml_client: Any | None = None,
+    ) -> tuple[MlflowConfig, str | None]:
+        return self.mlops_service.resolve_mlflow_config(
+            enabled=bool(self.mlflow_enabled_var.get()),
+            backend=self.mlflow_backend_var.get().strip() or "local",
+            experiment_name=self.mlflow_experiment_var.get(),
+            registered_model_name=self.mlflow_registered_model_var.get(),
+            tracking_uri=self.mlflow_tracking_uri_var.get(),
+            require_tracking_uri=require_tracking_uri,
+            ml_client=ml_client,
+            soft_disable=soft_disable,
+        )
+
+    def poll_job_events(self):
+        for event in self.job_manager.drain_events():
+            self.handle_job_event(event)
+        self.root.after(250, self.poll_job_events)
+
+    def handle_job_event(self, event):
+        if event.message:
+            self.status_var.set(event.message)
+        if event.job_id == self.current_data_prep_job_id:
+            self._handle_data_prep_event(event)
+        elif event.job_id == self.current_training_job_id:
+            self._handle_training_event(event)
+        elif event.job_id == self.current_hosting_job_id:
+            self._handle_hosting_event(event)
+        elif event.job_id == self.current_repo_job_id:
+            self._handle_repo_event(event)
+        elif event.job_id == self.current_branch_job_id:
+            self._handle_branch_event(event)
+
+    def _handle_data_prep_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_data_prep_job_id = ""
+        self.prepare_btn.config(state="normal")
+        if event.status == "succeeded":
+            self.status_var.set("Data processed successfully!")
+            messagebox.showinfo("Success", event.payload.get("message", "Data processed successfully."))
+            return
+        if event.status == "canceled":
+            self.status_var.set("Data preparation was interrupted.")
+            messagebox.showinfo("Canceled", event.payload.get("message", "Data preparation was interrupted."))
+            return
+        self.show_error(event.payload.get("message", "Data preparation failed."))
+
+    def _handle_training_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_training_job_id = ""
+        self.finish_training_session()
+        if event.status == "succeeded":
+            selected_model_dir = clean_optional_string(event.payload.get("selected_model_dir"))
+            if selected_model_dir:
+                self.refresh_hosted_model_inventory(selected_model_dir)
+            self.status_var.set("Training completed successfully.")
+            messagebox.showinfo("Success", event.payload.get("message", "Training completed successfully."))
+            return
+        if event.status == "canceled":
+            self.status_var.set("Training was interrupted.")
+            messagebox.showinfo("Training Interrupted", event.payload.get("message", "Training was interrupted before completion."))
+            return
+        self.status_var.set("Training failed.")
+        messagebox.showerror("Training Error", event.payload.get("message", "Training failed."))
+
+    def _handle_hosting_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_hosting_job_id = ""
+        self.hosting_process = self.observability_service.hosting_process
+        self.prometheus_process = self.observability_service.prometheus_process
+        self.grafana_process = self.observability_service.grafana_process
+        if event.status == "succeeded":
+            self.hosting_api_url_var.set(clean_optional_string(event.payload.get("api_url")))
+            self.hosting_mode_summary_var.set(clean_optional_string(event.payload.get("summary")))
+            self.azure_mlops_url_var.set(clean_optional_string(event.payload.get("mlops_url")))
+            self.azure_llmops_url_var.set(clean_optional_string(event.payload.get("llmops_url")))
+            self.azure_hosted_endpoint_name_var.set(clean_optional_string(event.payload.get("endpoint_name")))
+            self.finish_hosting_action()
+            self.status_var.set(clean_optional_string(event.payload.get("message")) or "Hosting is ready.")
+            messagebox.showinfo("Hosting Ready", event.payload.get("message", "Hosting is ready."))
+            self.open_hosting_dashboard_on_success(self.hosting_mode_var.get(), clean_optional_string(event.payload.get("mlops_url")))
+            return
+        self.finish_hosting_action()
+        if event.status == "canceled":
+            self.status_var.set("Hosting was interrupted.")
+            messagebox.showinfo("Hosting Interrupted", event.payload.get("message", "Hosting was interrupted."))
+            return
+        self.status_var.set("Hosting failed.")
+        messagebox.showerror("Hosting Error", event.payload.get("message", "Hosting failed."))
+
+    def _handle_repo_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_repo_job_id = ""
+        self.load_repos_btn.config(state="normal")
+        if event.status == "succeeded":
+            self.update_repo_combo(event.payload.get("repo_names", []))
+            return
+        if event.status == "canceled":
+            self.status_var.set("Repository load canceled.")
+            return
+        self.show_error(event.payload.get("message", "Failed to load repositories."))
+
+    def _handle_branch_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_branch_job_id = ""
+        if event.status == "succeeded":
+            self.update_branch_combo(event.payload.get("branch_names", []))
+            return
+        if event.status == "canceled":
+            self.status_var.set("Branch load canceled.")
+            return
+        self.show_error(event.payload.get("message", "Failed to load branches."))
+
     # --- GitHub Repos/Branches Methods ---
     def start_repo_thread(self):
         token = self.github_key_entry.get().strip()
         if not token:
             messagebox.showwarning("Warning", "Please enter a GitHub Personal Access Token.")
             return
-        
+
         self.status_var.set("Loading repositories...")
         self.load_repos_btn.config(state="disabled")
-        threading.Thread(target=self.fetch_repos, args=(token,), daemon=True).start()
-
-    def fetch_repos(self, token):
-        headers = {"Authorization": f"Bearer {token}"}
-        try:
-            response = requests.get("https://api.github.com/user/repos?per_page=100", headers=headers)
-            response.raise_for_status()
-            repos = response.json()
-            repo_names = [repo['full_name'] for repo in repos]
-            self.root.after(0, self.update_repo_combo, repo_names)
-        except Exception as e:
-            self.root.after(0, self.show_error, f"Failed to load repos: {e}")
-        finally:
-            self.root.after(0, lambda: self.load_repos_btn.config(state="normal"))
+        job = self.job_manager.submit(
+            "github_fetch_repos",
+            lambda ctx: {"repo_names": self.github_service.fetch_repos(token)},
+            metadata={"operation": "github_fetch_repos"},
+        )
+        self.current_repo_job_id = job.job_id
 
     def update_repo_combo(self, repo_names):
         self.repo_combo['values'] = repo_names
@@ -755,18 +851,12 @@ class LogProcessorApp:
 
         self.status_var.set("Loading branches...")
         self.branch_combo.set('')
-        threading.Thread(target=self.fetch_branches, args=(token, repo_name), daemon=True).start()
-
-    def fetch_branches(self, token, repo_name):
-        headers = {"Authorization": f"Bearer {token}"}
-        try:
-            response = requests.get(f"https://api.github.com/repos/{repo_name}/branches", headers=headers)
-            response.raise_for_status()
-            branches = response.json()
-            branch_names = [branch['name'] for branch in branches]
-            self.root.after(0, self.update_branch_combo, branch_names)
-        except Exception as e:
-            self.root.after(0, self.show_error, f"Failed to load branches: {e}")
+        job = self.job_manager.submit(
+            "github_fetch_branches",
+            lambda ctx: {"branch_names": self.github_service.fetch_branches(token, repo_name)},
+            metadata={"operation": "github_fetch_branches", "repo_name": repo_name},
+        )
+        self.current_branch_job_id = job.job_id
 
     def update_branch_combo(self, branch_names):
         self.branch_combo['values'] = branch_names
@@ -791,7 +881,7 @@ class LogProcessorApp:
             self.refresh_hosted_model_inventory(preferred_path=selected_dir)
 
     def refresh_azure_training_instance_options(self, preferred: str = ""):
-        candidates = self.get_azure_training_instance_candidates(self.azure_compute_var.get())
+        candidates = self.azure_platform_service.get_azure_training_instance_candidates(self.azure_compute_var.get())
         self.azure_instance_combo["values"] = candidates
         preferred_value = clean_optional_string(preferred) or clean_optional_string(self.azure_training_instance_var.get())
         if preferred_value in candidates:
@@ -805,7 +895,7 @@ class LogProcessorApp:
         self.refresh_azure_training_instance_options()
 
     def refresh_azure_host_instance_options(self, preferred: str = ""):
-        candidates = self.get_azure_host_instance_candidates(self.azure_host_compute_var.get())
+        candidates = self.azure_platform_service.get_azure_host_instance_candidates(self.azure_host_compute_var.get())
         self.azure_host_instance_combo["values"] = candidates
         preferred_value = clean_optional_string(preferred) or clean_optional_string(self.azure_host_instance_var.get())
         if preferred_value in candidates:
@@ -818,176 +908,13 @@ class LogProcessorApp:
     def on_azure_host_compute_change(self, event=None):
         self.refresh_azure_host_instance_options()
 
-    def is_supported_model_dir(self, candidate: Path) -> bool:
-        return candidate.is_dir() and (candidate / "config.json").exists() and (
-            (candidate / "pytorch_model.bin").exists()
-            or (candidate / "model.safetensors").exists()
-            or (candidate / "tf_model.h5").exists()
-        )
 
-    def archive_data_version(self, csv_path: str, metadata: dict | None = None) -> dict:
-        resolved_csv = Path(csv_path).expanduser().resolve()
-        if not resolved_csv.exists():
-            return {}
 
-        dataset_hash = compute_file_sha256(str(resolved_csv))
-        version_root = Path(self.project_dir) / "outputs" / "data_versions" / dataset_hash
-        version_root.mkdir(parents=True, exist_ok=True)
 
-        archived_dataset_path = version_root / "dataset.csv"
-        try:
-            same_target = archived_dataset_path.resolve() == resolved_csv
-        except Exception:
-            same_target = False
-        if not same_target:
-            shutil.copy2(str(resolved_csv), str(archived_dataset_path))
 
-        metadata_path = version_root / "metadata.json"
-        existing_metadata = read_json(str(metadata_path)) or {}
-        payload = {
-            "data_version_id": dataset_hash,
-            "dataset_hash": dataset_hash,
-            "source_dataset_path": str(resolved_csv),
-            "archived_dataset_path": str(archived_dataset_path),
-            "source_filename": resolved_csv.name,
-            "created_at": clean_optional_string(existing_metadata.get("created_at")) or now_utc_iso(),
-        }
-        if isinstance(metadata, dict):
-            for key, value in metadata.items():
-                if value is None:
-                    continue
-                if isinstance(value, str):
-                    cleaned = clean_optional_string(value)
-                    if not cleaned:
-                        continue
-                    payload[key] = cleaned
-                else:
-                    payload[key] = value
-        write_json(str(metadata_path), payload)
-        return {
-            "data_version_id": dataset_hash,
-            "data_version_dir": str(version_root),
-            "data_version_path": str(archived_dataset_path),
-        }
-
-    def iter_model_dirs_under(self, root: Path) -> list[Path]:
-        discovered: list[Path] = []
-        seen: set[str] = set()
-        if not root.exists():
-            return discovered
-
-        def add_candidate(candidate: Path) -> None:
-            try:
-                resolved = candidate.resolve()
-            except Exception:
-                resolved = candidate
-            key = str(resolved)
-            if key in seen or not self.is_supported_model_dir(resolved):
-                return
-            seen.add(key)
-            discovered.append(resolved)
-
-        add_candidate(root)
-        if not root.is_dir():
-            return discovered
-
-        try:
-            config_matches = sorted(root.rglob("config.json"))
-        except Exception:
-            config_matches = []
-        for config_path in config_matches:
-            add_candidate(config_path.parent)
-        return discovered
-
-    def find_training_metadata_for_model_dir(self, model_dir: Path) -> dict:
-        current = model_dir
-        for _ in range(6):
-            metadata_path = current / "last_training_mlflow.json"
-            if metadata_path.exists():
-                payload = read_json(str(metadata_path)) or {}
-                if payload:
-                    payload["_metadata_path"] = str(metadata_path)
-                    return payload
-            if current.parent == current:
-                break
-            current = current.parent
-        return {}
-
-    def build_model_inventory_label(self, source_label: str, model_dir: Path, metadata: dict) -> str:
-        created_at = clean_optional_string(metadata.get("created_at"))
-        created_label = created_at.replace("T", " ")[:19] if created_at else "no timestamp"
-        version_id = clean_optional_string(metadata.get("model_version_id"))
-        run_id = clean_optional_string(metadata.get("run_id"))
-        accuracy = ""
-        test_metrics = metadata.get("test_metrics")
-        if isinstance(test_metrics, dict) and test_metrics.get("accuracy") is not None:
-            try:
-                accuracy = f"acc {float(test_metrics['accuracy']):.4f}"
-            except Exception:
-                accuracy = f"acc {test_metrics['accuracy']}"
-
-        parts = [source_label, created_label]
-        if version_id:
-            parts.append(f"ver {version_id[:18]}")
-        elif run_id:
-            parts.append(f"run {run_id[:8]}")
-        if accuracy:
-            parts.append(accuracy)
-        parent_name = model_dir.parent.name if model_dir.name == "final_model" else model_dir.name
-        if parent_name:
-            parts.append(parent_name)
-        return " | ".join(parts)
 
     def discover_available_hosted_models(self) -> list[dict]:
-        inventory: list[dict] = []
-        seen: set[str] = set()
-
-        def add_entry(candidate_path: Path, source_label: str) -> None:
-            try:
-                resolved_model_dir = Path(discover_model_dir(str(candidate_path))).resolve()
-            except Exception:
-                return
-            key = str(resolved_model_dir)
-            if key in seen:
-                return
-            seen.add(key)
-            metadata = self.find_training_metadata_for_model_dir(resolved_model_dir)
-            created_at = clean_optional_string(metadata.get("created_at"))
-            version_id = clean_optional_string(metadata.get("model_version_id"))
-            run_id = clean_optional_string(metadata.get("run_id"))
-            entry = {
-                "path": str(resolved_model_dir),
-                "source": source_label,
-                "created_at": created_at,
-                "model_version_id": version_id,
-                "run_id": run_id,
-                "label": self.build_model_inventory_label(source_label, resolved_model_dir, metadata),
-            }
-            inventory.append(entry)
-
-        latest_local_model = Path(self.project_dir) / "outputs" / "final_model"
-        add_entry(latest_local_model, "Latest local")
-
-        archived_models_root = Path(self.project_dir) / "outputs" / "model_versions"
-        if archived_models_root.exists():
-            for version_dir in sorted(archived_models_root.iterdir(), reverse=True):
-                add_entry(version_dir / "final_model", "Archived")
-
-        project_download_root = Path(self.project_dir) / "downloaded_model"
-        if project_download_root.exists():
-            for model_dir in self.iter_model_dirs_under(project_download_root):
-                add_entry(model_dir, "Downloaded")
-
-        current_selection = clean_optional_string(self.hosted_model_path_var.get())
-        if current_selection:
-            add_entry(Path(current_selection), "Selected")
-
-        def sort_key(entry: dict):
-            created_at = clean_optional_string(entry.get("created_at"))
-            version_id = clean_optional_string(entry.get("model_version_id"))
-            return (created_at, version_id, clean_optional_string(entry.get("path")))
-
-        return sorted(inventory, key=sort_key, reverse=True)
+        return [asdict(entry) for entry in self.model_catalog_service.discover_available_hosted_models(self.hosted_model_path_var.get())]
 
     def refresh_hosted_model_inventory(self, preferred_path: str = ""):
         inventory = self.discover_available_hosted_models()
@@ -1102,1638 +1029,130 @@ class LogProcessorApp:
     def finish_hosting_action(self):
         with self.hosting_state_lock:
             self.hosting_active = False
-            processes = [self.hosting_process, self.prometheus_process, self.grafana_process]
+            processes = [
+                self.observability_service.hosting_process,
+                self.observability_service.prometheus_process,
+                self.observability_service.grafana_process,
+            ]
         self.host_service_btn.config(state="normal")
         local_running = any(process is not None and process.poll() is None for process in processes)
         self.stop_hosting_btn.config(state="normal" if local_running else "disabled")
 
-    def is_iis_available(self) -> bool:
-        if os.name != "nt":
-            return False
-        windir = os.environ.get("WINDIR", r"C:\Windows")
-        return Path(windir, "System32", "inetsrv", "appcmd.exe").exists()
 
-    def find_free_port(self) -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            sock.listen(1)
-            return int(sock.getsockname()[1])
 
-    def terminate_process(self, process, timeout_seconds: int = 5) -> None:
-        if process is None or process.poll() is not None:
-            return
-        try:
-            process.terminate()
-            process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
 
-    def read_process_output(self, process, limit: int = 4000) -> str:
-        if process is None or process.stdout is None or process.poll() is None:
-            return ""
-        try:
-            output = process.stdout.read() or ""
-        except Exception:
-            return ""
-        output = output.strip()
-        if len(output) > limit:
-            output = output[-limit:]
-        return output
 
-    def read_file_tail(self, path: str, limit: int = 6000) -> str:
-        target = Path(clean_optional_string(path))
-        if not target.exists() or not target.is_file():
-            return ""
-        try:
-            text = target.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return ""
-        text = text.strip()
-        if len(text) > limit:
-            text = text[-limit:]
-        return text
 
-    def shutdown_local_hosting_stack(self) -> None:
-        with self.hosting_state_lock:
-            processes = [
-                self.grafana_process,
-                self.prometheus_process,
-                self.hosting_process,
-            ]
-            self.grafana_process = None
-            self.prometheus_process = None
-            self.hosting_process = None
-        for process in processes:
-            self.terminate_process(process)
 
-    def find_local_executable(self, candidates: list[str]) -> str:
-        for candidate in candidates:
-            clean_candidate = clean_optional_string(candidate)
-            if not clean_candidate:
-                continue
-            resolved = shutil.which(clean_candidate)
-            if resolved:
-                return resolved
-            path_candidate = Path(clean_candidate).expanduser()
-            if path_candidate.is_file():
-                return str(path_candidate)
-        return ""
 
-    def get_local_observability_tools_root(self) -> Path:
-        return self.get_local_observability_root() / "tools" / self.get_local_observability_platform_name()
 
-    def get_local_observability_downloads_root(self) -> Path:
-        return self.get_local_observability_root() / "downloads" / self.get_local_observability_platform_name()
 
-    def get_local_observability_platform_name(self) -> str:
-        if sys.platform == "win32":
-            return "windows"
-        if sys.platform == "darwin":
-            return "macos"
-        return "linux"
 
-    def get_observability_binary_names(self, tool_name: str) -> list[str]:
-        if tool_name == "grafana-server":
-            if sys.platform == "win32":
-                return ["grafana-server.exe", "grafana.exe"]
-            return ["grafana-server", "grafana"]
-        if tool_name == "prometheus":
-            return ["prometheus.exe"] if sys.platform == "win32" else ["prometheus"]
-        default_name = tool_name + (".exe" if sys.platform == "win32" else "")
-        return [default_name]
 
-    def find_vendored_observability_binary(self, tool_name: str) -> str:
-        root = self.get_local_observability_tools_root()
-        if not root.exists():
-            return ""
 
-        binary_names = self.get_observability_binary_names(tool_name)
-        preferred_root = root / tool_name / "current"
-        search_roots = [preferred_root, root]
-        seen: set[str] = set()
-        for search_root in search_roots:
-            try:
-                resolved_root = search_root.resolve()
-            except Exception:
-                resolved_root = search_root
-            key = str(resolved_root)
-            if key in seen or not search_root.exists():
-                continue
-            seen.add(key)
-            for binary_name in binary_names:
-                try:
-                    matches = list(search_root.rglob(binary_name))
-                except Exception:
-                    matches = []
-                matches = [path for path in matches if path.is_file()]
-                if matches:
-                    return str(max(matches, key=lambda path: len(path.parts)))
-        return ""
 
-    def get_os_release_info(self) -> dict:
-        target = Path("/etc/os-release")
-        if not target.exists():
-            return {}
-        payload: dict[str, str] = {}
-        try:
-            for raw_line in target.read_text(encoding="utf-8").splitlines():
-                line = raw_line.strip()
-                if not line or "=" not in line or line.startswith("#"):
-                    continue
-                key, value = line.split("=", 1)
-                payload[key.strip().lower()] = value.strip().strip('"')
-        except Exception:
-            return {}
-        return payload
 
-    def can_auto_install_local_observability(self) -> bool:
-        if sys.platform == "win32":
-            machine = platform.machine().lower()
-            return machine in {"amd64", "x86_64", "arm64"}
-        if sys.platform == "darwin":
-            return bool(shutil.which("brew"))
-        if not sys.platform.startswith("linux"):
-            return False
-        if not shutil.which("apt-get") or not shutil.which("pkexec"):
-            return False
-        release_info = self.get_os_release_info()
-        distro_id = clean_optional_string(release_info.get("id", "")).lower()
-        distro_like = clean_optional_string(release_info.get("id_like", "")).lower()
-        supported_ids = {"ubuntu", "debian"}
-        if distro_id in supported_ids:
-            return True
-        return any(token in supported_ids for token in distro_like.split())
 
-    def get_missing_local_observability_tools(self) -> list[str]:
-        missing: list[str] = []
-        if not self.get_prometheus_binary():
-            missing.append("prometheus")
-        if not self.get_grafana_server_binary():
-            missing.append("grafana-server")
-        return missing
 
-    def get_local_observability_install_script(self) -> str:
-        script_path = Path(self.project_dir) / "scripts" / "install_local_observability.sh"
-        if not script_path.exists():
-            raise RuntimeError("The local observability install script is missing from this project.")
-        return str(script_path)
 
-    def install_local_observability_dependencies(self) -> None:
-        if sys.platform == "win32":
-            self.install_windows_local_observability_dependencies()
-            return
-        script_path = self.get_local_observability_install_script()
-        if sys.platform == "darwin":
-            if not self.can_auto_install_local_observability():
-                raise RuntimeError(
-                    "Automatic installation on macOS requires Homebrew (`brew`) to be installed and available on PATH."
-                )
-            process = subprocess.Popen(
-                ["/bin/bash", script_path],
-                cwd=self.project_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            output, _ = process.communicate()
-            clean_output = (output or "").strip()
-            if process.returncode != 0:
-                if not clean_output:
-                    clean_output = "Homebrew installation did not complete successfully."
-                raise RuntimeError(
-                    "Automatic installation of Grafana and Prometheus did not complete successfully.\n\n"
-                    f"{clean_output[-4000:]}"
-                )
 
-            missing = self.get_missing_local_observability_tools()
-            if missing:
-                raise RuntimeError(
-                    "The installation finished, but the required binaries are still missing: "
-                    + ", ".join(missing)
-                )
-            return
-        if not self.can_auto_install_local_observability():
-            raise RuntimeError(
-                "Automatic installation is only supported on macOS with Homebrew or Debian/Ubuntu-style Linux systems with `pkexec` and `apt-get` available."
-            )
 
-        process = subprocess.Popen(
-            ["pkexec", "/bin/bash", script_path],
-            cwd=self.project_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        output, _ = process.communicate()
-        clean_output = (output or "").strip()
-        if process.returncode != 0:
-            if not clean_output:
-                clean_output = "Installation was canceled or the system denied the authorization request."
-            raise RuntimeError(
-                "Automatic installation of Grafana and Prometheus did not complete successfully.\n\n"
-                f"{clean_output[-4000:]}"
-            )
 
-        missing = self.get_missing_local_observability_tools()
-        if missing:
-            raise RuntimeError(
-                "The installation finished, but the required binaries are still missing: "
-                + ", ".join(missing)
-            )
 
-    def get_prometheus_binary(self) -> str:
-        return self.find_local_executable(
-            [
-                os.environ.get("PROMETHEUS_BIN", ""),
-                self.find_vendored_observability_binary("prometheus"),
-                "prometheus",
-                "/opt/homebrew/bin/prometheus",
-                "/opt/homebrew/opt/prometheus/bin/prometheus",
-                "/usr/bin/prometheus",
-                "/usr/local/bin/prometheus",
-                "/usr/local/opt/prometheus/bin/prometheus",
-            ]
-        )
 
-    def get_grafana_server_binary(self) -> str:
-        return self.find_local_executable(
-            [
-                os.environ.get("GRAFANA_SERVER_BIN", ""),
-                self.find_vendored_observability_binary("grafana-server"),
-                "grafana-server",
-                "grafana",
-                "/opt/homebrew/bin/grafana-server",
-                "/opt/homebrew/bin/grafana",
-                "/usr/sbin/grafana-server",
-                "/usr/bin/grafana-server",
-                "/usr/share/grafana/bin/grafana-server",
-                "/opt/homebrew/opt/grafana/bin/grafana-server",
-                "/opt/homebrew/opt/grafana/bin/grafana",
-                "/usr/local/bin/grafana-server",
-                "/usr/local/bin/grafana",
-                "/usr/local/opt/grafana/bin/grafana-server",
-                "/usr/local/opt/grafana/bin/grafana",
-            ]
-        )
 
-    def get_homebrew_prefix(self, formula_name: str) -> str:
-        brew_binary = shutil.which("brew")
-        if not brew_binary:
-            return ""
-        try:
-            result = subprocess.run(
-                [brew_binary, "--prefix", formula_name],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        except Exception:
-            return ""
-        return clean_optional_string(result.stdout)
 
-    def fetch_text_url(self, url: str, timeout_seconds: int = 60) -> str:
-        response = requests.get(url, timeout=timeout_seconds)
-        response.raise_for_status()
-        return response.text
 
-    def download_url_to_file(self, url: str, destination_path: Path) -> None:
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        with requests.get(url, stream=True, timeout=(30, 300)) as response:
-            response.raise_for_status()
-            with open(destination_path, "wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
 
-    def clear_directory(self, target: Path) -> None:
-        if target.exists():
-            shutil.rmtree(target)
-        target.mkdir(parents=True, exist_ok=True)
 
-    def extract_zip_safely(self, archive_path: Path, destination_dir: Path) -> None:
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        base_dir = destination_dir.resolve()
-        with zipfile.ZipFile(archive_path) as archive:
-            for member in archive.infolist():
-                member_path = (destination_dir / member.filename).resolve()
-                if member.filename and member_path != base_dir and base_dir not in member_path.parents:
-                    raise RuntimeError(f"Unsafe ZIP archive entry: {member.filename}")
-            archive.extractall(destination_dir)
 
-    def extract_tar_safely(self, archive_path: Path, destination_dir: Path) -> None:
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        base_dir = destination_dir.resolve()
-        with tarfile.open(archive_path, "r:*") as archive:
-            for member in archive.getmembers():
-                member_path = (destination_dir / member.name).resolve()
-                if member.name and member_path != base_dir and base_dir not in member_path.parents:
-                    raise RuntimeError(f"Unsafe TAR archive entry: {member.name}")
-            archive.extractall(destination_dir)
 
-    def fetch_grafana_windows_download_url(self) -> str:
-        page_text = self.fetch_text_url("https://grafana.com/grafana/download?platform=windows")
-        match = re.search(r"https://dl\.grafana\.com/[^\s\"']+windows_amd64\.(?:zip|tar\.gz)", page_text)
-        if not match:
-            raise RuntimeError("Could not find the official Grafana Windows standalone download URL.")
-        return match.group(0)
 
-    def fetch_prometheus_windows_download_url(self) -> str:
-        page_text = self.fetch_text_url("https://prometheus.io/download/")
-        match = re.search(
-            r"https://github\.com/prometheus/prometheus/releases/download/[^\s\"']+/prometheus-[^\s\"']+windows-amd64\.zip",
-            page_text,
-        )
-        if not match:
-            raise RuntimeError("Could not find the official Prometheus Windows download URL.")
-        return match.group(0)
 
-    def download_and_extract_observability_package(self, url: str, tool_name: str) -> str:
-        downloads_root = self.get_local_observability_downloads_root()
-        tools_root = self.get_local_observability_tools_root()
-        archive_name = Path(urlparse(url).path).name or f"{tool_name}.archive"
-        archive_path = downloads_root / archive_name
-        extract_root = tools_root / tool_name
-        current_root = extract_root / "current"
 
-        self.download_url_to_file(url, archive_path)
-        self.clear_directory(current_root)
-        if archive_name.endswith(".zip"):
-            self.extract_zip_safely(archive_path, current_root)
-        elif archive_name.endswith(".tar.gz") or archive_name.endswith(".tgz"):
-            self.extract_tar_safely(archive_path, current_root)
-        else:
-            raise RuntimeError(f"Unsupported archive format for {tool_name}: {archive_name}")
 
-        binary_path = self.find_vendored_observability_binary(tool_name)
-        if not binary_path:
-            expected_names = ", ".join(self.get_observability_binary_names(tool_name))
-            raise RuntimeError(
-                f"The {tool_name} archive was extracted, but the expected binary was not found.\n\n"
-                f"Looked for: {expected_names}"
-            )
-        return binary_path
 
-    def install_windows_local_observability_dependencies(self) -> None:
-        if not self.can_auto_install_local_observability():
-            raise RuntimeError(
-                "Automatic Windows installation is only supported on 64-bit Windows environments."
-            )
 
-        grafana_url = self.fetch_grafana_windows_download_url()
-        prometheus_url = self.fetch_prometheus_windows_download_url()
 
-        self.root.after(0, lambda: self.status_var.set("Downloading Prometheus for Windows..."))
-        self.download_and_extract_observability_package(prometheus_url, "prometheus")
-        self.root.after(0, lambda: self.status_var.set("Downloading Grafana for Windows..."))
-        self.download_and_extract_observability_package(grafana_url, "grafana-server")
 
-    def get_grafana_home(self, grafana_binary: str) -> str:
-        explicit_home = clean_optional_string(os.environ.get("GRAFANA_HOME", ""))
-        homebrew_prefix = self.get_homebrew_prefix("grafana")
-        candidates: list[Path] = []
-        if explicit_home:
-            candidates.append(Path(explicit_home).expanduser())
-        binary_path = Path(grafana_binary).expanduser()
-        candidates.extend(
-            [
-                binary_path.parent.parent,
-                binary_path.parent.parent / "share" / "grafana",
-                Path("/usr/share/grafana"),
-                Path("/usr/local/share/grafana"),
-                Path("/opt/homebrew/share/grafana"),
-                Path("/opt/homebrew/opt/grafana/share/grafana"),
-                Path("/usr/local/opt/grafana/share/grafana"),
-            ]
-        )
-        if homebrew_prefix:
-            candidates.append(Path(homebrew_prefix) / "share" / "grafana")
-        for candidate in candidates:
-            try:
-                resolved = candidate.resolve()
-            except Exception:
-                resolved = candidate
-            if (resolved / "conf" / "defaults.ini").exists() and (resolved / "public").exists():
-                return str(resolved)
-        return ""
 
-    def get_local_observability_root(self) -> Path:
-        return Path(self.project_dir) / "outputs" / "local_observability"
 
-    def yaml_quote(self, value: str) -> str:
-        return "'" + str(value).replace("'", "''") + "'"
 
-    def wait_for_http_endpoint(
-        self,
-        url: str,
-        timeout_seconds: int = 60,
-        ready_statuses: tuple[int, ...] = (200, 302, 401, 403),
-    ) -> bool:
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            try:
-                response = requests.get(url, timeout=2, allow_redirects=False)
-                if response.status_code in ready_statuses:
-                    return True
-            except Exception:
-                pass
-            time.sleep(1)
-        return False
 
-    def wait_for_process_http_endpoint(
-        self,
-        process,
-        url: str,
-        timeout_seconds: int = 60,
-        ready_statuses: tuple[int, ...] = (200, 302, 401, 403),
-    ) -> bool:
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            if process is not None and process.poll() is not None:
-                return False
-            try:
-                response = requests.get(url, timeout=2, allow_redirects=False)
-                if response.status_code in ready_statuses:
-                    return True
-            except Exception:
-                pass
-            time.sleep(1)
-        return False
 
-    def wait_for_process_http_endpoints(
-        self,
-        process,
-        urls: list[str],
-        timeout_seconds: int = 60,
-        ready_statuses: tuple[int, ...] = (200, 302, 401, 403),
-    ) -> bool:
-        deadline = time.time() + timeout_seconds
-        candidate_urls = [clean_optional_string(url) for url in urls if clean_optional_string(url)]
-        while time.time() < deadline:
-            if process is not None and process.poll() is not None:
-                return False
-            for url in candidate_urls:
-                try:
-                    response = requests.get(url, timeout=2, allow_redirects=False)
-                    if response.status_code in ready_statuses:
-                        return True
-                except Exception:
-                    pass
-            time.sleep(1)
-        return False
 
-    def resolve_dashboard_tracking_console(self, launch_live_console: bool = True) -> tuple[str, str]:
-        training_meta = self.find_latest_training_mlflow_metadata() or {}
-        backend = self.mlflow_backend_var.get().strip() or "local"
-        tracking_uri = clean_optional_string(training_meta.get("tracking_uri")) or clean_optional_string(self.mlflow_tracking_uri_var.get())
 
-        if backend == "local":
-            if mlflow is None:
-                return "", "The local MLflow UI is unavailable because the `mlflow` package is not installed in this Python environment."
-            if launch_live_console:
-                try:
-                    return self.start_local_mlflow_ui(self.local_mlflow_tracking_uri), ""
-                except Exception as exc:
-                    return "", str(exc)
-            return "http://127.0.0.1:5001", ""
 
-        if backend == "custom_uri":
-            if tracking_uri.startswith("http://") or tracking_uri.startswith("https://"):
-                return tracking_uri, ""
-            return "", "The custom tracking URI is not an HTTP URL, so it cannot be opened in the browser."
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def get_azure_batch_timezone_options(self) -> list[str]:
+        return self.azure_platform_service.get_azure_batch_timezone_options()
+
+    def build_azure_studio_url(self, sub_id: str, tenant_id: str = "") -> str:
+        return self.azure_platform_service.build_azure_studio_url(sub_id, tenant_id)
+
+    def refresh_azure_dashboard_links(self):
         sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
         tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
-        studio_url = self.build_azure_studio_url(sub_id, tenant_id)
-        if studio_url:
-            return studio_url, ""
-        return "", "Azure dashboard URL is unavailable because the Azure subscription ID is empty."
+        mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(sub_id, tenant_id)
+        self.azure_mlops_url_var.set(mlops_url)
+        self.azure_llmops_url_var.set(llmops_url)
 
-    def build_local_grafana_dashboard_json(
-        self,
-        hosting_meta: dict,
-        training_meta: dict,
-        tracking_console_url: str = "",
-        tracking_console_note: str = "",
-    ) -> str:
-        datasource = {"type": "prometheus", "uid": "local-prometheus"}
-        api_url = clean_optional_string(hosting_meta.get("api_url"))
-        api_home_url = api_url[:-8] if api_url.endswith("/predict") else api_url
-        health_url = clean_optional_string(hosting_meta.get("health_url"))
-        metrics_url = clean_optional_string(hosting_meta.get("metrics_url"))
-        prometheus_url = clean_optional_string(hosting_meta.get("prometheus_url"))
-        grafana_url = clean_optional_string(hosting_meta.get("grafana_url"))
-        model_version_id = clean_optional_string(hosting_meta.get("model_version_id")) or clean_optional_string(
-            training_meta.get("model_version_id")
-        )
-        run_id = clean_optional_string(training_meta.get("run_id"))
-        experiment_name = clean_optional_string(training_meta.get("experiment_name")) or clean_optional_string(
-            self.mlflow_experiment_var.get()
-        )
-        backend = self.mlflow_backend_var.get().strip() or "local"
-        sample_request = json.dumps({"errorMessage": "timeout while opening socket"}, indent=2)
-
-        details_lines = [
-            "# Log Monitor Local Hosting",
-            "",
-            f"- Prediction endpoint: [{api_url}]({api_url})" if api_url else "- Prediction endpoint: not available",
-            f"- API home: [{api_home_url}]({api_home_url})" if api_home_url else "- API home: not available",
-            f"- Health check: [{health_url}]({health_url})" if health_url else "- Health check: not available",
-            f"- Metrics: [{metrics_url}]({metrics_url})" if metrics_url else "- Metrics: not available",
-            f"- Prometheus: [{prometheus_url}]({prometheus_url})" if prometheus_url else "- Prometheus: not available",
-            f"- Grafana: [{grafana_url}]({grafana_url})" if grafana_url else "- Grafana: not available",
-            f"- Model version: `{model_version_id or 'Not available'}`",
-            f"- Training run: `{run_id or 'Not available'}`",
-            f"- Experiment: `{experiment_name or 'Not available'}`",
-            f"- Tracking backend: `{backend}`",
-        ]
-        if tracking_console_url:
-            details_lines.append(f"- Tracking console: [{tracking_console_url}]({tracking_console_url})")
-        elif tracking_console_note:
-            details_lines.append(f"- Tracking console: {tracking_console_note}")
-        details_lines.extend(
-            [
-                "",
-                "## Request Example",
-                "",
-                "```json",
-                sample_request,
-                "```",
-            ]
-        )
-        details_markdown = "\n".join(details_lines)
-
-        panels = [
-            {
-                "id": 1,
-                "type": "stat",
-                "title": "Prediction Requests",
-                "datasource": datasource,
-                "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
-                "targets": [{"expr": "sum(log_monitor_predictions_total)", "instant": True, "refId": "A"}],
-                "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-                "options": {
-                    "reduceOptions": {"values": False, "calcs": ["lastNotNull"], "fields": ""},
-                    "orientation": "auto",
-                    "textMode": "value_and_name",
-                    "colorMode": "value",
-                    "graphMode": "none",
-                    "justifyMode": "auto",
-                },
-            },
-            {
-                "id": 2,
-                "type": "stat",
-                "title": "Average Predict Latency",
-                "datasource": datasource,
-                "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
-                "targets": [
-                    {
-                        "expr": "1000 * sum(log_monitor_request_duration_seconds_sum{path=\"/predict\"}) / clamp_min(sum(log_monitor_request_duration_seconds_count{path=\"/predict\"}), 1)",
-                        "instant": True,
-                        "refId": "A",
-                    }
-                ],
-                "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
-                "options": {
-                    "reduceOptions": {"values": False, "calcs": ["lastNotNull"], "fields": ""},
-                    "orientation": "auto",
-                    "textMode": "value_and_name",
-                    "colorMode": "value",
-                    "graphMode": "none",
-                    "justifyMode": "auto",
-                },
-            },
-            {
-                "id": 3,
-                "type": "stat",
-                "title": "API Uptime",
-                "datasource": datasource,
-                "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
-                "targets": [{"expr": "log_monitor_process_uptime_seconds", "instant": True, "refId": "A"}],
-                "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
-                "options": {
-                    "reduceOptions": {"values": False, "calcs": ["lastNotNull"], "fields": ""},
-                    "orientation": "auto",
-                    "textMode": "value_and_name",
-                    "colorMode": "value",
-                    "graphMode": "none",
-                    "justifyMode": "auto",
-                },
-            },
-            {
-                "id": 4,
-                "type": "stat",
-                "title": "Model Loaded",
-                "datasource": datasource,
-                "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
-                "targets": [{"expr": "log_monitor_model_loaded", "instant": True, "refId": "A"}],
-                "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-                "options": {
-                    "reduceOptions": {"values": False, "calcs": ["lastNotNull"], "fields": ""},
-                    "orientation": "auto",
-                    "textMode": "value_and_name",
-                    "colorMode": "value",
-                    "graphMode": "none",
-                    "justifyMode": "auto",
-                },
-            },
-            {
-                "id": 5,
-                "type": "timeseries",
-                "title": "Request Rate By Path",
-                "datasource": datasource,
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
-                "targets": [
-                    {
-                        "expr": "sum by (path) (rate(log_monitor_http_requests_total{path!=\"/metrics\"}[5m]))",
-                        "legendFormat": "{{path}}",
-                        "refId": "A",
-                    }
-                ],
-                "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-                "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
-            },
-            {
-                "id": 6,
-                "type": "timeseries",
-                "title": "Response Codes",
-                "datasource": datasource,
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
-                "targets": [
-                    {
-                        "expr": "sum by (status) (rate(log_monitor_http_requests_total{path!=\"/metrics\"}[5m]))",
-                        "legendFormat": "HTTP {{status}}",
-                        "refId": "A",
-                    }
-                ],
-                "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-                "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
-            },
-            {
-                "id": 7,
-                "type": "table",
-                "title": "Prediction Totals By Label",
-                "datasource": datasource,
-                "gridPos": {"h": 8, "w": 10, "x": 0, "y": 12},
-                "targets": [
-                    {
-                        "expr": "sum by (prediction) (log_monitor_predictions_total)",
-                        "format": "table",
-                        "instant": True,
-                        "refId": "A",
-                    }
-                ],
-                "options": {"showHeader": True},
-                "fieldConfig": {"defaults": {}, "overrides": []},
-            },
-            {
-                "id": 8,
-                "type": "text",
-                "title": "Service Notes",
-                "gridPos": {"h": 8, "w": 14, "x": 10, "y": 12},
-                "options": {"mode": "markdown", "content": details_markdown},
-            },
-        ]
-
-        dashboard = {
-            "id": None,
-            "uid": "log-monitor-local",
-            "title": "Log Monitor Local Hosting",
-            "tags": ["log-monitor", "local", "grafana"],
-            "timezone": "browser",
-            "schemaVersion": 39,
-            "version": 1,
-            "refresh": "10s",
-            "time": {"from": "now-6h", "to": "now"},
-            "annotations": {"list": []},
-            "editable": False,
-            "fiscalYearStartMonth": 0,
-            "graphTooltip": 0,
-            "panels": panels,
-            "templating": {"list": []},
-        }
-        return json.dumps(dashboard, indent=2)
-
-    def write_local_observability_files(
-        self,
-        hosting_meta: dict,
-        training_meta: dict,
-        tracking_console_url: str = "",
-        tracking_console_note: str = "",
-    ) -> dict:
-        root = self.get_local_observability_root()
-        prometheus_root = root / "prometheus"
-        grafana_root = root / "grafana"
-        provisioning_root = grafana_root / "provisioning"
-        datasources_root = provisioning_root / "datasources"
-        dashboards_root = provisioning_root / "dashboards"
-        dashboard_files_root = grafana_root / "dashboards"
-        grafana_data_root = grafana_root / "data"
-        grafana_logs_root = grafana_root / "logs"
-        grafana_plugins_root = grafana_root / "plugins"
-        prometheus_data_root = prometheus_root / "data"
-
-        for path in [
-            prometheus_root,
-            prometheus_data_root,
-            datasources_root,
-            dashboards_root,
-            dashboard_files_root,
-            grafana_data_root,
-            grafana_logs_root,
-            grafana_plugins_root,
-        ]:
-            path.mkdir(parents=True, exist_ok=True)
-
-        metrics_url = clean_optional_string(hosting_meta.get("metrics_url"))
-        metrics_target = urlparse(metrics_url).netloc or "127.0.0.1:8000"
-        prometheus_url = clean_optional_string(hosting_meta.get("prometheus_url"))
-
-        prometheus_config_path = prometheus_root / "prometheus.yml"
-        prometheus_config_path.write_text(
-            (
-                "global:\n"
-                "  scrape_interval: 5s\n"
-                "  evaluation_interval: 5s\n\n"
-                "scrape_configs:\n"
-                "  - job_name: 'log-monitor-local-api'\n"
-                "    metrics_path: /metrics\n"
-                "    static_configs:\n"
-                f"      - targets: [{self.yaml_quote(metrics_target)}]\n"
-                "        labels:\n"
-                "          service: 'log-monitor-local-api'\n"
-            ),
-            encoding="utf-8",
-        )
-
-        datasource_path = datasources_root / "local-prometheus.yml"
-        datasource_path.write_text(
-            (
-                "apiVersion: 1\n"
-                "datasources:\n"
-                "  - name: Local Prometheus\n"
-                "    uid: local-prometheus\n"
-                "    type: prometheus\n"
-                "    access: proxy\n"
-                f"    url: {self.yaml_quote(prometheus_url)}\n"
-                "    isDefault: true\n"
-                "    editable: false\n"
-            ),
-            encoding="utf-8",
-        )
-
-        dashboard_provider_path = dashboards_root / "log-monitor-local.yml"
-        dashboard_provider_path.write_text(
-            (
-                "apiVersion: 1\n"
-                "providers:\n"
-                "  - name: Log Monitor Local\n"
-                "    orgId: 1\n"
-                "    type: file\n"
-                "    disableDeletion: false\n"
-                "    updateIntervalSeconds: 5\n"
-                "    allowUiUpdates: false\n"
-                "    options:\n"
-                f"      path: {self.yaml_quote(str(dashboard_files_root.resolve()))}\n"
-            ),
-            encoding="utf-8",
-        )
-
-        dashboard_path = dashboard_files_root / "log-monitor-local-hosting.json"
-        dashboard_path.write_text(
-            self.build_local_grafana_dashboard_json(
-                hosting_meta=hosting_meta,
-                training_meta=training_meta,
-                tracking_console_url=tracking_console_url,
-                tracking_console_note=tracking_console_note,
-            ),
-            encoding="utf-8",
-        )
-
-        return {
-            "root": str(root.resolve()),
-            "prometheus_config_path": str(prometheus_config_path.resolve()),
-            "prometheus_data_path": str(prometheus_data_root.resolve()),
-            "prometheus_launch_log_path": str((prometheus_root / "prometheus.log").resolve()),
-            "grafana_provisioning_path": str(provisioning_root.resolve()),
-            "grafana_dashboard_path": str(dashboard_path.resolve()),
-            "grafana_data_path": str(grafana_data_root.resolve()),
-            "grafana_logs_path": str(grafana_logs_root.resolve()),
-            "grafana_plugins_path": str(grafana_plugins_root.resolve()),
-            "grafana_launch_log_path": str((grafana_logs_root / "grafana-startup.log").resolve()),
-        }
-
-    def refresh_local_grafana_dashboard(self, launch_live_console: bool = True) -> None:
-        hosting_meta = self.read_last_hosting_metadata()
+    def open_local_dashboard_page(self, launch_live_console: bool = True) -> str:
+        hosting_meta = self.model_catalog_service.read_last_hosting_metadata()
         if clean_optional_string(hosting_meta.get("mode")) != "local":
-            return
-        training_meta = self.find_latest_training_mlflow_metadata() or {}
-        tracking_console_url, tracking_console_note = self.resolve_dashboard_tracking_console(
-            launch_live_console=launch_live_console
+            raise RuntimeError("Grafana dashboard URL is not available yet. Start local hosting first.")
+
+        hosted_model_path = clean_optional_string(hosting_meta.get("model_dir")) or clean_optional_string(self.hosted_model_path_var.get())
+        sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
+        tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
+        tracking_console_url, tracking_console_note = self.mlops_service.resolve_dashboard_tracking_console(
+            backend=self.mlflow_backend_var.get().strip() or "local",
+            tracking_uri=clean_optional_string(self.mlflow_tracking_uri_var.get()),
+            azure_studio_url=self.azure_platform_service.build_azure_studio_url(sub_id, tenant_id),
+            launch_live_console=launch_live_console,
+            hosted_model_path=hosted_model_path,
         )
-        self.write_local_observability_files(
+        training_meta = self.mlops_service.find_latest_training_mlflow_metadata(hosted_model_path) or {}
+        self.observability_service.write_local_observability_files(
             hosting_meta=hosting_meta,
             training_meta=training_meta,
             tracking_console_url=tracking_console_url,
             tracking_console_note=tracking_console_note,
         )
-
-    def start_local_prometheus(self, config_path: str, data_path: str, port: int, log_path: str = ""):
-        prometheus_binary = self.get_prometheus_binary()
-        if not prometheus_binary:
-            raise RuntimeError(
-                "Prometheus is required for local Grafana hosting, but the `prometheus` binary was not found.\n\n"
-                "Install Prometheus and ensure it is available on PATH, or set the `PROMETHEUS_BIN` environment variable."
-            )
-
-        log_handle = None
-        if log_path:
-            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(log_path).write_text("", encoding="utf-8")
-            log_handle = open(log_path, "a", encoding="utf-8")
-
-        process = subprocess.Popen(
-            [
-                prometheus_binary,
-                f"--config.file={config_path}",
-                f"--storage.tsdb.path={data_path}",
-                f"--web.listen-address=127.0.0.1:{port}",
-                "--web.enable-lifecycle",
-            ],
-            cwd=self.project_dir,
-            stdout=log_handle if log_handle is not None else subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=log_handle is None,
-            bufsize=1 if log_handle is None else -1,
+        dashboard_url = clean_optional_string(hosting_meta.get("dashboard_url")) or clean_optional_string(
+            hosting_meta.get("grafana_url")
         )
-        if log_handle is not None:
-            log_handle.close()
-        ready_url = f"http://127.0.0.1:{port}/-/ready"
-        if not self.wait_for_process_http_endpoint(process, ready_url, timeout_seconds=60, ready_statuses=(200,)):
-            output = self.read_file_tail(log_path) if log_path else self.read_process_output(process)
-            self.terminate_process(process)
-            if output:
-                raise RuntimeError(
-                    "Prometheus failed to start.\n\n"
-                    + (f"Startup log: {log_path}\n\n" if log_path else "")
-                    + output
-                )
-            raise TimeoutError(
-                "Timed out waiting for Prometheus to become ready."
-                + (f"\n\nStartup log: {log_path}" if log_path else "")
-            )
-        return process
-
-    def start_local_grafana(
-        self,
-        provisioning_path: str,
-        dashboard_path: str,
-        data_path: str,
-        logs_path: str,
-        plugins_path: str,
-        port: int,
-        log_path: str = "",
-    ):
-        grafana_binary = self.get_grafana_server_binary()
-        if not grafana_binary:
-            raise RuntimeError(
-                "Grafana is required for local hosting, but the `grafana-server` binary was not found.\n\n"
-                "Install Grafana and ensure it is available on PATH, or set the `GRAFANA_SERVER_BIN` environment variable."
-            )
-
-        grafana_home = self.get_grafana_home(grafana_binary)
-        if not grafana_home:
-            raise RuntimeError(
-                "The Grafana server binary was found, but the app could not determine Grafana's home directory.\n\n"
-                "Set the `GRAFANA_HOME` environment variable to the folder that contains Grafana's `conf` and `public` directories."
-            )
-
-        env = os.environ.copy()
-        env.update(
-            {
-                "GF_PATHS_DATA": data_path,
-                "GF_PATHS_LOGS": logs_path,
-                "GF_PATHS_PLUGINS": plugins_path,
-                "GF_PATHS_PROVISIONING": provisioning_path,
-                "GF_SERVER_HTTP_ADDR": "127.0.0.1",
-                "GF_SERVER_HTTP_PORT": str(port),
-                "GF_SERVER_ROOT_URL": f"http://127.0.0.1:{port}/",
-                "GF_LOG_MODE": "console file",
-                "GF_AUTH_ANONYMOUS_ENABLED": "true",
-                "GF_AUTH_ANONYMOUS_ORG_NAME": "Main Org.",
-                "GF_AUTH_ANONYMOUS_ORG_ROLE": "Viewer",
-                "GF_AUTH_BASIC_ENABLED": "false",
-                "GF_AUTH_DISABLE_LOGIN_FORM": "true",
-                "GF_USERS_ALLOW_SIGN_UP": "false",
-                "GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH": dashboard_path,
-            }
-        )
-
-        grafana_command = [grafana_binary]
-        if Path(grafana_binary).stem.lower() == "grafana":
-            grafana_command.append("server")
-        grafana_command.extend(["--homepath", grafana_home])
-
-        log_handle = None
-        if log_path:
-            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(log_path).write_text("", encoding="utf-8")
-            log_handle = open(log_path, "a", encoding="utf-8")
-
-        process = subprocess.Popen(
-            grafana_command,
-            cwd=grafana_home,
-            env=env,
-            stdout=log_handle if log_handle is not None else subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=log_handle is None,
-            bufsize=1 if log_handle is None else -1,
-        )
-        if log_handle is not None:
-            log_handle.close()
-        readiness_urls = [
-            f"http://127.0.0.1:{port}/api/health",
-            f"http://127.0.0.1:{port}/login",
-            f"http://127.0.0.1:{port}/",
-        ]
-        if not self.wait_for_process_http_endpoints(process, readiness_urls, timeout_seconds=300, ready_statuses=(200, 302, 401, 403)):
-            output = self.read_file_tail(log_path) if log_path else self.read_process_output(process)
-            self.terminate_process(process)
-            if output:
-                raise RuntimeError(
-                    "Grafana failed to start.\n\n"
-                    + (f"Startup log: {log_path}\n\n" if log_path else "")
-                    + output
-                )
-            raise TimeoutError(
-                "Timed out waiting for Grafana to become ready."
-                + (f"\n\nStartup log: {log_path}" if log_path else "")
-            )
-        return process
-
-    def sanitize_azure_name(self, raw_value: str, max_length: int = 32) -> str:
-        cleaned = re.sub(r"[^a-z0-9-]", "-", clean_optional_string(raw_value).lower())
-        cleaned = re.sub(r"-+", "-", cleaned).strip("-")
-        cleaned = cleaned[:max_length].strip("-")
-        return cleaned or "log-monitor"
-
-    def sanitize_azure_storage_name(self, raw_value: str, max_length: int = 24) -> str:
-        cleaned = re.sub(r"[^a-z0-9]", "", clean_optional_string(raw_value).lower())
-        cleaned = cleaned[:max_length]
-        if len(cleaned) < 3:
-            cleaned = (cleaned + "logmonitor")[:max_length]
-        return cleaned or "logmonitorstore"
-
-    def build_azure_workspace_id(self, sub_id: str) -> str:
-        return (
-            f"/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
-            f"/providers/Microsoft.MachineLearningServices/workspaces/{self.WORKSPACE_NAME}"
-        )
-
-    def build_azure_studio_workspace_id(self, sub_id: str) -> str:
-        return (
-            f"/subscriptions/{sub_id}/resourcegroups/{self.RESOURCE_GROUP}"
-            f"/workspaces/{self.WORKSPACE_NAME}"
-        )
-
-    def build_azure_studio_query(self, sub_id: str, tenant_id: str = "") -> str:
-        clean_sub_id = clean_optional_string(sub_id)
-        if not clean_sub_id:
-            return ""
-        studio_wsid = self.build_azure_studio_workspace_id(clean_sub_id)
-        query = f"wsid={url_quote(studio_wsid, safe='')}"
-        clean_tenant_id = clean_optional_string(tenant_id)
-        if clean_tenant_id:
-            query += f"&tid={url_quote(clean_tenant_id, safe='')}"
-        return query
-
-    def build_azure_studio_url(self, sub_id: str, tenant_id: str = "") -> str:
-        query = self.build_azure_studio_query(sub_id, tenant_id)
-        if not query:
-            return ""
-        return f"https://ml.azure.com/experiments?{query}"
-
-    def build_azure_dashboard_urls(self, sub_id: str, tenant_id: str = "") -> tuple[str, str]:
-        query = self.build_azure_studio_query(sub_id, tenant_id)
-        if not query:
-            return "", ""
-        mlops_url = f"https://ml.azure.com/experiments?{query}"
-        llmops_url = f"https://ml.azure.com/experiments?{query}"
-        return mlops_url, llmops_url
-
-    def dedupe_instance_candidates(self, candidates: list[str]) -> list[str]:
-        unique_candidates: list[str] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            clean_candidate = clean_optional_string(candidate)
-            if not clean_candidate or clean_candidate in seen:
-                continue
-            seen.add(clean_candidate)
-            unique_candidates.append(clean_candidate)
-        return unique_candidates
-
-    def prioritize_instance_candidates(self, candidates: list[str], preferred: str) -> list[str]:
-        ordered = self.dedupe_instance_candidates(candidates)
-        preferred_clean = clean_optional_string(preferred)
-        if preferred_clean and preferred_clean in ordered:
-            ordered.remove(preferred_clean)
-            ordered.insert(0, preferred_clean)
-        return ordered
-
-    def get_azure_training_instance_candidates(self, azure_compute: str) -> list[str]:
-        compute_mode = clean_optional_string(azure_compute).lower() or "cpu"
-        if compute_mode == "gpu":
-            candidates = [
-                "Standard_NC4as_T4_v3",
-                "Standard_NC6s_v3",
-            ]
-        else:
-            candidates = [
-                "Standard_D2as_v4",
-                "Standard_DS2_v2",
-                "Standard_DS1_v2",
-                "Standard_F2s_v2",
-                "Standard_E2s_v3",
-                "Standard_E4s_v3",
-            ]
-        return self.dedupe_instance_candidates(candidates)
-
-    def get_azure_host_instance_candidates(self, azure_compute: str) -> list[str]:
-        compute_mode = clean_optional_string(azure_compute).lower() or "cpu"
-        if compute_mode == "gpu":
-            candidates = [
-                "Standard_NC4as_T4_v3",
-                "Standard_NC6s_v3",
-            ]
-        else:
-            candidates = [
-                "Standard_D2as_v4",
-                "Standard_DS2_v2",
-                "Standard_DS1_v2",
-                "Standard_F2s_v2",
-                "Standard_E2s_v3",
-                "Standard_E4s_v3",
-                "Standard_DS3_v2",
-            ]
-        return self.dedupe_instance_candidates(candidates)
-
-    def get_azure_batch_timezone_options(self) -> list[str]:
-        return [
-            "UTC",
-            "Eastern Standard Time",
-            "Central Standard Time",
-            "Mountain Standard Time",
-            "Pacific Standard Time",
-        ]
-
-    def get_azure_batch_timezone_iana(self, timezone_name: str) -> str:
-        mapping = {
-            "UTC": "UTC",
-            "Eastern Standard Time": "America/New_York",
-            "Central Standard Time": "America/Chicago",
-            "Mountain Standard Time": "America/Denver",
-            "Pacific Standard Time": "America/Los_Angeles",
-        }
-        return mapping.get(clean_optional_string(timezone_name), "UTC")
-
-    def parse_daily_time(self, raw_value: str) -> tuple[int, int]:
-        clean_value = clean_optional_string(raw_value)
-        match = re.fullmatch(r"(\d{1,2}):(\d{2})", clean_value)
-        if not match:
-            raise ValueError("Enter the batch time as HH:MM using 24-hour time, for example 02:00 or 14:30.")
-        hour = int(match.group(1))
-        minute = int(match.group(2))
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError("Batch time must use hours 00-23 and minutes 00-59.")
-        return hour, minute
-
-    def is_cloud_accessible_batch_input(self, raw_value: str) -> bool:
-        clean_value = clean_optional_string(raw_value)
-        if not clean_value:
-            return False
-        if clean_value.startswith("/subscriptions/") or clean_value.startswith("azureml:"):
-            return True
-        return re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", clean_value) is not None
-
-    def is_azure_quota_error(self, exc: Exception) -> bool:
-        message = clean_optional_string(str(exc)).lower()
-        quota_signals = [
-            "not enough quota available",
-            "quota",
-            "additional needed",
-            "vmsize",
-        ]
-        return any(signal in message for signal in quota_signals)
-
-    def format_azure_hosting_error(self, exc: Exception, attempted_instance_types: list[str] | None = None) -> str:
-        message = clean_optional_string(str(exc))
-        if self.is_azure_quota_error(exc):
-            attempted_text = ", ".join(attempted_instance_types or [])
-            guidance = (
-                "Azure hosting failed because this subscription does not have enough quota in "
-                f"`eastus` for the VM sizes we tried.\n\n"
-            )
-            if attempted_text:
-                guidance += f"Tried instance types:\n- {attempted_text.replace(', ', chr(10) + '- ')}\n\n"
-            guidance += (
-                "What you can do next:\n"
-                "- Request a quota increase in Azure for one of those VM families.\n"
-                "- Use a different Azure subscription with available quota.\n"
-                "- Change the workspace region from `eastus` if you want to target a region with quota.\n"
-                "- Pick a smaller VM size in the hosting form and try again.\n"
-            )
-            return guidance
-        return message
-
-    def refresh_azure_dashboard_links(self):
-        sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
-        tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
-        mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id, tenant_id)
-        self.azure_mlops_url_var.set(mlops_url)
-        self.azure_llmops_url_var.set(llmops_url)
-
-    def normalize_arm_template_outputs(self, outputs) -> dict:
-        if outputs is None:
-            return {}
-        if hasattr(outputs, "items"):
-            raw_items = outputs.items()
-        else:
-            return {}
-        normalized: dict[str, str] = {}
-        for key, value in raw_items:
-            if isinstance(value, dict) and "value" in value:
-                normalized[key] = value.get("value")
-            else:
-                normalized[key] = value
-        return normalized
-
-    def get_azure_management_token(self, credential) -> str:
-        token = credential.get_token("https://management.azure.com/.default")
-        return clean_optional_string(getattr(token, "token", ""))
-
-    def azure_management_json_request(
-        self,
-        credential,
-        method: str,
-        url: str,
-        payload: dict | None = None,
-        expected_statuses: tuple[int, ...] = (200, 201, 202),
-    ) -> dict:
-        headers = {
-            "Authorization": f"Bearer {self.get_azure_management_token(credential)}",
-        }
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
-
-        response = requests.request(
-            method=method.upper(),
-            url=url,
-            headers=headers,
-            json=payload,
-            timeout=180,
-        )
-        body_text = response.text.strip()
-        if response.status_code not in expected_statuses:
-            detail = body_text
-            try:
-                parsed = response.json()
-                detail = json.dumps(parsed, indent=2, ensure_ascii=True)
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"Azure management request failed ({response.status_code} {response.reason}).\n\n{detail[:4000]}"
-            )
-
-        if not body_text:
-            return {}
-        try:
-            return response.json()
-        except Exception:
-            try:
-                parsed, _ = json.JSONDecoder().raw_decode(body_text)
-                return parsed
-            except Exception:
-                return {"raw_body": body_text}
-
-    def load_azure_function_bridge_template(self) -> dict:
-        template_path = Path(self.project_dir) / "azure_function_bridge_infra.json"
-        template = read_json(str(template_path))
-        if not isinstance(template, dict):
-            raise RuntimeError("Could not load the Azure Function bridge ARM template.")
-        return template
-
-    def wait_for_resource_group_deployment(
-        self,
-        credential,
-        sub_id: str,
-        deployment_name: str,
-        timeout_seconds: int = 1800,
-    ) -> dict:
-        url = (
-            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
-            f"/providers/Microsoft.Resources/deployments/{deployment_name}"
-            "?api-version=2025-04-01"
-        )
-        deadline = time.time() + timeout_seconds
-        last_state = ""
-        while time.time() < deadline:
-            payload = self.azure_management_json_request(
-                credential,
-                "GET",
-                url,
-                expected_statuses=(200,),
-            )
-            properties = payload.get("properties") if isinstance(payload.get("properties"), dict) else {}
-            provisioning_state = clean_optional_string(properties.get("provisioningState"))
-            if provisioning_state:
-                last_state = provisioning_state
-            if provisioning_state == "Succeeded":
-                return payload
-            if provisioning_state in {"Failed", "Canceled"}:
-                error_payload = properties.get("error")
-                detail = json.dumps(error_payload, indent=2, ensure_ascii=True) if error_payload else json.dumps(payload, indent=2, ensure_ascii=True)
-                raise RuntimeError(
-                    f"Azure infrastructure deployment {provisioning_state.lower()}.\n\n{detail[:4000]}"
-                )
-            time.sleep(10)
-        raise TimeoutError(
-            "Timed out waiting for the Azure infrastructure deployment to finish."
-            + (f" Last known state: {last_state}." if last_state else "")
-        )
-
-    def deploy_azure_function_bridge_infrastructure(
-        self,
-        credential,
-        sub_id: str,
-        function_app_name: str,
-        function_plan_name: str,
-        storage_account_name: str,
-        service_bus_namespace_name: str,
-        service_bus_queue_name: str,
-    ) -> dict:
-        deployment_name = self.sanitize_azure_name(f"log-monitor-bridge-{function_app_name}", max_length=50)
-        workspace_resource_id = self.build_azure_workspace_id(sub_id)
-        template = self.load_azure_function_bridge_template()
-        parameters = {
-            "location": {"value": "eastus"},
-            "workspaceResourceId": {"value": workspace_resource_id},
-            "functionPlanName": {"value": function_plan_name},
-            "functionAppName": {"value": function_app_name},
-            "storageAccountName": {"value": storage_account_name},
-            "serviceBusNamespaceName": {"value": service_bus_namespace_name},
-            "serviceBusQueueName": {"value": service_bus_queue_name},
-        }
-        deployment_properties = {
-            "mode": "Incremental",
-            "template": template,
-            "parameters": parameters,
-        }
-        url = (
-            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
-            f"/providers/Microsoft.Resources/deployments/{deployment_name}"
-            "?api-version=2025-04-01"
-        )
-        self.azure_management_json_request(
-            credential,
-            "PUT",
-            url,
-            payload={"properties": deployment_properties},
-            expected_statuses=(200, 201, 202),
-        )
-        deployment = self.wait_for_resource_group_deployment(
-            credential=credential,
-            sub_id=sub_id,
-            deployment_name=deployment_name,
-        )
-        properties = deployment.get("properties") if isinstance(deployment.get("properties"), dict) else {}
-        outputs = properties.get("outputs")
-        normalized = self.normalize_arm_template_outputs(outputs)
-        if not normalized:
-            raise RuntimeError("Azure infrastructure deployment completed but did not return the expected outputs.")
-        return normalized
-
-    def build_function_bridge_package(self, package_name: str) -> str:
-        bridge_root = Path(self.project_dir) / "azure_function_bridge"
-        if not bridge_root.exists():
-            raise RuntimeError("The Azure Function bridge files are missing from this project.")
-        package_path = Path(tempfile.gettempdir()) / f"{package_name}.zip"
-        if package_path.exists():
-            package_path.unlink()
-        with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for file_path in bridge_root.rglob("*"):
-                if not file_path.is_file() or "__pycache__" in file_path.parts:
-                    continue
-                archive.write(file_path, arcname=str(file_path.relative_to(bridge_root)))
-        return str(package_path)
-
-    def upload_function_bridge_package(
-        self,
-        storage_connection_string: str,
-        storage_account_name: str,
-        storage_account_key: str,
-        package_path: str,
-        package_container_name: str = "functionpkgs",
-    ) -> str:
-        from azure.storage.blob import BlobSasPermissions, BlobServiceClient, generate_blob_sas
-
-        blob_service = BlobServiceClient.from_connection_string(storage_connection_string)
-        container_client = blob_service.get_container_client(package_container_name)
-        package_blob_name = f"releases/{Path(package_path).name}"
-        with open(package_path, "rb") as handle:
-            container_client.upload_blob(name=package_blob_name, data=handle, overwrite=True)
-
-        sas_token = generate_blob_sas(
-            account_name=storage_account_name,
-            container_name=package_container_name,
-            blob_name=package_blob_name,
-            account_key=storage_account_key,
-            permission=BlobSasPermissions(read=True),
-            expiry=datetime.now(timezone.utc) + timedelta(hours=24),
-        )
-        return (
-            f"https://{storage_account_name}.blob.core.windows.net/"
-            f"{package_container_name}/{package_blob_name}?{sas_token}"
-        )
-
-    def set_function_app_settings(
-        self,
-        credential,
-        sub_id: str,
-        function_app_name: str,
-        settings: dict,
-    ) -> None:
-        url = (
-            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
-            f"/providers/Microsoft.Web/sites/{function_app_name}/config/appsettings"
-            "?api-version=2025-03-01"
-        )
-        self.azure_management_json_request(
-            credential,
-            "PUT",
-            url,
-            payload={"properties": settings},
-            expected_statuses=(200,),
-        )
-
-    def trigger_function_app_onedeploy(
-        self,
-        credential,
-        sub_id: str,
-        function_app_name: str,
-        package_uri: str,
-    ) -> None:
-        url = (
-            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
-            f"/providers/Microsoft.Web/sites/{function_app_name}/extensions/onedeploy"
-            "?api-version=2025-03-01"
-        )
-        self.azure_management_json_request(
-            credential,
-            "PUT",
-            url,
-            payload={
-                "properties": {
-                    "packageUri": package_uri,
-                    "remoteBuild": True,
-                },
-                "type": "zip",
-            },
-            expected_statuses=(200, 202),
-        )
-
-    def wait_for_function_bridge_endpoint(
-        self,
-        credential,
-        sub_id: str,
-        function_app_name: str,
-        function_host_name: str,
-        function_name: str = "ingest_log",
-    ) -> tuple[str, str]:
-        host_keys_url = (
-            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
-            f"/providers/Microsoft.Web/sites/{function_app_name}/host/default/listkeys"
-            "?api-version=2025-03-01"
-        )
-        function_secrets_url = (
-            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.RESOURCE_GROUP}"
-            f"/providers/Microsoft.Web/sites/{function_app_name}/functions/{function_name}/listsecrets"
-            "?api-version=2025-05-01"
-        )
-        deadline = time.time() + 900
-        last_error = ""
-        while time.time() < deadline:
-            try:
-                payload = self.azure_management_json_request(
-                    credential,
-                    "POST",
-                    host_keys_url,
-                    payload={},
-                    expected_statuses=(200,),
-                )
-                function_keys = payload.get("functionKeys") if isinstance(payload.get("functionKeys"), dict) else {}
-                function_key = clean_optional_string(function_keys.get("default"))
-                if not function_key and function_keys:
-                    function_key = clean_optional_string(next(iter(function_keys.values()), ""))
-                if function_key:
-                    return f"https://{function_host_name}/api/logs?code={function_key}", function_key
-            except Exception as exc:
-                last_error = str(exc)
-
-            try:
-                payload = self.azure_management_json_request(
-                    credential,
-                    "POST",
-                    function_secrets_url,
-                    payload={},
-                    expected_statuses=(200,),
-                )
-                trigger_url = clean_optional_string(payload.get("trigger_url"))
-                function_key = clean_optional_string(payload.get("key"))
-                if trigger_url:
-                    return trigger_url, function_key
-                if function_key:
-                    return f"https://{function_host_name}/api/logs?code={function_key}", function_key
-            except Exception as exc:
-                last_error = str(exc)
-            time.sleep(10)
-        raise RuntimeError(
-            "The Azure Function API was deployed, but the app could not retrieve the trigger URL in time.\n\n"
-            f"Last error:\n{last_error}"
-        )
-
-    def ensure_azure_blob_datastore(
-        self,
-        ml_client,
-        datastore_name: str,
-        storage_account_name: str,
-        container_name: str,
-        storage_account_key: str,
-    ):
-        datastore = AzureBlobDatastore(
-            name=datastore_name,
-            account_name=storage_account_name,
-            container_name=container_name,
-            credentials=AccountKeyConfiguration(account_key=storage_account_key),
-            description="Queued log batches for Azure ML inference.",
-        )
-        return ml_client.datastores.create_or_update(datastore)
-
-    def deploy_azure_batch_endpoint(
-        self,
-        ml_client,
-        model_dir: str,
-        azure_compute: str,
-        preferred_instance_type: str,
-        endpoint_name: str,
-        environment_name: str,
-        model_name: str,
-        endpoint_auth_mode: str = "aad_token",
-    ) -> dict:
-        attempted_instance_types: list[str] = []
-        deployment_name = "default"
-        compute_name = "log-monitor-batch-gpu" if clean_optional_string(azure_compute).lower() == "gpu" else "log-monitor-batch-cpu"
-        instance_candidates = self.prioritize_instance_candidates(
-            self.get_azure_host_instance_candidates(azure_compute),
-            preferred_instance_type,
-        )
-        selected_instance_type = ""
-
-        self.root.after(0, lambda: self.status_var.set("Registering model in Azure ML..."))
-        model_asset = Model(
-            path=model_dir.replace("\\", "/"),
-            name=model_name,
-            type=AssetTypes.CUSTOM_MODEL,
-            description="Log Monitor generated DeBERTa model",
-        )
-        registered_model = ml_client.models.create_or_update(model_asset)
-
-        self.root.after(0, lambda: self.status_var.set("Creating Azure batch inference environment..."))
-        environment = Environment(
-            name=environment_name,
-            image="mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04:latest",
-            conda_file=os.path.join(self.project_dir, "azure_batch_inference_conda.yml"),
-            description="Batch inference environment for Log Monitor hosted API",
-        )
-        environment = ml_client.environments.create_or_update(environment)
-
-        last_deployment_error = None
-        for instance_type in instance_candidates:
-            attempted_instance_types.append(instance_type)
-            self.root.after(
-                0,
-                lambda size=instance_type: self.status_var.set(f"Ensuring Azure batch compute ({size})..."),
-            )
-            try:
-                compute = AmlCompute(
-                    name=compute_name,
-                    type="amlcompute",
-                    size=instance_type,
-                    min_instances=0,
-                    max_instances=1,
-                    idle_time_before_scale_down=120,
-                )
-                ml_client.compute.begin_create_or_update(compute).result()
-                selected_instance_type = instance_type
-                break
-            except Exception as exc:
-                last_deployment_error = exc
-                if self.is_azure_quota_error(exc) and instance_type != instance_candidates[-1]:
-                    print(
-                        f"[AZURE-HOST] Instance type {instance_type} is unavailable due to quota. "
-                        "Trying the next fallback size."
-                    )
-                    continue
-                raise
-
-        if not selected_instance_type:
-            if last_deployment_error is not None:
-                raise last_deployment_error
-            raise RuntimeError("Azure hosting could not provision any batch compute for scoring.")
-
-        self.root.after(0, lambda: self.status_var.set("Creating Azure batch endpoint..."))
-        endpoint = BatchEndpoint(
-            name=endpoint_name,
-            auth_mode=endpoint_auth_mode,
-            description="Asynchronous batch prediction endpoint for Log Monitor",
-        )
-        ml_client.batch_endpoints.begin_create_or_update(endpoint).result()
-
-        self.root.after(0, lambda: self.status_var.set("Creating Azure batch deployment..."))
-        deployment = ModelBatchDeployment(
-            name=deployment_name,
-            endpoint_name=endpoint_name,
-            model=registered_model,
-            environment=environment,
-            compute=compute_name,
-            code_configuration=CodeConfiguration(
-                code=self.project_dir,
-                scoring_script="azure_batch_score.py",
-            ),
-            settings=ModelBatchDeploymentSettings(
-                mini_batch_size=1,
-                instance_count=1,
-            ),
-        )
-        ml_client.batch_deployments.begin_create_or_update(deployment).result()
-
-        endpoint = ml_client.batch_endpoints.get(endpoint_name)
-        try:
-            endpoint.default_deployment_name = deployment_name
-        except Exception:
-            pass
-        try:
-            if getattr(endpoint, "defaults", None) is not None:
-                endpoint.defaults.deployment_name = deployment_name
-        except Exception:
-            pass
-        ml_client.batch_endpoints.begin_create_or_update(endpoint).result()
-        endpoint_details = ml_client.batch_endpoints.get(endpoint_name)
-        scoring_uri = clean_optional_string(getattr(endpoint_details, "scoring_uri", ""))
-        if not scoring_uri:
-            raise RuntimeError("Azure deployment completed but no scoring URI was returned.")
-
-        return {
-            "endpoint_name": endpoint_name,
-            "deployment_name": deployment_name,
-            "instance_type": selected_instance_type,
-            "compute_name": compute_name,
-            "api_url": scoring_uri,
-            "attempted_instance_types": attempted_instance_types,
-        }
-
-    def start_local_mlflow_ui(self, tracking_uri: str = "") -> str:
-        if mlflow is None:
-            raise RuntimeError("The `mlflow` package is not available in this Python environment.")
-        backend_store_uri = clean_optional_string(tracking_uri) or self.local_mlflow_tracking_uri
-        if backend_store_uri.startswith("file://"):
-            backend_store_uri = backend_store_uri[7:]
-        if self.mlflow_ui_process is None or self.mlflow_ui_process.poll() is not None:
-            self.mlflow_ui_process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "mlflow",
-                    "ui",
-                    "--backend-store-uri",
-                    backend_store_uri,
-                    "--port",
-                    "5001",
-                ],
-                cwd=self.project_dir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(0.5)
-            if self.mlflow_ui_process.poll() is not None:
-                raise RuntimeError("Failed to start the local MLflow UI process.")
-        return "http://127.0.0.1:5001"
+        if not dashboard_url:
+            raise RuntimeError("Grafana dashboard URL is not available yet. Start local hosting first.")
+        self.mlops_service.open_dashboard_url(dashboard_url)
+        return dashboard_url
 
     def open_hosting_dashboard_on_success(self, hosting_mode: str, mlops_url: str = "") -> bool:
         try:
@@ -2765,614 +1184,14 @@ class LogProcessorApp:
             )
         return False
 
-    def save_last_hosting_metadata(self, payload: dict) -> str:
-        target = Path(self.project_dir) / "outputs" / "last_hosting.json"
-        write_json(str(target), payload)
-        return str(target)
 
-    def read_last_hosting_metadata(self) -> dict:
-        target = Path(self.project_dir) / "outputs" / "last_hosting.json"
-        if not target.exists():
-            return {}
-        return read_json(str(target)) or {}
 
-    def get_training_metadata_search_roots(self) -> list[Path]:
-        roots: list[Path] = []
-        seen: set[str] = set()
 
-        def add_root(path: Path | None) -> None:
-            if path is None:
-                return
-            try:
-                resolved = path.expanduser().resolve()
-            except Exception:
-                return
-            key = str(resolved)
-            if key in seen or not resolved.exists():
-                return
-            seen.add(key)
-            roots.append(resolved)
 
-        add_root(Path(self.project_dir) / "outputs")
-        add_root(Path(self.project_dir) / "downloaded_model")
 
-        hosted_model_value = clean_optional_string(self.hosted_model_path_var.get())
-        if hosted_model_value:
-            try:
-                hosted_model_dir = Path(discover_model_dir(hosted_model_value))
-            except Exception:
-                hosted_model_dir = Path(hosted_model_value).expanduser()
 
-            current = hosted_model_dir
-            for _ in range(5):
-                add_root(current)
-                if current.parent == current:
-                    break
-                current = current.parent
 
-        return roots
 
-    def describe_training_metadata_search_roots(self) -> list[str]:
-        return [str(path) for path in self.get_training_metadata_search_roots()]
-
-    def _dashboard_value_html(self, value) -> str:
-        text = clean_optional_string(value)
-        return html.escape(text) if text else "<span class='muted'>Not available</span>"
-
-    def _dashboard_link_html(self, url: str, label: str | None = None) -> str:
-        clean_url = clean_optional_string(url)
-        if not clean_url:
-            return "<span class='muted'>Not available</span>"
-        link_label = clean_optional_string(label) or clean_url
-        return (
-            f"<a href=\"{html.escape(clean_url, quote=True)}\" target=\"_blank\" rel=\"noreferrer\">"
-            f"{html.escape(link_label)}</a>"
-        )
-
-    def build_local_dashboard_html(self, launch_live_console: bool = True) -> str:
-        hosting_meta = self.read_last_hosting_metadata()
-        training_meta = self.find_latest_training_mlflow_metadata() or {}
-
-        api_url = clean_optional_string(hosting_meta.get("api_url")) or clean_optional_string(self.hosting_api_url_var.get())
-        hosting_mode = clean_optional_string(hosting_meta.get("mode")) or clean_optional_string(self.hosting_mode_var.get()) or "local"
-        is_azure_batch = hosting_mode == "azure_batch"
-        is_azure_queue_batch = hosting_mode == "azure_queue_batch"
-        is_azure_online = hosting_mode == "azure"
-        health_url = clean_optional_string(hosting_meta.get("health_url"))
-        api_browser_url = ""
-        if not (is_azure_batch or is_azure_queue_batch):
-            api_browser_url = api_url[:-8] if api_url.endswith("/predict") else api_url
-
-        backend = self.mlflow_backend_var.get().strip() or "local"
-        tracking_uri = clean_optional_string(training_meta.get("tracking_uri")) or clean_optional_string(self.mlflow_tracking_uri_var.get())
-        experiment_name = clean_optional_string(training_meta.get("experiment_name")) or clean_optional_string(self.mlflow_experiment_var.get())
-        run_id = clean_optional_string(training_meta.get("run_id"))
-        model_uri = clean_optional_string(training_meta.get("model_uri"))
-        created_at = clean_optional_string(training_meta.get("created_at")) or clean_optional_string(hosting_meta.get("created_at"))
-        test_metrics = training_meta.get("test_metrics") if isinstance(training_meta.get("test_metrics"), dict) else {}
-        selection_summary = training_meta.get("selection_summary") if isinstance(training_meta.get("selection_summary"), dict) else {}
-        metadata_path = clean_optional_string(training_meta.get("_metadata_path"))
-        metadata_search_roots = self.describe_training_metadata_search_roots()
-        metadata_note = ""
-        if not training_meta:
-            metadata_note = (
-                "Training metadata was not found. The dashboard looked under: "
-                + ", ".join(metadata_search_roots)
-            )
-
-        console_url = ""
-        console_note = ""
-        if backend == "local":
-            if mlflow is None:
-                console_note = "The local MLflow UI is unavailable because the `mlflow` package is not installed in this Python environment."
-            else:
-                console_url = "http://127.0.0.1:5001"
-                if launch_live_console:
-                    try:
-                        console_url = self.start_local_mlflow_ui(self.local_mlflow_tracking_uri)
-                    except Exception as exc:
-                        console_url = ""
-                        console_note = str(exc)
-        elif backend == "custom_uri":
-            if tracking_uri.startswith("http://") or tracking_uri.startswith("https://"):
-                console_url = tracking_uri
-            else:
-                console_note = "The custom tracking URI is not an HTTP URL, so it cannot be opened in the browser."
-        else:
-            sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
-            tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
-            console_url = self.build_azure_studio_url(sub_id, tenant_id)
-            if not console_url:
-                console_note = "Azure dashboard URL is unavailable because the Azure subscription ID is empty."
-
-        metrics_html = ""
-        for key, label in [
-            ("accuracy", "Accuracy"),
-            ("weighted_precision", "Weighted Precision"),
-            ("weighted_recall", "Weighted Recall"),
-            ("weighted_f1", "Weighted F1"),
-            ("loss", "Loss"),
-        ]:
-            metric_value = test_metrics.get(key)
-            if metric_value is None:
-                rendered = "Not available"
-            else:
-                try:
-                    rendered = f"{float(metric_value):.4f}"
-                except Exception:
-                    rendered = str(metric_value)
-            metrics_html += (
-                "<div class='metric'>"
-                f"<span>{html.escape(label)}</span>"
-                f"<strong>{html.escape(rendered)}</strong>"
-                "</div>"
-            )
-
-        best_config = selection_summary.get("best_config") if isinstance(selection_summary.get("best_config"), dict) else {}
-        selection_html = ""
-        for key in ("train_mode", "epochs", "batch_size", "learning_rate", "weight_decay", "max_length"):
-            value = best_config.get(key)
-            if value not in (None, ""):
-                selection_html += (
-                    "<div class='kv'>"
-                    f"<span>{html.escape(key.replace('_', ' ').title())}</span>"
-                    f"<strong>{html.escape(str(value))}</strong>"
-                    "</div>"
-                )
-        if not selection_html:
-            selection_html = "<p class='muted'>No selected training configuration was recorded.</p>"
-
-        available_models = self.discover_available_hosted_models()
-        available_models_html = ""
-        for entry in available_models[:12]:
-            available_models_html += (
-                "<div class='kv'>"
-                f"<span>{html.escape(clean_optional_string(entry.get('label')) or 'Available model')}</span>"
-                f"<strong>{self._dashboard_value_html(entry.get('path'))}</strong>"
-                "</div>"
-            )
-        if not available_models_html:
-            available_models_html = "<p class='muted'>No versioned or downloaded models were discovered yet.</p>"
-
-        if is_azure_queue_batch:
-            payload_example = json.dumps(
-                {
-                    "timestamp": now_utc_iso(),
-                    "level": "ERROR",
-                    "source": "desktop-app",
-                    "message": "timeout while opening socket",
-                },
-                indent=2,
-            )
-            response_example = json.dumps(
-                {
-                    "accepted": True,
-                    "queued": True,
-                    "received_at": now_utc_iso(),
-                },
-                indent=2,
-            )
-            contract_title = "Queued Log API"
-            contract_note = (
-                "The public endpoint is an Azure Function that accepts one log at a time, stores it in Service Bus, "
-                "and then launches the Azure ML batch job once per day at the scheduled time."
-            )
-            endpoint_label = "Log Ingestion API"
-            invocation_style = "Queued HTTP API with daily background batch processing"
-            browser_row_html = ""
-            health_row_html = ""
-            extra_hosting_html = (
-                "<div class='kv'><span>Function App</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('function_app_name'))}</strong></div>"
-                "<div class='kv'><span>Service Bus Queue</span>"
-                f"<strong>{self._dashboard_value_html((clean_optional_string(hosting_meta.get('service_bus_namespace')) + '/' + clean_optional_string(hosting_meta.get('service_bus_queue'))).strip('/'))}</strong></div>"
-                "<div class='kv'><span>Batch Endpoint</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('endpoint_name'))}</strong></div>"
-                "<div class='kv'><span>Compute Cluster</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('compute_name'))}</strong></div>"
-                "<div class='kv'><span>VM Size</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('instance_type'))}</strong></div>"
-                "<div class='kv'><span>Daily Schedule</span>"
-                f"<strong>{self._dashboard_value_html((clean_optional_string(hosting_meta.get('schedule_time')) + ' ' + clean_optional_string(hosting_meta.get('schedule_time_zone'))).strip())}</strong></div>"
-                "<div class='kv'><span>Blob Datastore</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('datastore_name'))}</strong></div>"
-            )
-            api_action_url = api_url
-            api_action_label = "Open Log API URL"
-        elif is_azure_batch:
-            payload_example = """sample.csv
-LogMessage
-processed Canceled
-timeout while opening socket"""
-            response_example = """{"source_file":"sample.csv","row_index":0,"errorMessage":"processed Canceled","prediction":"Noise"}
-{"source_file":"sample.csv","row_index":1,"errorMessage":"timeout while opening socket","prediction":"Error"}"""
-            contract_title = "Batch Input And Output"
-            contract_note = (
-                "Azure batch endpoints are asynchronous. Submit files, folders, or Azure ML data assets to the "
-                "endpoint; prediction rows are written to Azure Storage when the job finishes."
-            )
-            endpoint_label = "Batch Endpoint"
-            invocation_style = "Asynchronous batch job"
-            browser_row_html = ""
-            health_row_html = ""
-            extra_hosting_html = (
-                "<div class='kv'><span>Compute Cluster</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('compute_name'))}</strong></div>"
-                "<div class='kv'><span>VM Size</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('instance_type'))}</strong></div>"
-                "<div class='kv'><span>Daily Schedule</span>"
-                f"<strong>{self._dashboard_value_html((clean_optional_string(hosting_meta.get('schedule_time')) + ' ' + clean_optional_string(hosting_meta.get('schedule_time_zone'))).strip())}</strong></div>"
-                "<div class='kv'><span>Batch Input URI</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('batch_input_uri'))}</strong></div>"
-                "<div class='kv'><span>Schedule Name</span>"
-                f"<strong>{self._dashboard_value_html(hosting_meta.get('schedule_name'))}</strong></div>"
-            )
-            api_action_url = api_url
-            api_action_label = "Open Endpoint URL"
-        else:
-            payload_example = json.dumps({"errorMessage": ""}, indent=2)
-            response_example = json.dumps({"prediction": ""}, indent=2)
-            contract_title = "Prediction Contract"
-            contract_note = ""
-            endpoint_label = "Prediction Endpoint"
-            invocation_style = "Synchronous HTTP API"
-            if is_azure_online:
-                browser_row_html = ""
-                health_row_html = ""
-                extra_hosting_html = (
-                    "<div class='kv'><span>VM Size</span>"
-                    f"<strong>{self._dashboard_value_html(hosting_meta.get('instance_type'))}</strong></div>"
-                    "<div class='kv'><span>Authentication</span>"
-                    f"<strong>{self._dashboard_value_html(hosting_meta.get('endpoint_auth_mode'))}</strong></div>"
-                )
-                api_action_label = "Open Endpoint URL"
-            else:
-                browser_row_html = (
-                    "<div class='kv'><span>Browser URL</span>"
-                    f"<strong>{self._dashboard_link_html(api_browser_url)}</strong></div>"
-                    if api_browser_url
-                    else ""
-                )
-                health_row_html = (
-                    "<div class='kv'><span>Health Check</span>"
-                    f"<strong>{self._dashboard_link_html(health_url)}</strong></div>"
-                    if health_url
-                    else ""
-                )
-                extra_hosting_html = (
-                    "<div class='kv'><span>VM Size</span>"
-                    f"<strong>{self._dashboard_value_html(hosting_meta.get('instance_type'))}</strong></div>"
-                )
-                api_action_label = "Open Local API Home"
-            api_action_url = api_browser_url
-        training_json = json.dumps(training_meta, indent=2, sort_keys=True)
-        hosting_json = json.dumps(hosting_meta, indent=2, sort_keys=True)
-        tracking_action = (
-            f"<a class='action' href='{html.escape(console_url, quote=True)}' target='_blank' rel='noreferrer'>Open Tracking Console</a>"
-            if console_url else ""
-        )
-        api_action = (
-            f"<a class='action' href='{html.escape(api_action_url, quote=True)}' target='_blank' rel='noreferrer'>{html.escape(api_action_label)}</a>"
-            if api_action_url else ""
-        )
-        health_action = (
-            f"<a class='action' href='{html.escape(health_url, quote=True)}' target='_blank' rel='noreferrer'>Open Health Check</a>"
-            if health_url and not (is_azure_batch or is_azure_queue_batch) else ""
-        )
-        console_note_html = f"<p class='muted' style='margin-top:16px'>{html.escape(console_note)}</p>" if console_note else ""
-        metadata_note_html = f"<p class='muted' style='margin-top:12px'>{html.escape(metadata_note)}</p>" if metadata_note else ""
-        contract_note_html = f"<p class='muted' style='margin-top:12px'>{html.escape(contract_note)}</p>" if contract_note else ""
-
-        return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Log Monitor Dashboard</title>
-  <style>
-    :root {{
-      --bg: #f4efe7;
-      --panel: #fffaf3;
-      --ink: #1f2328;
-      --muted: #6b7280;
-      --line: #dfd4c4;
-      --accent: #0f766e;
-      --accent-2: #a16207;
-      --shadow: 0 20px 45px rgba(69, 52, 30, 0.08);
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: Georgia, "Times New Roman", serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15, 118, 110, 0.14), transparent 32%),
-        radial-gradient(circle at top right, rgba(161, 98, 7, 0.16), transparent 28%),
-        linear-gradient(180deg, #f7f2eb 0%, var(--bg) 100%);
-    }}
-    main {{
-      max-width: 1080px;
-      margin: 0 auto;
-      padding: 32px 20px 56px;
-    }}
-    .hero {{
-      background: linear-gradient(135deg, rgba(255,255,255,0.92), rgba(255,250,243,0.88));
-      border: 1px solid rgba(223, 212, 196, 0.9);
-      border-radius: 24px;
-      padding: 28px;
-      box-shadow: var(--shadow);
-    }}
-    .eyebrow {{
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      font-size: 12px;
-      color: var(--accent);
-      margin: 0 0 10px;
-    }}
-    h1, h2, h3 {{
-      margin: 0;
-      font-weight: 600;
-    }}
-    h1 {{
-      font-size: clamp(32px, 5vw, 52px);
-      line-height: 1.02;
-      margin-bottom: 12px;
-    }}
-    p {{
-      margin: 0;
-      line-height: 1.6;
-    }}
-    .hero p {{
-      max-width: 740px;
-      color: #394150;
-      font-size: 18px;
-    }}
-    .stack {{
-      display: grid;
-      gap: 18px;
-      margin-top: 22px;
-    }}
-    .grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 18px;
-      margin-top: 22px;
-    }}
-    .panel {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      padding: 22px;
-      box-shadow: var(--shadow);
-    }}
-    .panel h2 {{
-      font-size: 24px;
-      margin-bottom: 14px;
-    }}
-    .panel h3 {{
-      font-size: 18px;
-      margin-bottom: 10px;
-      margin-top: 16px;
-    }}
-    .kv {{
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 10px 0;
-      border-bottom: 1px solid rgba(223, 212, 196, 0.8);
-    }}
-    .kv:last-child {{
-      border-bottom: 0;
-      padding-bottom: 0;
-    }}
-    .kv span {{
-      color: var(--muted);
-    }}
-    .metric-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 12px;
-      margin-top: 14px;
-    }}
-    .metric {{
-      border: 1px solid rgba(15, 118, 110, 0.18);
-      background: rgba(15, 118, 110, 0.05);
-      border-radius: 16px;
-      padding: 14px;
-      display: grid;
-      gap: 6px;
-    }}
-    .metric span {{
-      color: var(--muted);
-      font-size: 13px;
-    }}
-    .metric strong {{
-      font-size: 24px;
-      font-weight: 600;
-    }}
-    .actions {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-top: 18px;
-    }}
-    .action {{
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 11px 16px;
-      border-radius: 999px;
-      border: 1px solid rgba(15, 118, 110, 0.22);
-      background: white;
-      color: var(--ink);
-      text-decoration: none;
-      font-size: 14px;
-    }}
-    .action:hover {{
-      border-color: var(--accent);
-    }}
-    .muted {{
-      color: var(--muted);
-    }}
-    pre {{
-      margin: 12px 0 0;
-      padding: 14px;
-      border-radius: 16px;
-      background: #201c1a;
-      color: #f5efe6;
-      overflow-x: auto;
-      font-size: 13px;
-      line-height: 1.55;
-    }}
-    details {{
-      margin-top: 14px;
-    }}
-    summary {{
-      cursor: pointer;
-      color: var(--accent-2);
-      font-weight: 600;
-    }}
-    a {{
-      color: var(--accent);
-    }}
-  </style>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <p class="eyebrow">Log Monitor</p>
-      <h1>Local MLOps and LLMOps Dashboard</h1>
-      <p>This page summarizes the most recent hosted API, training run, and LLM data-preparation lineage available on this machine.</p>
-      <div class="actions">
-        {tracking_action}
-        {api_action}
-        {health_action}
-      </div>
-      {console_note_html}
-    </section>
-
-	    <div class="grid">
-	      <section class="panel">
-	        <h2>Hosted Service</h2>
-	        <div class="kv"><span>{html.escape(endpoint_label)}</span><strong>{self._dashboard_link_html(api_url)}</strong></div>
-	        {browser_row_html}
-	        {health_row_html}
-	        <div class="kv"><span>Hosting Mode</span><strong>{self._dashboard_value_html(hosting_mode)}</strong></div>
-	        <div class="kv"><span>Invocation Style</span><strong>{html.escape(invocation_style)}</strong></div>
-	        <div class="kv"><span>Hosted Model Version</span><strong>{self._dashboard_value_html(hosting_meta.get("model_version_id"))}</strong></div>
-	        {extra_hosting_html}
-	        <div class="kv"><span>Generated</span><strong>{self._dashboard_value_html(created_at)}</strong></div>
-	        <h3>{html.escape(contract_title)}</h3>
-	        {contract_note_html}
-	        <pre>{html.escape(payload_example)}</pre>
-	        <pre>{html.escape(response_example)}</pre>
-	      </section>
-
-      <section class="panel">
-        <h2>MLOps</h2>
-        <div class="kv"><span>Backend</span><strong>{self._dashboard_value_html(backend)}</strong></div>
-        <div class="kv"><span>Experiment</span><strong>{self._dashboard_value_html(experiment_name)}</strong></div>
-        <div class="kv"><span>Tracking URI</span><strong>{self._dashboard_value_html(tracking_uri)}</strong></div>
-        <div class="kv"><span>Run ID</span><strong>{self._dashboard_value_html(run_id)}</strong></div>
-        <div class="kv"><span>Model URI</span><strong>{self._dashboard_value_html(model_uri)}</strong></div>
-        <div class="kv"><span>Model Version ID</span><strong>{self._dashboard_value_html(training_meta.get("model_version_id"))}</strong></div>
-        <div class="kv"><span>Metadata File</span><strong>{self._dashboard_value_html(metadata_path)}</strong></div>
-        <div class="metric-grid">{metrics_html}</div>
-        {metadata_note_html}
-      </section>
-    </div>
-
-    <div class="grid">
-      <section class="panel">
-        <h2>Selected Training Config</h2>
-        {selection_html}
-      </section>
-
-      <section class="panel">
-        <h2>LLMOps</h2>
-        <div class="kv"><span>LLM Model</span><strong>{self._dashboard_value_html(training_meta.get("llm_model"))}</strong></div>
-        <div class="kv"><span>Prompt Hash</span><strong>{self._dashboard_value_html(training_meta.get("prompt_hash"))}</strong></div>
-        <div class="kv"><span>Pipeline ID</span><strong>{self._dashboard_value_html(training_meta.get("pipeline_id"))}</strong></div>
-        <div class="kv"><span>Parent Run ID</span><strong>{self._dashboard_value_html(training_meta.get("parent_run_id"))}</strong></div>
-        <div class="kv"><span>Data Prep Run ID</span><strong>{self._dashboard_value_html(training_meta.get("data_prep_run_id"))}</strong></div>
-        <div class="kv"><span>Data Prep Experiment</span><strong>{self._dashboard_value_html(training_meta.get("data_prep_experiment_name"))}</strong></div>
-        <div class="kv"><span>Data Version ID</span><strong>{self._dashboard_value_html(training_meta.get("data_version_id"))}</strong></div>
-      </section>
-    </div>
-
-    <div class="stack">
-      <section class="panel">
-        <h2>Available Models</h2>
-        {available_models_html}
-      </section>
-
-      <section class="panel">
-        <h2>Training Metadata</h2>
-        <details open>
-          <summary>Show JSON</summary>
-          <pre>{html.escape(training_json)}</pre>
-        </details>
-      </section>
-
-      <section class="panel">
-        <h2>Hosting Metadata</h2>
-        <details>
-          <summary>Show JSON</summary>
-          <pre>{html.escape(hosting_json)}</pre>
-        </details>
-      </section>
-    </div>
-  </main>
-</body>
-</html>
-"""
-
-    def open_local_dashboard_page(self, launch_live_console: bool = True) -> str:
-        self.refresh_local_grafana_dashboard(launch_live_console=launch_live_console)
-        hosting_meta = self.read_last_hosting_metadata()
-        dashboard_url = clean_optional_string(hosting_meta.get("dashboard_url")) or clean_optional_string(
-            hosting_meta.get("grafana_url")
-        )
-        if not dashboard_url:
-            raise RuntimeError("Grafana dashboard URL is not available yet. Start local hosting first.")
-        webbrowser.open(dashboard_url)
-        return dashboard_url
-
-    def ensure_azure_workspace(self, sub_id: str, tenant_id: str, credential=None) -> MLClient:
-        resource_group = self.RESOURCE_GROUP
-        workspace_name = self.WORKSPACE_NAME
-
-        if credential is None:
-            self.root.after(0, lambda: self.status_var.set("Please log in to Azure in your web browser..."))
-            credential = InteractiveBrowserCredential(tenant_id=tenant_id)
-        ml_client = MLClient(credential, sub_id, resource_group, workspace_name)
-        resource_client = ResourceManagementClient(credential, sub_id)
-
-        self.root.after(0, lambda: self.status_var.set("Checking Azure Resource Group..."))
-        try:
-            resource_client.resource_groups.get(resource_group)
-        except Exception:
-            self.root.after(0, lambda: self.status_var.set("Creating Azure Resource Group..."))
-            resource_client.resource_groups.create_or_update(resource_group, {"location": "eastus"})
-
-        self.root.after(0, lambda: self.status_var.set("Verifying Azure ML registration..."))
-        resource_client.providers.register("Microsoft.MachineLearningServices")
-        while True:
-            provider_info = resource_client.providers.get("Microsoft.MachineLearningServices")
-            if provider_info.registration_state == "Registered":
-                break
-            self.root.after(0, lambda: self.status_var.set("Activating Azure ML services..."))
-            time.sleep(10)
-
-        self.root.after(0, lambda: self.status_var.set("Ensuring Azure ML Workspace exists..."))
-        try:
-            ml_client.workspaces.get(workspace_name)
-        except Exception:
-            self.root.after(0, lambda: self.status_var.set("Creating Azure ML Workspace..."))
-            workspace = Workspace(name=workspace_name, location="eastus")
-            ml_client.workspaces.begin_create(workspace).result()
-
-        return ml_client
 
     def start_hosting_thread(self):
         model_path = clean_optional_string(self.hosted_model_path_var.get())
@@ -3396,7 +1215,15 @@ timeout while opening socket"""
             return
 
         hosting_mode = self.hosting_mode_var.get().strip() or "local"
+        request_kwargs = {
+            "model_dir": resolved_model_dir,
+            "mode": hosting_mode,
+        }
         if hosting_mode == "azure":
+            if not AZURE_AVAILABLE:
+                self.finish_hosting_action()
+                messagebox.showerror("Azure Dependencies Missing", "Azure SDK dependencies are not installed in this Python environment.")
+                return
             sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
             tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
             azure_compute = clean_optional_string(self.azure_host_compute_var.get()) or "cpu"
@@ -3408,7 +1235,7 @@ timeout while opening socket"""
             self.azure_host_sub_var.set(sub_id)
             self.azure_host_tenant_var.set(tenant_id)
             self.azure_host_compute_var.set(azure_compute)
-            valid_host_sizes = self.get_azure_host_instance_candidates(azure_compute)
+            valid_host_sizes = self.azure_platform_service.get_azure_host_instance_candidates(azure_compute)
             if not azure_instance_type:
                 azure_instance_type = valid_host_sizes[0] if valid_host_sizes else ""
                 self.azure_host_instance_var.set(azure_instance_type)
@@ -3421,7 +1248,7 @@ timeout while opening socket"""
                     self.finish_hosting_action()
                     messagebox.showwarning("Hosting", "Please provide a batch input URI for the daily batch schedule.")
                     return
-                if not self.is_cloud_accessible_batch_input(batch_input_uri):
+                if not self.azure_platform_service.is_cloud_accessible_batch_input(batch_input_uri):
                     self.finish_hosting_action()
                     messagebox.showwarning(
                         "Hosting",
@@ -3429,14 +1256,14 @@ timeout while opening socket"""
                     )
                     return
                 try:
-                    batch_hour, batch_minute = self.parse_daily_time(batch_time)
+                    batch_hour, batch_minute = self.azure_platform_service.parse_daily_time(batch_time)
                 except Exception as exc:
                     self.finish_hosting_action()
                     messagebox.showwarning("Hosting", str(exc))
                     return
             elif azure_service == "queued_batch":
                 try:
-                    batch_hour, batch_minute = self.parse_daily_time(batch_time)
+                    batch_hour, batch_minute = self.azure_platform_service.parse_daily_time(batch_time)
                 except Exception as exc:
                     self.finish_hosting_action()
                     messagebox.showwarning("Hosting", str(exc))
@@ -3455,28 +1282,27 @@ timeout while opening socket"""
                 messagebox.showwarning("Hosting", "Please provide your Azure Tenant ID for hosting.")
                 return
 
-            threading.Thread(
-                target=self.run_azure_hosting,
-                args=(
-                    resolved_model_dir,
-                    sub_id,
-                    tenant_id,
-                    azure_compute,
-                    azure_instance_type,
-                    azure_service,
-                    batch_input_uri,
-                    batch_hour,
-                    batch_minute,
-                    batch_timezone,
-                ),
-                daemon=True,
-            ).start()
+            request_kwargs.update(
+                {
+                    "azure_sub_id": sub_id,
+                    "azure_tenant_id": tenant_id,
+                    "azure_compute": azure_compute,
+                    "azure_instance_type": azure_instance_type,
+                    "azure_service": azure_service,
+                    "batch_input_uri": batch_input_uri,
+                    "batch_hour": batch_hour,
+                    "batch_minute": batch_minute,
+                    "batch_timezone": batch_timezone,
+                }
+            )
+            job = self.hosting_service.submit_hosting(HostingRequest(**request_kwargs))
+            self.current_hosting_job_id = job.job_id
             return
 
         auto_install_missing_tools = False
-        missing_tools = self.get_missing_local_observability_tools()
+        missing_tools = self.observability_service.get_missing_local_observability_tools()
         if missing_tools:
-            if not self.can_auto_install_local_observability():
+            if not self.observability_service.can_auto_install_local_observability():
                 self.finish_hosting_action()
                 messagebox.showerror(
                     "Local Hosting",
@@ -3517,735 +1343,45 @@ timeout while opening socket"""
                 return
             auto_install_missing_tools = True
 
-        threading.Thread(
-            target=self.run_local_hosting,
-            args=(resolved_model_dir, auto_install_missing_tools),
-            daemon=True,
-        ).start()
+        request_kwargs["auto_install_missing_tools"] = auto_install_missing_tools
+        job = self.hosting_service.submit_hosting(HostingRequest(**request_kwargs))
+        self.current_hosting_job_id = job.job_id
 
     def stop_hosting(self):
-        with self.hosting_state_lock:
-            processes = [self.hosting_process, self.prometheus_process, self.grafana_process]
+        if self.current_hosting_job_id:
+            if self.hosting_service.cancel(self.current_hosting_job_id):
+                self.status_var.set("Interrupt requested. Stopping hosting...")
+                return
 
+        processes = [
+            self.observability_service.hosting_process,
+            self.observability_service.prometheus_process,
+            self.observability_service.grafana_process,
+        ]
         if not any(process is not None and process.poll() is None for process in processes):
             self.stop_hosting_btn.config(state="disabled")
             self.status_var.set("No local hosted stack is currently running.")
             return
 
         try:
-            self.shutdown_local_hosting_stack()
+            self.hosting_service.stop_local_stack()
         finally:
+            self.hosting_process = None
+            self.prometheus_process = None
+            self.grafana_process = None
             self.hosting_api_url_var.set("")
             self.hosting_mode_summary_var.set("Local Grafana hosting stack stopped.")
             self.stop_hosting_btn.config(state="disabled")
             self.status_var.set("Local hosted stack stopped.")
 
-    def run_local_hosting(self, model_dir: str, install_missing_dependencies: bool = False):
-        process = None
-        prometheus_process = None
-        grafana_process = None
-        try:
-            serve_script = os.path.join(self.project_dir, "serve_model.py")
-            if not os.path.exists(serve_script):
-                raise FileNotFoundError("Could not find 'serve_model.py' in the app directory.")
 
-            self.shutdown_local_hosting_stack()
 
-            if install_missing_dependencies:
-                self.root.after(0, lambda: self.status_var.set("Installing Grafana and Prometheus..."))
-                self.install_local_observability_dependencies()
 
-            port = self.find_free_port()
-            prometheus_port = self.find_free_port()
-            grafana_port = self.find_free_port()
-            host = "127.0.0.1"
-            api_url = f"http://{host}:{port}/predict"
-            health_url = f"http://{host}:{port}/health"
-            metrics_url = f"http://{host}:{port}/metrics"
-            prometheus_url = f"http://127.0.0.1:{prometheus_port}"
-            grafana_url = f"http://127.0.0.1:{grafana_port}"
-            dashboard_url = f"{grafana_url}/d/log-monitor-local/log-monitor-local-hosting?orgId=1&refresh=10s"
-            self.root.after(0, lambda: self.status_var.set("Starting local prediction API..."))
 
-            process = subprocess.Popen(
-                [sys.executable, serve_script, "--model-dir", model_dir, "--host", host, "--port", str(port)],
-                cwd=self.project_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            with self.hosting_state_lock:
-                self.hosting_process = process
-
-            ready = False
-            deadline = time.time() + 60
-            while time.time() < deadline:
-                if process.poll() is not None:
-                    output = process.stdout.read() if process.stdout else ""
-                    raise RuntimeError(f"Local hosting exited unexpectedly.\n\n{output}")
-                try:
-                    response = requests.get(health_url, timeout=2)
-                    if response.ok:
-                        ready = True
-                        break
-                except Exception:
-                    pass
-                time.sleep(1)
-
-            if not ready:
-                raise TimeoutError("Timed out waiting for the local prediction API to become ready.")
-
-            training_metadata = self.find_training_metadata_for_model_dir(Path(model_dir))
-            local_hosting_meta = {
-                "mode": "local",
-                "service_kind": "grafana_local",
-                "model_dir": model_dir,
-                "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
-                "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
-                "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
-                "api_url": api_url,
-                "health_url": health_url,
-                "metrics_url": metrics_url,
-                "prometheus_url": prometheus_url,
-                "grafana_url": grafana_url,
-                "dashboard_url": dashboard_url,
-                "created_at": now_utc_iso(),
-            }
-            tracking_console_url, tracking_console_note = self.resolve_dashboard_tracking_console(
-                launch_live_console=True
-            )
-            observability_files = self.write_local_observability_files(
-                hosting_meta=local_hosting_meta,
-                training_meta=training_metadata,
-                tracking_console_url=tracking_console_url,
-                tracking_console_note=tracking_console_note,
-            )
-
-            self.root.after(0, lambda: self.status_var.set("Starting local Prometheus..."))
-            prometheus_process = self.start_local_prometheus(
-                config_path=observability_files["prometheus_config_path"],
-                data_path=observability_files["prometheus_data_path"],
-                port=prometheus_port,
-                log_path=observability_files["prometheus_launch_log_path"],
-            )
-            with self.hosting_state_lock:
-                self.prometheus_process = prometheus_process
-
-            self.root.after(0, lambda: self.status_var.set("Starting local Grafana..."))
-            grafana_process = self.start_local_grafana(
-                provisioning_path=observability_files["grafana_provisioning_path"],
-                dashboard_path=observability_files["grafana_dashboard_path"],
-                data_path=observability_files["grafana_data_path"],
-                logs_path=observability_files["grafana_logs_path"],
-                plugins_path=observability_files["grafana_plugins_path"],
-                port=grafana_port,
-                log_path=observability_files["grafana_launch_log_path"],
-            )
-            with self.hosting_state_lock:
-                self.grafana_process = grafana_process
-
-            if not self.wait_for_http_endpoint(dashboard_url, timeout_seconds=45, ready_statuses=(200,)):
-                dashboard_url = grafana_url
-                local_hosting_meta["dashboard_url"] = dashboard_url
-
-            host_note = (
-                "IIS was detected on this machine; this implementation is serving the model directly "
-                "from the app host for a simpler local API workflow."
-                if self.is_iis_available()
-                else "Serving the model directly from this machine."
-            )
-            summary = (
-                f"Local Grafana hosting stack is running.\n"
-                f"POST {api_url}\n"
-                f"Grafana: {dashboard_url}\n"
-                f"Prometheus: {prometheus_url}\n"
-                f"Metrics: {metrics_url}\n"
-                f"Body: {{\"errorMessage\": \"...\"}}\n"
-                f"Response: {{\"prediction\": \"...\"}}\n"
-                f"{host_note}"
-            )
-            metadata_path = self.save_last_hosting_metadata(
-                local_hosting_meta
-            )
-            self.root.after(0, lambda: self.hosting_api_url_var.set(api_url))
-            self.root.after(0, lambda: self.hosting_mode_summary_var.set(summary))
-            self.root.after(0, lambda: self.status_var.set("Local Grafana hosting stack is ready."))
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Hosting Ready",
-                    (
-                        f"Local Grafana hosting stack is ready.\n\n"
-                        f"Prediction URL:\n{api_url}\n\n"
-                        f"Grafana Dashboard:\n{dashboard_url}\n\n"
-                        f"Prometheus:\n{prometheus_url}\n\n"
-                        "The app will try to open Grafana in your browser.\n\n"
-                        f"Hosting metadata saved to:\n{metadata_path}"
-                    ),
-                ),
-            )
-            self.root.after(100, lambda: self.open_hosting_dashboard_on_success("local"))
-        except Exception as exc:
-            self.shutdown_local_hosting_stack()
-            self.root.after(0, lambda err=str(exc): messagebox.showerror("Hosting Error", err))
-            self.root.after(0, lambda: self.status_var.set("Local hosting failed."))
-        finally:
-            self.root.after(0, self.finish_hosting_action)
-
-    def run_azure_hosting(
-        self,
-        model_dir: str,
-        sub_id: str,
-        tenant_id: str,
-        azure_compute: str,
-        preferred_instance_type: str,
-        azure_service: str,
-        batch_input_uri: str,
-        batch_hour: int,
-        batch_minute: int,
-        batch_timezone: str,
-    ):
-        service_kind = clean_optional_string(azure_service) or "queued_batch"
-        if service_kind == "online":
-            self.run_azure_online_hosting(
-                model_dir,
-                sub_id,
-                tenant_id,
-                azure_compute,
-                preferred_instance_type,
-            )
-            return
-
-        if service_kind == "queued_batch":
-            self.run_azure_queued_batch_hosting(
-                model_dir,
-                sub_id,
-                tenant_id,
-                azure_compute,
-                preferred_instance_type,
-                batch_hour,
-                batch_minute,
-                batch_timezone,
-            )
-            return
-
-        self.run_azure_batch_hosting(
-            model_dir,
-            sub_id,
-            tenant_id,
-            azure_compute,
-            preferred_instance_type,
-            batch_input_uri,
-            batch_hour,
-            batch_minute,
-            batch_timezone,
-        )
-
-    def run_azure_online_hosting(
-        self,
-        model_dir: str,
-        sub_id: str,
-        tenant_id: str,
-        azure_compute: str,
-        preferred_instance_type: str,
-    ):
-        attempted_instance_types: list[str] = []
-        try:
-            self.root.after(0, lambda: self.status_var.set("Preparing Azure hosting..."))
-            ml_client = self.ensure_azure_workspace(sub_id, tenant_id)
-
-            timestamp = int(time.time())
-            model_name = self.sanitize_azure_name(f"log-monitor-model-{Path(model_dir).name}-{timestamp}")
-            endpoint_name = self.sanitize_azure_name(f"log-monitor-endpoint-{timestamp}")
-            deployment_name = "blue"
-            env_name = self.sanitize_azure_name(f"log-monitor-inference-env-{timestamp}")
-            instance_candidates = self.prioritize_instance_candidates(
-                self.get_azure_host_instance_candidates(azure_compute),
-                preferred_instance_type,
-            )
-            selected_instance_type = ""
-
-            self.root.after(0, lambda: self.status_var.set("Registering model in Azure ML..."))
-            model_asset = Model(
-                path=model_dir.replace("\\", "/"),
-                name=model_name,
-                type=AssetTypes.CUSTOM_MODEL,
-                description="Log Monitor generated DeBERTa model",
-            )
-            registered_model = ml_client.models.create_or_update(model_asset)
-
-            self.root.after(0, lambda: self.status_var.set("Creating Azure inference environment..."))
-            environment = Environment(
-                name=env_name,
-                image="mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04:latest",
-                conda_file=os.path.join(self.project_dir, "azure_inference_conda.yml"),
-                description="Inference environment for Log Monitor hosted API",
-            )
-            environment = ml_client.environments.create_or_update(environment)
-
-            self.root.after(0, lambda: self.status_var.set("Creating Azure online endpoint..."))
-            endpoint = ManagedOnlineEndpoint(
-                name=endpoint_name,
-                auth_mode="key",
-                description="Hosted prediction API for Log Monitor",
-            )
-            ml_client.online_endpoints.begin_create_or_update(endpoint).result()
-
-            last_deployment_error = None
-            for instance_type in instance_candidates:
-                attempted_instance_types.append(instance_type)
-                self.root.after(
-                    0,
-                    lambda size=instance_type: self.status_var.set(
-                        f"Deploying model to Azure endpoint ({size})..."
-                    ),
-                )
-                try:
-                    deployment = ManagedOnlineDeployment(
-                        name=deployment_name,
-                        endpoint_name=endpoint_name,
-                        model=registered_model,
-                        environment=environment,
-                        code_configuration=CodeConfiguration(
-                            code=self.project_dir,
-                            scoring_script="azure_score.py",
-                        ),
-                        instance_type=instance_type,
-                        instance_count=1,
-                    )
-                    ml_client.online_deployments.begin_create_or_update(deployment).result()
-                    selected_instance_type = instance_type
-                    break
-                except Exception as exc:
-                    last_deployment_error = exc
-                    if self.is_azure_quota_error(exc) and instance_type != instance_candidates[-1]:
-                        print(
-                            f"[AZURE-HOST] Instance type {instance_type} is unavailable due to quota. "
-                            "Trying the next fallback size."
-                        )
-                        continue
-                    raise
-
-            if not selected_instance_type:
-                if last_deployment_error is not None:
-                    raise last_deployment_error
-                raise RuntimeError("Azure deployment did not complete and no scoring instance was selected.")
-
-            endpoint.traffic = {deployment_name: 100}
-            ml_client.online_endpoints.begin_create_or_update(endpoint).result()
-            endpoint_details = ml_client.online_endpoints.get(endpoint_name)
-            scoring_uri = clean_optional_string(getattr(endpoint_details, "scoring_uri", ""))
-            if not scoring_uri:
-                raise RuntimeError("Azure deployment completed but no scoring URI was returned.")
-
-            mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id, tenant_id)
-            training_metadata = self.find_training_metadata_for_model_dir(Path(model_dir))
-            metadata_path = self.save_last_hosting_metadata(
-                {
-                    "mode": "azure",
-                    "service_kind": "online",
-                    "model_dir": model_dir,
-                    "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
-                    "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
-                    "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
-                    "endpoint_name": endpoint_name,
-                    "deployment_name": deployment_name,
-                    "instance_type": selected_instance_type,
-                    "endpoint_auth_mode": "key",
-                    "api_url": scoring_uri,
-                    "azure_subscription_id": sub_id,
-                    "azure_tenant_id": tenant_id,
-                    "azure_compute": azure_compute,
-                    "mlops_url": mlops_url,
-                    "llmops_url": llmops_url,
-                    "created_at": now_utc_iso(),
-                }
-            )
-
-            summary = (
-                f"Azure real-time endpoint is ready.\n"
-                f"POST {scoring_uri}\n"
-                f"Instance Type: {selected_instance_type}\n"
-                f"Body: {{\"errorMessage\": \"...\"}}\n"
-                f"Response: {{\"prediction\": \"...\"}}\n"
-                "Authentication: endpoint keys."
-            )
-
-            self.root.after(0, lambda: self.azure_hosted_endpoint_name_var.set(endpoint_name))
-            self.root.after(0, lambda: self.hosting_api_url_var.set(scoring_uri))
-            self.root.after(0, lambda: self.azure_mlops_url_var.set(mlops_url))
-            self.root.after(0, lambda: self.azure_llmops_url_var.set(llmops_url))
-            self.root.after(0, lambda: self.hosting_mode_summary_var.set(summary))
-            self.root.after(0, lambda: self.status_var.set("Azure real-time endpoint is ready."))
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Hosting Ready",
-                    (
-                        f"Azure real-time endpoint is ready.\n\n"
-                        f"Prediction URL:\n{scoring_uri}\n\n"
-                        f"Instance Type:\n{selected_instance_type}\n\n"
-                        f"MLOps Dashboard:\n{mlops_url}\n\n"
-                        f"LLMOps Dashboard:\n{llmops_url}\n\n"
-                        "The app will try to open the MLOps dashboard in your browser.\n\n"
-                        f"Hosting metadata saved to:\n{metadata_path}"
-                    ),
-                ),
-            )
-            self.root.after(100, lambda: self.open_hosting_dashboard_on_success("azure", mlops_url))
-        except Exception as exc:
-            error_message = self.format_azure_hosting_error(exc, attempted_instance_types)
-            self.root.after(0, lambda err=error_message: messagebox.showerror("Hosting Error", err))
-            self.root.after(0, lambda: self.status_var.set("Azure hosting failed."))
-        finally:
-            self.root.after(0, self.finish_hosting_action)
-
-    def run_azure_batch_hosting(
-        self,
-        model_dir: str,
-        sub_id: str,
-        tenant_id: str,
-        azure_compute: str,
-        preferred_instance_type: str,
-        batch_input_uri: str,
-        batch_hour: int,
-        batch_minute: int,
-        batch_timezone: str,
-    ):
-        attempted_instance_types: list[str] = []
-        try:
-            self.root.after(0, lambda: self.status_var.set("Preparing Azure hosting..."))
-            ml_client = self.ensure_azure_workspace(sub_id, tenant_id)
-
-            timestamp = int(time.time())
-            model_name = self.sanitize_azure_name(f"log-monitor-model-{Path(model_dir).name}-{timestamp}")
-            endpoint_name = self.sanitize_azure_name(f"log-monitor-batch-endpoint-{timestamp}")
-            schedule_name = self.sanitize_azure_name(f"log-monitor-batch-schedule-{timestamp}")
-            env_name = self.sanitize_azure_name(f"log-monitor-batch-env-{timestamp}")
-            deployment_meta = self.deploy_azure_batch_endpoint(
-                ml_client=ml_client,
-                model_dir=model_dir,
-                azure_compute=azure_compute,
-                preferred_instance_type=preferred_instance_type,
-                endpoint_name=endpoint_name,
-                environment_name=env_name,
-                model_name=model_name,
-                endpoint_auth_mode="aad_token",
-            )
-            deployment_name = clean_optional_string(deployment_meta.get("deployment_name")) or "default"
-            compute_name = clean_optional_string(deployment_meta.get("compute_name"))
-            selected_instance_type = clean_optional_string(deployment_meta.get("instance_type"))
-            scoring_uri = clean_optional_string(deployment_meta.get("api_url"))
-            attempted_instance_types = list(deployment_meta.get("attempted_instance_types") or [])
-
-            self.root.after(0, lambda: self.status_var.set("Creating daily Azure batch schedule..."))
-            seed_job = ml_client.batch_endpoints.invoke(
-                endpoint_name=endpoint_name,
-                deployment_name=deployment_name,
-                input=Input(path=batch_input_uri),
-                experiment_name="log-monitor-batch-schedules",
-            )
-            seed_job_name = clean_optional_string(getattr(seed_job, "name", ""))
-            if not seed_job_name:
-                raise RuntimeError("Azure batch invocation did not return a job name for schedule creation.")
-
-            schedule = JobSchedule(
-                name=schedule_name,
-                display_name="Log Monitor Daily Batch Schedule",
-                description="Runs the Log Monitor batch endpoint once per day.",
-                trigger=RecurrenceTrigger(
-                    frequency="day",
-                    interval=1,
-                    schedule=RecurrencePattern(hours=batch_hour, minutes=batch_minute),
-                    time_zone=batch_timezone or "UTC",
-                ),
-                create_job=seed_job_name,
-            )
-            ml_client.schedules.begin_create_or_update(schedule=schedule).result()
-
-            try:
-                ml_client.jobs.begin_cancel(seed_job_name).result()
-            except Exception:
-                print("[AZURE-HOST] Seed batch job could not be canceled after schedule creation.")
-                traceback.print_exc()
-
-            mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id, tenant_id)
-            training_metadata = self.find_training_metadata_for_model_dir(Path(model_dir))
-            metadata_path = self.save_last_hosting_metadata(
-                {
-                    "mode": "azure_batch",
-                    "service_kind": "batch",
-                    "model_dir": model_dir,
-                    "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
-                    "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
-                    "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
-                    "endpoint_name": endpoint_name,
-                    "deployment_name": deployment_name,
-                    "schedule_name": schedule_name,
-                    "schedule_time": f"{batch_hour:02d}:{batch_minute:02d}",
-                    "schedule_time_zone": batch_timezone or "UTC",
-                    "batch_input_uri": batch_input_uri,
-                    "seed_job_name": seed_job_name,
-                    "instance_type": selected_instance_type,
-                    "compute_name": compute_name,
-                    "endpoint_auth_mode": "aad_token",
-                    "api_url": scoring_uri,
-                    "azure_subscription_id": sub_id,
-                    "azure_tenant_id": tenant_id,
-                    "azure_compute": azure_compute,
-                    "mlops_url": mlops_url,
-                    "llmops_url": llmops_url,
-                    "created_at": now_utc_iso(),
-                }
-            )
-
-            summary = (
-                f"Azure batch endpoint is ready.\n"
-                f"Invoke: {scoring_uri}\n"
-                f"Cluster: {compute_name} ({selected_instance_type}, min nodes 0)\n"
-                f"Schedule: every day at {batch_hour:02d}:{batch_minute:02d} {batch_timezone or 'UTC'}\n"
-                f"Input: {batch_input_uri}\n"
-                "Output: prediction rows are written to Azure Storage when each batch job finishes.\n"
-                "Authentication: Microsoft Entra ID."
-            )
-
-            self.root.after(0, lambda: self.azure_hosted_endpoint_name_var.set(endpoint_name))
-            self.root.after(0, lambda: self.hosting_api_url_var.set(scoring_uri))
-            self.root.after(0, lambda: self.azure_mlops_url_var.set(mlops_url))
-            self.root.after(0, lambda: self.azure_llmops_url_var.set(llmops_url))
-            self.root.after(0, lambda: self.hosting_mode_summary_var.set(summary))
-            self.root.after(0, lambda: self.status_var.set("Azure batch endpoint and daily schedule are ready."))
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Hosting Ready",
-                    (
-                        f"Azure batch endpoint is ready.\n\n"
-                        f"Endpoint URL:\n{scoring_uri}\n\n"
-                        f"Compute Cluster:\n{compute_name}\n\n"
-                        f"Instance Type:\n{selected_instance_type}\n\n"
-                        f"Daily Schedule:\n{batch_hour:02d}:{batch_minute:02d} {batch_timezone or 'UTC'}\n\n"
-                        f"Batch Input URI:\n{batch_input_uri}\n\n"
-                        f"MLOps Dashboard:\n{mlops_url}\n\n"
-                        f"LLMOps Dashboard:\n{llmops_url}\n\n"
-                        "The app will try to open the MLOps dashboard in your browser.\n\n"
-                        f"Hosting metadata saved to:\n{metadata_path}"
-                    ),
-                ),
-            )
-            self.root.after(100, lambda: self.open_hosting_dashboard_on_success("azure_batch", mlops_url))
-        except Exception as exc:
-            error_message = self.format_azure_hosting_error(exc, attempted_instance_types)
-            self.root.after(0, lambda err=error_message: messagebox.showerror("Hosting Error", err))
-            self.root.after(0, lambda: self.status_var.set("Azure hosting failed."))
-        finally:
-            self.root.after(0, self.finish_hosting_action)
-
-    def run_azure_queued_batch_hosting(
-        self,
-        model_dir: str,
-        sub_id: str,
-        tenant_id: str,
-        azure_compute: str,
-        preferred_instance_type: str,
-        batch_hour: int,
-        batch_minute: int,
-        batch_timezone: str,
-    ):
-        attempted_instance_types: list[str] = []
-        try:
-            self.root.after(0, lambda: self.status_var.set("Preparing Azure queued batch hosting..."))
-            credential = InteractiveBrowserCredential(tenant_id=tenant_id)
-            ml_client = self.ensure_azure_workspace(sub_id, tenant_id, credential=credential)
-
-            timestamp = int(time.time())
-            function_app_name = self.sanitize_azure_name(f"log-monitor-func-{timestamp}", max_length=60)
-            function_plan_name = self.sanitize_azure_name(f"log-monitor-flex-{timestamp}", max_length=40)
-            storage_account_name = self.sanitize_azure_storage_name(f"logmonitor{timestamp}")
-            service_bus_namespace_name = self.sanitize_azure_name(f"log-monitor-sb-{timestamp}", max_length=50)
-            service_bus_queue_name = "logs"
-            datastore_name = self.sanitize_azure_name(f"log-monitor-batches-{timestamp}", max_length=30).replace("-", "")
-            batch_endpoint_name = self.sanitize_azure_name(f"log-monitor-batch-endpoint-{timestamp}")
-            batch_env_name = self.sanitize_azure_name(f"log-monitor-batch-env-{timestamp}")
-            model_name = self.sanitize_azure_name(f"log-monitor-model-{Path(model_dir).name}-{timestamp}")
-            batch_timezone_iana = self.get_azure_batch_timezone_iana(batch_timezone)
-
-            self.root.after(0, lambda: self.status_var.set("Creating Azure queue, storage, and Function App..."))
-            infra_outputs = self.deploy_azure_function_bridge_infrastructure(
-                credential=credential,
-                sub_id=sub_id,
-                function_app_name=function_app_name,
-                function_plan_name=function_plan_name,
-                storage_account_name=storage_account_name,
-                service_bus_namespace_name=service_bus_namespace_name,
-                service_bus_queue_name=service_bus_queue_name,
-            )
-            storage_connection_string = clean_optional_string(infra_outputs.get("storageConnectionString"))
-            storage_account_key = clean_optional_string(infra_outputs.get("storageAccountKey"))
-            service_bus_connection_string = clean_optional_string(infra_outputs.get("serviceBusConnectionString"))
-            function_host_name = clean_optional_string(infra_outputs.get("functionAppHostName"))
-
-            if not storage_connection_string or not storage_account_key or not service_bus_connection_string or not function_host_name:
-                raise RuntimeError("Azure infrastructure deployment did not return the required connection details.")
-
-            self.root.after(0, lambda: self.status_var.set("Registering Azure Blob datastore for queued batches..."))
-            self.ensure_azure_blob_datastore(
-                ml_client=ml_client,
-                datastore_name=datastore_name,
-                storage_account_name=storage_account_name,
-                container_name="log-batches",
-                storage_account_key=storage_account_key,
-            )
-
-            deployment_meta = self.deploy_azure_batch_endpoint(
-                ml_client=ml_client,
-                model_dir=model_dir,
-                azure_compute=azure_compute,
-                preferred_instance_type=preferred_instance_type,
-                endpoint_name=batch_endpoint_name,
-                environment_name=batch_env_name,
-                model_name=model_name,
-                endpoint_auth_mode="aad_token",
-            )
-            attempted_instance_types = list(deployment_meta.get("attempted_instance_types") or [])
-            compute_name = clean_optional_string(deployment_meta.get("compute_name"))
-            selected_instance_type = clean_optional_string(deployment_meta.get("instance_type"))
-            batch_scoring_uri = clean_optional_string(deployment_meta.get("api_url"))
-            deployment_name = clean_optional_string(deployment_meta.get("deployment_name")) or "default"
-
-            self.root.after(0, lambda: self.status_var.set("Updating Azure Function settings..."))
-            self.set_function_app_settings(
-                credential=credential,
-                sub_id=sub_id,
-                function_app_name=function_app_name,
-                settings={
-                    "AzureWebJobsStorage__accountName": storage_account_name,
-                    "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
-                    "LOGMONITOR_BLOB_CONTAINER": "log-batches",
-                    "LOGMONITOR_SERVICEBUS_CONNECTION": service_bus_connection_string,
-                    "LOGMONITOR_QUEUE_NAME": service_bus_queue_name,
-                    "LOGMONITOR_BATCH_TIME": f"{batch_hour:02d}:{batch_minute:02d}",
-                    "LOGMONITOR_BATCH_TIME_ZONE": batch_timezone_iana,
-                    "LOGMONITOR_BATCH_ENDPOINT_NAME": batch_endpoint_name,
-                    "LOGMONITOR_BATCH_DEPLOYMENT_NAME": deployment_name,
-                    "LOGMONITOR_AML_SUBSCRIPTION_ID": sub_id,
-                    "LOGMONITOR_AML_RESOURCE_GROUP": self.RESOURCE_GROUP,
-                    "LOGMONITOR_AML_WORKSPACE_NAME": self.WORKSPACE_NAME,
-                    "LOGMONITOR_DATASTORE_NAME": datastore_name,
-                    "LOGMONITOR_INPUT_PREFIX": "queue-batches",
-                    "LOGMONITOR_STATE_BLOB": "queue-state/scheduler-state.json",
-                },
-            )
-
-            self.root.after(0, lambda: self.status_var.set("Packaging the Azure Function bridge..."))
-            package_path = self.build_function_bridge_package(f"log-monitor-function-{timestamp}")
-            package_uri = self.upload_function_bridge_package(
-                storage_connection_string=storage_connection_string,
-                storage_account_name=storage_account_name,
-                storage_account_key=storage_account_key,
-                package_path=package_path,
-                package_container_name="functionpkgs",
-            )
-
-            self.root.after(0, lambda: self.status_var.set("Deploying the Azure Function bridge..."))
-            self.trigger_function_app_onedeploy(
-                credential=credential,
-                sub_id=sub_id,
-                function_app_name=function_app_name,
-                package_uri=package_uri,
-            )
-
-            self.root.after(0, lambda: self.status_var.set("Waiting for the Azure log API to become ready..."))
-            log_api_url, function_key = self.wait_for_function_bridge_endpoint(
-                credential=credential,
-                sub_id=sub_id,
-                function_app_name=function_app_name,
-                function_host_name=function_host_name,
-            )
-
-            mlops_url, llmops_url = self.build_azure_dashboard_urls(sub_id, tenant_id)
-            training_metadata = self.find_training_metadata_for_model_dir(Path(model_dir))
-            metadata_path = self.save_last_hosting_metadata(
-                {
-                    "mode": "azure_queue_batch",
-                    "service_kind": "queued_batch",
-                    "model_dir": model_dir,
-                    "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
-                    "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
-                    "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
-                    "api_url": log_api_url,
-                    "function_key": function_key,
-                    "function_app_name": function_app_name,
-                    "function_host_name": function_host_name,
-                    "service_bus_namespace": service_bus_namespace_name,
-                    "service_bus_queue": service_bus_queue_name,
-                    "storage_account_name": storage_account_name,
-                    "log_container_name": "log-batches",
-                    "datastore_name": datastore_name,
-                    "endpoint_name": batch_endpoint_name,
-                    "deployment_name": deployment_name,
-                    "batch_endpoint_url": batch_scoring_uri,
-                    "schedule_time": f"{batch_hour:02d}:{batch_minute:02d}",
-                    "schedule_time_zone": batch_timezone,
-                    "schedule_time_zone_iana": batch_timezone_iana,
-                    "instance_type": selected_instance_type,
-                    "compute_name": compute_name,
-                    "endpoint_auth_mode": "aad_token",
-                    "azure_subscription_id": sub_id,
-                    "azure_tenant_id": tenant_id,
-                    "azure_compute": azure_compute,
-                    "mlops_url": mlops_url,
-                    "llmops_url": llmops_url,
-                    "created_at": now_utc_iso(),
-                }
-            )
-
-            summary = (
-                f"Azure queued batch pipeline is ready.\n"
-                f"Log API: {log_api_url}\n"
-                f"Queue: {service_bus_namespace_name}/{service_bus_queue_name}\n"
-                f"Batch Endpoint: {batch_endpoint_name}\n"
-                f"Schedule: every day at {batch_hour:02d}:{batch_minute:02d} {batch_timezone}\n"
-                f"Cluster: {compute_name} ({selected_instance_type}, min nodes 0)\n"
-                "Flow: POST logs to the Function API, queue them, and process the accumulated logs once per day in the background."
-            )
-
-            self.root.after(0, lambda: self.azure_hosted_endpoint_name_var.set(batch_endpoint_name))
-            self.root.after(0, lambda: self.hosting_api_url_var.set(log_api_url))
-            self.root.after(0, lambda: self.azure_mlops_url_var.set(mlops_url))
-            self.root.after(0, lambda: self.azure_llmops_url_var.set(llmops_url))
-            self.root.after(0, lambda: self.hosting_mode_summary_var.set(summary))
-            self.root.after(0, lambda: self.status_var.set("Azure queued batch pipeline is ready."))
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Hosting Ready",
-                    (
-                        f"Azure queued batch pipeline is ready.\n\n"
-                        f"Log API URL:\n{log_api_url}\n\n"
-                        f"Function App:\n{function_app_name}\n\n"
-                        f"Service Bus Queue:\n{service_bus_namespace_name}/{service_bus_queue_name}\n\n"
-                        f"Batch Endpoint:\n{batch_endpoint_name}\n\n"
-                        f"Daily Schedule:\n{batch_hour:02d}:{batch_minute:02d} {batch_timezone}\n\n"
-                        f"MLOps Dashboard:\n{mlops_url}\n\n"
-                        f"LLMOps Dashboard:\n{llmops_url}\n\n"
-                        "The app will try to open the MLOps dashboard in your browser.\n\n"
-                        f"Hosting metadata saved to:\n{metadata_path}"
-                    ),
-                ),
-            )
-            self.root.after(100, lambda: self.open_hosting_dashboard_on_success("azure_queue_batch", mlops_url))
-        except Exception as exc:
-            error_message = self.format_azure_hosting_error(exc, attempted_instance_types)
-            self.root.after(0, lambda err=error_message: messagebox.showerror("Hosting Error", err))
-            self.root.after(0, lambda: self.status_var.set("Azure queued batch hosting failed."))
-        finally:
-            self.root.after(0, self.finish_hosting_action)
 
     def on_app_close(self):
-        self.shutdown_local_hosting_stack()
-        self.terminate_process(self.mlflow_ui_process, timeout_seconds=3)
+        self.hosting_service.stop_local_stack()
+        self.mlops_service.stop_local_mlflow_ui()
         self.root.destroy()
 
     # --- File Processing & LLM Methods ---
@@ -4267,12 +1403,6 @@ timeout while opening socket"""
             self.training_filepath_entry.delete(0, tk.END)
             self.training_filepath_entry.insert(0, filepath)
 
-    def load_prompt(self):
-        prompt_path = os.path.join(self.project_dir, "prompt.txt")
-        if not os.path.exists(prompt_path):
-            raise FileNotFoundError("Could not find 'prompt.txt' in the application directory.")
-        with open(prompt_path, "r", encoding="utf-8") as file:
-            return file.read()
 
     def on_mlflow_enabled_change(self):
         enabled = bool(self.mlflow_enabled_var.get())
@@ -4313,470 +1443,15 @@ timeout while opening socket"""
             self.mlflow_tracking_uri_var.set("")
         self.mlflow_tracking_uri_entry.config(state="normal")
 
-    def _resolve_azure_mlflow_tracking_uri(self, ml_client: MLClient | None) -> str:
-        if self.azure_mlflow_tracking_uri:
-            return self.azure_mlflow_tracking_uri
 
-        if ml_client is None:
-            return ""
 
-        try:
-            workspace = ml_client.workspaces.get(self.WORKSPACE_NAME)
-            uri = clean_optional_string(getattr(workspace, "mlflow_tracking_uri", ""))
-            if uri:
-                self.azure_mlflow_tracking_uri = uri
-                self.root.after(0, lambda value=uri: self.mlflow_tracking_uri_var.set(value))
-            return uri
-        except Exception:
-            print("[MLOPS] Failed to resolve Azure MLflow tracking URI.")
-            traceback.print_exc()
-            return ""
 
-    def resolve_mlflow_config(
-        self,
-        require_tracking_uri: bool,
-        ml_client: MLClient | None = None,
-        soft_disable: bool = False,
-    ):
-        enabled = bool(self.mlflow_enabled_var.get())
-        backend = self.mlflow_backend_var.get().strip() or "local"
-        experiment_name = clean_optional_string(self.mlflow_experiment_var.get())
-        registered_model_name = clean_optional_string(self.mlflow_registered_model_var.get())
 
-        config = {
-            "enabled": enabled,
-            "backend": backend,
-            "tracking_uri": "",
-            "experiment_name": experiment_name,
-            "registered_model_name": registered_model_name,
-        }
 
-        if not enabled:
-            return config, None
 
-        def soft_disabled(reason: str):
-            fallback = dict(config)
-            fallback["enabled"] = False
-            fallback["tracking_uri"] = ""
-            fallback["disabled_reason"] = reason
-            print(f"[MLOPS] {reason} Proceeding with MLflow disabled.")
-            return fallback, None
 
-        if mlflow is None:
-            if soft_disable:
-                return soft_disabled("MLflow is enabled in UI, but the `mlflow` package is not available.")
-            return config, "MLflow is enabled in UI, but the `mlflow` package is not available."
 
-        if not experiment_name:
-            if soft_disable:
-                return soft_disabled(
-                    (
-                        "MLflow is enabled, but `Experiment Name` is empty.\n\n"
-                        "Set a non-empty value in Hosting:\n"
-                        "- Experiment Name (example: `log-monitor`)"
-                    )
-                )
-            return (
-                config,
-                (
-                    "MLflow is enabled, but `Experiment Name` is empty.\n\n"
-                    "Set a non-empty value in Hosting:\n"
-                    "- Experiment Name (example: `log-monitor`)"
-                ),
-            )
 
-        if backend == "local":
-            config["tracking_uri"] = self.local_mlflow_tracking_uri
-            self.mlflow_tracking_uri_var.set(self.local_mlflow_tracking_uri)
-        elif backend == "custom_uri":
-            config["tracking_uri"] = clean_optional_string(self.mlflow_tracking_uri_var.get())
-            if require_tracking_uri and not config["tracking_uri"]:
-                if soft_disable:
-                    return soft_disabled("MLflow backend is `custom_uri` but Tracking URI is empty.")
-                return config, "MLflow backend is `custom_uri` but Tracking URI is empty."
-        elif backend == "azure":
-            config["tracking_uri"] = self._resolve_azure_mlflow_tracking_uri(ml_client)
-            if not config["tracking_uri"]:
-                current_value = clean_optional_string(self.mlflow_tracking_uri_var.get())
-                if current_value and "resolved during Azure run" not in current_value:
-                    config["tracking_uri"] = current_value
-            if require_tracking_uri and not config["tracking_uri"]:
-                if soft_disable:
-                    return soft_disabled("Azure MLflow URI is not resolved yet. Run Azure auth or provide `custom_uri` backend.")
-                return config, "Azure MLflow URI is not resolved yet. Run Azure auth or provide `custom_uri` backend."
-        else:
-            if soft_disable:
-                return soft_disabled(f"Unsupported MLflow backend: {backend}")
-            return config, f"Unsupported MLflow backend: {backend}"
-
-        return config, None
-
-    def sidecar_matches_mlflow_target(self, sidecar: dict, mlflow_config: dict) -> bool:
-        if not bool(mlflow_config.get("enabled")):
-            return True
-
-        current_tracking_uri = clean_optional_string(mlflow_config.get("tracking_uri", ""))
-        current_experiment = clean_optional_string(mlflow_config.get("experiment_name", ""))
-        recorded_tracking_uri = clean_optional_string(
-            sidecar.get("training_tracking_uri")
-            or sidecar.get("tracking_uri")
-            or sidecar.get("data_prep_tracking_uri")
-        )
-        recorded_experiment = clean_optional_string(
-            sidecar.get("training_experiment_name")
-            or sidecar.get("experiment_name")
-            or sidecar.get("data_prep_experiment_name")
-        )
-
-        if recorded_tracking_uri and current_tracking_uri and recorded_tracking_uri != current_tracking_uri:
-            return False
-        if recorded_experiment and current_experiment and recorded_experiment != current_experiment:
-            return False
-        return True
-
-    def build_training_mlflow_env(self, mlflow_config: dict, pipeline_context: dict, run_source: str) -> dict[str, str]:
-        env = {key: "" for key in MLOPS_ENV_VARS}
-
-        tags = {
-            "run_type": "training",
-            "pipeline_id": str(pipeline_context.get("pipeline_id", "")),
-            "run_source": run_source,
-            "environment_mode": self.train_mode.get().strip() or "unknown",
-        }
-        data_prep_run_id = clean_optional_string(pipeline_context.get("data_prep_run_id", ""))
-        if data_prep_run_id:
-            tags["data_prep_run_id"] = data_prep_run_id
-        prompt_hash = clean_optional_string(pipeline_context.get("prompt_hash", ""))
-        if prompt_hash:
-            tags["prompt_hash"] = prompt_hash
-        llm_model = clean_optional_string(pipeline_context.get("llm_model", ""))
-        if llm_model:
-            tags["llm_model"] = llm_model
-        data_prep_input_hash = clean_optional_string(pipeline_context.get("input_dataset_hash", ""))
-        if data_prep_input_hash:
-            tags["data_prep_input_dataset_hash"] = data_prep_input_hash
-        data_prep_output_hash = clean_optional_string(pipeline_context.get("output_dataset_hash", ""))
-        if data_prep_output_hash:
-            tags["data_prep_output_dataset_hash"] = data_prep_output_hash
-        data_prep_tracking_uri = clean_optional_string(pipeline_context.get("data_prep_tracking_uri", ""))
-        if data_prep_tracking_uri:
-            tags["data_prep_tracking_uri"] = data_prep_tracking_uri
-        data_prep_experiment_name = clean_optional_string(pipeline_context.get("data_prep_experiment_name", ""))
-        if data_prep_experiment_name:
-            tags["data_prep_experiment_name"] = data_prep_experiment_name
-        data_version_id = clean_optional_string(pipeline_context.get("data_version_id", ""))
-        if data_version_id:
-            tags["data_version_id"] = data_version_id
-        data_version_dir = clean_optional_string(pipeline_context.get("data_version_dir", ""))
-        if data_version_dir:
-            tags["data_version_dir"] = data_version_dir
-        data_version_path = clean_optional_string(pipeline_context.get("data_version_path", ""))
-        if data_version_path:
-            tags["data_version_path"] = data_version_path
-
-        env["MLFLOW_PIPELINE_ID"] = str(pipeline_context.get("pipeline_id", ""))
-        env["MLFLOW_PARENT_RUN_ID"] = str(pipeline_context.get("parent_run_id", ""))
-        env["MLFLOW_RUN_SOURCE"] = str(run_source)
-        env["MLFLOW_TAGS_JSON"] = json.dumps(tags)
-
-        enabled = (
-            bool(mlflow_config.get("enabled"))
-            and mlflow is not None
-            and bool(clean_optional_string(mlflow_config.get("tracking_uri", "")))
-        )
-        env["MLOPS_ENABLED"] = "1" if enabled else "0"
-        if not enabled:
-            return env
-
-        env["MLFLOW_TRACKING_URI"] = str(mlflow_config["tracking_uri"])
-        env["MLFLOW_EXPERIMENT_NAME"] = str(mlflow_config["experiment_name"])
-        return env
-
-    def build_shell_export_segment(self, env_map: dict[str, str]) -> str:
-        exports: list[str] = []
-        for key, value in env_map.items():
-            safe_key = clean_optional_string(key)
-            if not safe_key:
-                continue
-            exports.append(f"export {safe_key}={shlex.quote(str(value))}")
-        return " && ".join(exports)
-
-    def create_pipeline_parent_run(self, mlflow_config: dict, pipeline_id: str, run_source: str) -> str:
-        if not bool(mlflow_config.get("enabled")) or mlflow is None:
-            return ""
-        tracking_uri = clean_optional_string(mlflow_config.get("tracking_uri"))
-        if not tracking_uri:
-            return ""
-
-        try:
-            mlflow.set_tracking_uri(tracking_uri)
-            mlflow.set_experiment(mlflow_config["experiment_name"])
-            tags = {
-                "run_type": "pipeline",
-                "pipeline_id": pipeline_id,
-                "run_source": run_source,
-                "created_by": "app.py",
-            }
-            with mlflow.start_run(run_name=f"pipeline-{pipeline_id}", tags=tags) as run:
-                mlflow.log_dict(
-                    {
-                        "pipeline_id": pipeline_id,
-                        "run_source": run_source,
-                        "created_at": now_utc_iso(),
-                    },
-                    "pipeline_context.json",
-                )
-                return run.info.run_id
-        except Exception:
-            print("[MLOPS] Failed to create pipeline parent run.")
-            traceback.print_exc()
-            return ""
-
-    def prepare_training_pipeline_context(self, csv_path: str, mlflow_config: dict, run_source: str) -> dict:
-        sidecar = read_sidecar_for_csv(csv_path) or {}
-        data_version_info = self.archive_data_version(csv_path, sidecar)
-        if data_version_info:
-            sidecar.update(data_version_info)
-        pipeline_id = clean_optional_string(sidecar.get("pipeline_id")) or str(uuid.uuid4())
-        parent_run_id = clean_optional_string(sidecar.get("parent_run_id"))
-
-        if not self.sidecar_matches_mlflow_target(sidecar, mlflow_config):
-            print(
-                "[MLOPS] Existing sidecar lineage points to a different MLflow target. "
-                "Creating a new pipeline parent run for the current target."
-            )
-            parent_run_id = ""
-
-        if bool(mlflow_config.get("enabled")) and not parent_run_id:
-            parent_run_id = self.create_pipeline_parent_run(mlflow_config, pipeline_id, run_source)
-
-        context = {
-            "pipeline_id": pipeline_id,
-            "parent_run_id": parent_run_id,
-            "data_prep_run_id": clean_optional_string(sidecar.get("data_prep_run_id")),
-            "prompt_hash": clean_optional_string(sidecar.get("prompt_hash")),
-            "input_dataset_hash": clean_optional_string(sidecar.get("input_dataset_hash")),
-            "output_dataset_hash": clean_optional_string(sidecar.get("output_dataset_hash")),
-            "llm_model": clean_optional_string(sidecar.get("llm_model")),
-            "data_version_id": clean_optional_string(sidecar.get("data_version_id")),
-            "data_version_dir": clean_optional_string(sidecar.get("data_version_dir")),
-            "data_version_path": clean_optional_string(sidecar.get("data_version_path")),
-            "data_prep_tracking_uri": clean_optional_string(
-                sidecar.get("data_prep_tracking_uri") or sidecar.get("tracking_uri")
-            ),
-            "data_prep_experiment_name": clean_optional_string(
-                sidecar.get("data_prep_experiment_name") or sidecar.get("experiment_name")
-            ),
-        }
-
-        sidecar_payload = {
-            "pipeline_id": pipeline_id,
-            "parent_run_id": parent_run_id,
-            "data_prep_run_id": context["data_prep_run_id"],
-            "prompt_hash": context["prompt_hash"],
-            "input_dataset_hash": context["input_dataset_hash"],
-            "output_dataset_hash": context["output_dataset_hash"],
-            "llm_model": context["llm_model"],
-            "data_version_id": context["data_version_id"],
-            "data_version_dir": context["data_version_dir"],
-            "data_version_path": context["data_version_path"],
-            "created_at": clean_optional_string(sidecar.get("created_at")) or now_utc_iso(),
-            "tracking_uri": clean_optional_string(sidecar.get("tracking_uri"))
-            or clean_optional_string(mlflow_config.get("tracking_uri", "")),
-            "experiment_name": clean_optional_string(sidecar.get("experiment_name"))
-            or clean_optional_string(mlflow_config.get("experiment_name", "")),
-            "data_prep_tracking_uri": context["data_prep_tracking_uri"],
-            "data_prep_experiment_name": context["data_prep_experiment_name"],
-            "training_tracking_uri": clean_optional_string(mlflow_config.get("tracking_uri", ""))
-            or clean_optional_string(sidecar.get("training_tracking_uri", "")),
-            "training_experiment_name": clean_optional_string(mlflow_config.get("experiment_name", ""))
-            or clean_optional_string(sidecar.get("training_experiment_name", "")),
-        }
-        try:
-            write_sidecar_for_csv(csv_path, sidecar_payload)
-        except Exception:
-            print("[MLOPS] Failed to persist training sidecar context.")
-            traceback.print_exc()
-        return context
-
-    def log_data_prep_mlflow(
-        self,
-        mlflow_config: dict,
-        input_path: str,
-        output_path: str,
-        system_prompt: str,
-        llm_model: str,
-        input_df: pd.DataFrame,
-        output_df: pd.DataFrame,
-        input_hash: str,
-        output_hash: str,
-        usage_totals: dict[str, int],
-        data_version_info: dict | None = None,
-    ) -> dict:
-        payload = {
-            "pipeline_id": str(uuid.uuid4()),
-            "parent_run_id": "",
-            "data_prep_run_id": "",
-            "prompt_hash": prompt_sha256(system_prompt),
-            "llm_model": clean_optional_string(llm_model),
-            "input_dataset_hash": input_hash,
-            "output_dataset_hash": output_hash,
-            "created_at": now_utc_iso(),
-            "tracking_uri": clean_optional_string(mlflow_config.get("tracking_uri", "")),
-            "experiment_name": clean_optional_string(mlflow_config.get("experiment_name", "")),
-            "data_prep_tracking_uri": clean_optional_string(mlflow_config.get("tracking_uri", "")),
-            "data_prep_experiment_name": clean_optional_string(mlflow_config.get("experiment_name", "")),
-            "data_version_id": clean_optional_string((data_version_info or {}).get("data_version_id", "")),
-            "data_version_dir": clean_optional_string((data_version_info or {}).get("data_version_dir", "")),
-            "data_version_path": clean_optional_string((data_version_info or {}).get("data_version_path", "")),
-        }
-
-        if not bool(mlflow_config.get("enabled")):
-            return payload
-        if mlflow is None:
-            print("[MLOPS] Skipping data-prep tracking because `mlflow` is unavailable.")
-            return payload
-        if not payload["tracking_uri"]:
-            print("[MLOPS] Skipping data-prep tracking because tracking URI is unresolved.")
-            return payload
-
-        try:
-            mlflow.set_tracking_uri(payload["tracking_uri"])
-            mlflow.set_experiment(payload["experiment_name"])
-            with mlflow.start_run(
-                run_name=f"pipeline-{payload['pipeline_id']}",
-                tags={
-                    "run_type": "pipeline",
-                    "pipeline_id": payload["pipeline_id"],
-                    "run_source": "data_prep",
-                },
-            ) as parent_run:
-                payload["parent_run_id"] = parent_run.info.run_id
-
-                with mlflow.start_run(
-                    run_name="data-prep",
-                    nested=True,
-                    tags={
-                        "run_type": "data_prep",
-                        "pipeline_id": payload["pipeline_id"],
-                    },
-                ) as child_run:
-                    payload["data_prep_run_id"] = child_run.info.run_id
-                    input_meta = dataframe_metadata(input_df, label_col="class")
-                    output_meta = dataframe_metadata(output_df, label_col="class")
-
-                    mlflow.log_param("llm_model", clean_optional_string(llm_model) or "unknown")
-                    mlflow.log_param("input_filename", os.path.basename(input_path))
-                    mlflow.log_param("output_filename", os.path.basename(output_path))
-                    mlflow.log_param("prompt_hash", payload["prompt_hash"])
-                    mlflow.log_param("input_dataset_hash", payload["input_dataset_hash"])
-                    mlflow.log_param("output_dataset_hash", payload["output_dataset_hash"])
-                    if payload["data_version_id"]:
-                        mlflow.log_param("data_version_id", payload["data_version_id"])
-                    if payload["data_version_path"]:
-                        mlflow.log_param("data_version_path", payload["data_version_path"])
-
-                    mlflow.log_metric("input_rows", int(input_meta.get("row_count", 0)))
-                    mlflow.log_metric("output_rows", int(output_meta.get("row_count", 0)))
-                    for metric_name, metric_value in usage_totals.items():
-                        mlflow.log_metric(metric_name, int(metric_value))
-
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        prompt_preview_path = os.path.join(tmp_dir, "prompt_preview.txt")
-                        with open(prompt_preview_path, "w", encoding="utf-8") as file_obj:
-                            file_obj.write(safe_prompt_preview(system_prompt, max_chars=2000))
-
-                        metadata_path = os.path.join(tmp_dir, "data_prep_metadata.json")
-                        write_json(
-                            metadata_path,
-                            {
-                                "pipeline_id": payload["pipeline_id"],
-                                "input_path": input_path,
-                                "output_path": output_path,
-                                "prompt_hash": payload["prompt_hash"],
-                                "input_dataset_hash": payload["input_dataset_hash"],
-                                "output_dataset_hash": payload["output_dataset_hash"],
-                                "data_version_id": payload["data_version_id"],
-                                "data_version_path": payload["data_version_path"],
-                                "usage_totals": usage_totals,
-                                "input_metadata": input_meta,
-                                "output_metadata": output_meta,
-                                "created_at": payload["created_at"],
-                            },
-                        )
-
-                        sample_path = os.path.join(tmp_dir, "output_sample.csv")
-                        output_sample_df = dataframe_sample(output_df, max_rows=100, max_cell_chars=200)
-                        output_sample_df.to_csv(sample_path, index=False)
-
-                        mlflow.log_artifacts(tmp_dir, artifact_path="data_prep")
-        except Exception:
-            print("[MLOPS] Data-prep MLflow logging failed.")
-            traceback.print_exc()
-        return payload
-
-    def find_latest_training_mlflow_metadata(self) -> dict | None:
-        candidate_paths: list[Path] = []
-        seen: set[str] = set()
-        recursive_roots: list[Path] = []
-
-        hosted_model_value = clean_optional_string(self.hosted_model_path_var.get())
-        if hosted_model_value:
-            try:
-                recursive_roots.append(Path(discover_model_dir(hosted_model_value)).resolve())
-            except Exception:
-                pass
-
-        project_download_root = (Path(self.project_dir) / "downloaded_model").resolve()
-        if project_download_root.exists():
-            recursive_roots.append(project_download_root)
-
-        for root in self.get_training_metadata_search_roots():
-            direct_meta = root / "last_training_mlflow.json"
-            if direct_meta.exists():
-                key = str(direct_meta.resolve())
-                if key not in seen:
-                    seen.add(key)
-                    candidate_paths.append(direct_meta)
-
-            should_search_recursively = any(root == recursive_root for recursive_root in recursive_roots)
-            if root.is_dir() and should_search_recursively:
-                try:
-                    nested_matches = root.rglob("last_training_mlflow.json")
-                except Exception:
-                    nested_matches = []
-                for match in nested_matches:
-                    try:
-                        key = str(match.resolve())
-                    except Exception:
-                        key = str(match)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    candidate_paths.append(match)
-
-        if not candidate_paths:
-            return None
-
-        latest = max(candidate_paths, key=lambda path: path.stat().st_mtime)
-        payload = read_json(str(latest)) or {}
-        if payload:
-            payload["_metadata_path"] = str(latest)
-        return payload if payload else None
-
-    def cache_downloaded_training_mlflow_metadata(self, download_path: str) -> None:
-        search_root = Path(download_path)
-        if not search_root.exists():
-            return
-        candidates = list(search_root.rglob("last_training_mlflow.json"))
-        if not candidates:
-            return
-
-        latest = max(candidates, key=lambda path: path.stat().st_mtime)
-        target = Path(self.project_dir) / "outputs" / "last_training_mlflow.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(latest), str(target))
-        print(f"[MLOPS] Cached training metadata to {target}")
 
     def open_mlflow_console(self):
         backend = self.mlflow_backend_var.get().strip() or "local"
@@ -4784,6 +1459,7 @@ timeout while opening socket"""
 
         if backend == "local":
             try:
+                self.mlops_service.start_local_mlflow_ui(self.local_mlflow_tracking_uri)
                 self.open_local_dashboard_page(launch_live_console=True)
             except Exception as exc:
                 messagebox.showerror("Dashboard", f"Failed to open the local dashboard.\n\n{exc}")
@@ -4808,55 +1484,19 @@ timeout while opening socket"""
         webbrowser.open(studio_url)
 
     def register_last_model_version(self):
-        if mlflow is None:
-            messagebox.showerror("MLflow", "Model registration requires `mlflow` package availability.")
+        config, error = self.build_mlflow_config_from_ui(require_tracking_uri=True)
+        if error:
+            messagebox.showerror("MLflow", error)
             return
-
-        metadata = self.find_latest_training_mlflow_metadata()
-        if not metadata:
-            messagebox.showwarning("MLflow", "No training MLflow metadata file found.")
-            return
-
-        run_id = clean_optional_string(metadata.get("run_id"))
-        if not run_id:
-            messagebox.showerror("MLflow", "Training metadata is missing run_id; cannot register model.")
-            return
-
-        tracking_uri = clean_optional_string(metadata.get("tracking_uri"))
-        if not tracking_uri:
-            config, error = self.resolve_mlflow_config(require_tracking_uri=True)
-            if error:
-                messagebox.showerror("MLflow", error)
-                return
-            tracking_uri = clean_optional_string(config.get("tracking_uri"))
-
-        model_name = clean_optional_string(self.mlflow_registered_model_var.get())
-        if not model_name:
-            messagebox.showerror(
-                "MLflow",
-                (
-                    "`Registered Model` is empty.\n\n"
-                    "Set a non-empty model name in Hosting > Registered Model "
-                    "before registering a version."
-                ),
-            )
-            return
-        model_uri = clean_optional_string(metadata.get("model_uri")) or f"runs:/{run_id}/final_model"
-
-        try:
-            mlflow.set_tracking_uri(tracking_uri)
-            version = mlflow.register_model(model_uri=model_uri, name=model_name)
-            messagebox.showinfo(
-                "MLflow",
-                (
-                    f"Registered model version successfully.\n\n"
-                    f"Model: {model_name}\n"
-                    f"Version: {version.version}\n"
-                    f"Run ID: {run_id}"
-                ),
-            )
-        except Exception as exc:
-            messagebox.showerror("MLflow", f"Failed to register model version.\n\n{exc}")
+        ok, message = self.mlops_service.register_last_model_version(
+            registered_model_name=self.mlflow_registered_model_var.get(),
+            fallback_tracking_uri=config.tracking_uri,
+            hosted_model_path=self.hosted_model_path_var.get(),
+        )
+        if ok:
+            messagebox.showinfo("MLflow", message)
+        else:
+            messagebox.showerror("MLflow", message)
 
     def on_train_mode_change(self):
         is_azure = self.train_mode.get() == "azure"
@@ -4950,155 +1590,15 @@ timeout while opening socket"""
             self.training_config_visible = True
         self._refresh_scroll_region()
 
-    def _parse_numeric_list(self, raw_value: str, parser, field_name: str):
-        cleaned = raw_value.strip()
-        if not cleaned:
-            return []
-        parsed_values = []
-        for part in cleaned.split(","):
-            token = part.strip()
-            if not token:
-                continue
-            try:
-                parsed_values.append(parser(token))
-            except Exception as exc:
-                raise ValueError(f"Invalid value '{token}' in {field_name}: {exc}") from exc
-        return parsed_values
 
-    def collect_training_options(self):
-        try:
-            strategy = (self.training_strategy_var.get().strip() or "default").lower()
-            if strategy not in {"default", "tune", "tune_cv"}:
-                return None, f"Unsupported training mode: {strategy}"
 
-            epochs = int(self.epochs_var.get().strip())
-            batch_size = int(self.batch_size_var.get().strip())
-            learning_rate = float(self.learning_rate_var.get().strip())
-            weight_decay = float(self.weight_decay_var.get().strip())
-            max_length = int(self.max_length_var.get().strip())
-            cv_folds = int(self.cv_folds_var.get().strip() or "3")
-            max_trials = int(self.max_trials_var.get().strip() or "8")
-        except Exception as exc:
-            return None, f"Invalid training configuration values: {exc}"
 
-        if epochs < 1:
-            return None, "Epochs must be >= 1."
-        if batch_size < 1:
-            return None, "Batch Size must be >= 1."
-        if learning_rate <= 0:
-            return None, "Learning Rate must be > 0."
-        if weight_decay < 0:
-            return None, "Weight Decay must be >= 0."
-        if max_length < 16:
-            return None, "Max Length must be >= 16."
-        if cv_folds < 2:
-            return None, "CV Folds must be >= 2."
-        if max_trials < 1:
-            return None, "Max Trials must be >= 1."
-
-        try:
-            tune_lrs = self._parse_numeric_list(self.tune_lrs_var.get(), float, "Tune LRs")
-            tune_batch_sizes = self._parse_numeric_list(self.tune_batch_sizes_var.get(), int, "Tune Batch Sizes")
-            tune_epochs = self._parse_numeric_list(self.tune_epochs_var.get(), int, "Tune Epochs")
-            tune_weight_decays = self._parse_numeric_list(self.tune_weight_decays_var.get(), float, "Tune Weight Decays")
-            tune_max_lengths = self._parse_numeric_list(self.tune_max_lengths_var.get(), int, "Tune Max Lengths")
-        except ValueError as exc:
-            return None, str(exc)
-
-        tune_lrs = [value for value in tune_lrs if value > 0]
-        tune_batch_sizes = [value for value in tune_batch_sizes if value > 0]
-        tune_epochs = [value for value in tune_epochs if value > 0]
-        tune_weight_decays = [value for value in tune_weight_decays if value >= 0]
-        tune_max_lengths = [value for value in tune_max_lengths if value >= 16]
-
-        if not tune_lrs:
-            tune_lrs = [learning_rate]
-        if not tune_batch_sizes:
-            tune_batch_sizes = [batch_size]
-        if not tune_epochs:
-            tune_epochs = [epochs]
-        if not tune_weight_decays:
-            tune_weight_decays = [weight_decay]
-        if not tune_max_lengths:
-            tune_max_lengths = [max_length]
-
-        if strategy == "default":
-            max_trials = 1
-        if strategy != "tune_cv":
-            cv_folds = 3
-
-        options = {
-            "train_mode": strategy,
-            "epochs": epochs,
-            "batch_size": batch_size,
-            "learning_rate": learning_rate,
-            "weight_decay": weight_decay,
-            "max_length": max_length,
-            "val_ratio": 0.15,
-            "test_ratio": 0.15,
-            "cv_folds": cv_folds,
-            "max_trials": max_trials,
-            "tune_learning_rates": tune_lrs,
-            "tune_batch_sizes": tune_batch_sizes,
-            "tune_epochs": tune_epochs,
-            "tune_weight_decays": tune_weight_decays,
-            "tune_max_lengths": tune_max_lengths,
-        }
-        return options, None
-
-    def build_train_cli_args(self, training_options: dict) -> list[str]:
-        def list_to_csv(values):
-            return ",".join(str(value) for value in values)
-
-        return [
-            "--train-mode",
-            str(training_options["train_mode"]),
-            "--epochs",
-            str(training_options["epochs"]),
-            "--batch-size",
-            str(training_options["batch_size"]),
-            "--learning-rate",
-            str(training_options["learning_rate"]),
-            "--weight-decay",
-            str(training_options["weight_decay"]),
-            "--max-length",
-            str(training_options["max_length"]),
-            "--val-ratio",
-            str(training_options["val_ratio"]),
-            "--test-ratio",
-            str(training_options["test_ratio"]),
-            "--cv-folds",
-            str(training_options["cv_folds"]),
-            "--max-trials",
-            str(training_options["max_trials"]),
-            "--tune-learning-rates",
-            list_to_csv(training_options["tune_learning_rates"]),
-            "--tune-batch-sizes",
-            list_to_csv(training_options["tune_batch_sizes"]),
-            "--tune-epochs",
-            list_to_csv(training_options["tune_epochs"]),
-            "--tune-weight-decays",
-            list_to_csv(training_options["tune_weight_decays"]),
-            "--tune-max-lengths",
-            list_to_csv(training_options["tune_max_lengths"]),
-        ]
-
-    def build_train_cli_segment(self, training_options: dict) -> str:
-        train_args = self.build_train_cli_args(training_options)
-        if not train_args:
-            return ""
-        return " ".join(shlex.quote(arg) for arg in train_args)
 
     def start_training_session(self) -> bool:
         with self.training_state_lock:
             if self.training_active:
                 return False
             self.training_active = True
-            self.training_cancel_event.clear()
-            self.local_training_process = None
-            self.azure_ml_client_for_cancel = None
-            self.azure_active_job_name = ""
-            self.azure_cancel_requested = False
 
         self.get_model_btn.config(state="disabled")
         self.stop_training_btn.config(state="normal")
@@ -5107,79 +1607,20 @@ timeout while opening socket"""
     def finish_training_session(self):
         with self.training_state_lock:
             self.training_active = False
-            self.training_cancel_event.clear()
-            self.local_training_process = None
-            self.azure_ml_client_for_cancel = None
-            self.azure_active_job_name = ""
-            self.azure_cancel_requested = False
 
         self.get_model_btn.config(state="normal")
         self.stop_training_btn.config(state="disabled")
         self.status_var.set("Ready")
 
-    def _raise_if_training_cancelled(self):
-        if self.training_cancel_event.is_set():
-            raise TrainingInterrupted("Training was interrupted by the user.")
 
-    def request_azure_job_cancel(self, ml_client: MLClient, job_name: str):
-        jobs_client = ml_client.jobs
-        if hasattr(jobs_client, "begin_cancel"):
-            jobs_client.begin_cancel(job_name)
-            return
-        if hasattr(jobs_client, "cancel"):
-            jobs_client.cancel(job_name)
-            return
-        raise RuntimeError("Azure ML SDK does not expose a job cancellation method on this client version.")
 
-    def _request_azure_cancel_once(self, ml_client: MLClient, job_name: str):
-        with self.training_state_lock:
-            if self.azure_cancel_requested:
-                return
-            self.azure_cancel_requested = True
-
-        print(f"[DEBUG] Issuing cancellation for Azure job: {job_name}")
-        self.root.after(
-            0,
-            lambda: self.status_var.set("Cancellation requested. Waiting for Azure to stop the job..."),
-        )
-        try:
-            self.request_azure_job_cancel(ml_client, job_name)
-        except Exception:
-            with self.training_state_lock:
-                self.azure_cancel_requested = False
-            raise
 
     def stop_training(self):
-        local_process = None
-        azure_client = None
-        azure_job_name = ""
-        with self.training_state_lock:
-            if not self.training_active:
-                self.status_var.set("No training is currently running.")
-                return
-            self.training_cancel_event.set()
-            local_process = self.local_training_process
-            azure_client = self.azure_ml_client_for_cancel
-            azure_job_name = self.azure_active_job_name
-
-        self.status_var.set("Interrupt requested. Stopping training...")
-
-        if local_process and local_process.poll() is None:
-            try:
-                local_process.terminate()
-            except Exception:
-                print("[DEBUG] Failed to terminate local training process cleanly. Attempting kill...")
-                try:
-                    local_process.kill()
-                except Exception:
-                    traceback.print_exc()
-
-        if azure_client and azure_job_name:
-            try:
-                self._request_azure_cancel_once(azure_client, azure_job_name)
-            except Exception:
-                print("[DEBUG] Failed to request Azure job cancellation.")
-                traceback.print_exc()
+        if not self.current_training_job_id:
+            self.status_var.set("No training is currently running.")
+            return
+        if self.training_service.cancel(self.current_training_job_id):
+            self.status_var.set("Interrupt requested. Stopping training...")
 
     def prepare_data(self):
         api_key = self.openai_api_key_entry.get().strip()
@@ -5204,183 +1645,24 @@ timeout while opening socket"""
         if not save_path:
             return 
 
-        mlflow_config, mlflow_error = self.resolve_mlflow_config(
-            require_tracking_uri=False,
-            soft_disable=True,
-        )
+        mlflow_config, mlflow_error = self.build_mlflow_config_from_ui(require_tracking_uri=False, soft_disable=True)
         if mlflow_error:
             messagebox.showerror("MLflow Configuration Error", mlflow_error)
             return
 
         self.status_var.set(f"Processing data with OpenAI ({model_name})...")
         self.prepare_btn.config(state="disabled")
-        threading.Thread(
-            target=self.process_logs_llm,
-            args=(input_path, save_path, api_key, model_name, mlflow_config),
-            daemon=True,
-        ).start()
-
-    def process_logs_llm(self, input_path, save_path, api_key, model_name, mlflow_config):
-        processed_logs = []
-        usage_totals = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        }
-        try:
-            system_prompt = self.load_prompt()
-            df = pd.read_csv(input_path)
-            input_file_hash = compute_file_sha256(input_path)
-            
-            log_col = None
-            for col in df.columns:
-                if any(keyword in col.lower() for keyword in ['log', 'message', 'msg', 'text']):
-                    log_col = col
-                    break
-            if not log_col:
-                log_col = df.columns[0]
-
-            total_rows = len(df)
-            batch_size = 10 
-
-            api_url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-
-            for i in range(0, total_rows, batch_size):
-                batch_df = df.iloc[i:i+batch_size]
-                
-                self.root.after(0, lambda current=i, total=total_rows: self.status_var.set(
-                    f"Processing rows {current + 1} to {min(current + batch_size, total)} of {total}..."
-                ))
-
-                logs_batch = batch_df[log_col].astype(str).tolist()
-
-                payload = {
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": json.dumps(logs_batch)}
-                    ],
-                    "response_format": {"type": "json_object"},
-                }
-
-                max_retries = 5
-                base_delay = 5 
-                success = False
-
-                for attempt in range(max_retries):
-                    response = requests.post(api_url, json=payload, headers=headers, timeout=120)
-                    
-                    if response.status_code == 429:
-                        wait_time = base_delay * (2 ** attempt)
-                        self.root.after(0, lambda w=wait_time: self.status_var.set(
-                            f"Rate limit hit (429). Pausing for {w} seconds..."
-                        ))
-                        time.sleep(wait_time)
-                        continue 
-                    
-                    response.raise_for_status()
-                    success = True
-                    break 
-
-                if not success:
-                    raise Exception("Max retries reached. API rejecting requests due to rate limits.")
-
-                result_json = response.json()
-                usage = result_json.get("usage", {}) if isinstance(result_json, dict) else {}
-                for key in usage_totals:
-                    usage_totals[key] += int(usage.get(key, 0) or 0)
-                llm_content = result_json['choices'][0]['message']['content']
-                
-                try:
-                    parsed_data = json.loads(llm_content)
-                    results_array = parsed_data.get("results", [])
-                    
-                    for idx, log_text in enumerate(logs_batch):
-                        if idx < len(results_array):
-                            log_class = results_array[idx].get("class", "Noise")
-                        else:
-                            log_class = "Noise"
-
-                        processed_logs.append({
-                            "LogMessage": log_text,
-                            "class": log_class
-                        })
-                except json.JSONDecodeError:
-                    for log_text in logs_batch:
-                        processed_logs.append({
-                            "LogMessage": log_text,
-                            "class": "Noise"
-                        })
-                        
-                time.sleep(1.5) 
-
-            output_df = pd.DataFrame(processed_logs)
-            output_df.to_csv(save_path, index=False)
-
-            output_file_hash = compute_file_sha256(save_path)
-            data_version_info = self.archive_data_version(
-                save_path,
-                {
-                    "llm_model": clean_optional_string(model_name),
-                    "prompt_hash": prompt_sha256(system_prompt),
-                    "input_dataset_hash": input_file_hash,
-                    "output_dataset_hash": output_file_hash,
-                    "source_input_path": input_path,
-                    "generated_output_path": save_path,
-                },
-            )
-            mlops_lineage = self.log_data_prep_mlflow(
-                mlflow_config=mlflow_config,
+        job = self.data_prep_service.submit_data_prep(
+            DataPrepRequest(
                 input_path=input_path,
                 output_path=save_path,
-                system_prompt=system_prompt,
-                llm_model=model_name,
-                input_df=df,
-                output_df=output_df,
-                input_hash=input_file_hash,
-                output_hash=output_file_hash,
-                usage_totals=usage_totals,
-                data_version_info=data_version_info,
+                api_key=api_key,
+                model_name=model_name,
+                mlflow_config=mlflow_config,
             )
+        )
+        self.current_data_prep_job_id = job.job_id
 
-            sidecar_payload = {
-                "pipeline_id": mlops_lineage.get("pipeline_id", ""),
-                "parent_run_id": mlops_lineage.get("parent_run_id", ""),
-                "data_prep_run_id": mlops_lineage.get("data_prep_run_id", ""),
-                "prompt_hash": mlops_lineage.get("prompt_hash", ""),
-                "llm_model": mlops_lineage.get("llm_model", ""),
-                "input_dataset_hash": mlops_lineage.get("input_dataset_hash", ""),
-                "output_dataset_hash": mlops_lineage.get("output_dataset_hash", ""),
-                "created_at": mlops_lineage.get("created_at", now_utc_iso()),
-                "tracking_uri": mlops_lineage.get("tracking_uri", ""),
-                "experiment_name": mlops_lineage.get("experiment_name", ""),
-                "data_prep_tracking_uri": mlops_lineage.get("data_prep_tracking_uri", ""),
-                "data_prep_experiment_name": mlops_lineage.get("data_prep_experiment_name", ""),
-                "data_version_id": data_version_info.get("data_version_id", ""),
-                "data_version_dir": data_version_info.get("data_version_dir", ""),
-                "data_version_path": data_version_info.get("data_version_path", ""),
-            }
-            write_sidecar_for_csv(save_path, sidecar_payload)
-            
-            self.root.after(0, lambda: self.status_var.set("Data processed successfully!"))
-            self.root.after(0, lambda: messagebox.showinfo("Success", f"Data saved to:\n{save_path}"))
-
-        except Exception as e:
-            if processed_logs:
-                output_df = pd.DataFrame(processed_logs)
-                output_df.to_csv(save_path, index=False)
-                error_msg = f"An error stopped the process: {e}\n\nHowever, partial data ({len(processed_logs)} rows) was successfully saved to:\n{save_path}"
-            else:
-                error_msg = f"Error processing file: {e}\n\nNo data was saved."
-            
-            self.root.after(0, self.show_error, error_msg)
-
-        finally:
-            self.root.after(0, lambda: self.prepare_btn.config(state="normal"))
 
     # --- HEAVILY LOGGED TRAINING METHODS ---
     def start_training_thread(self):
@@ -5392,7 +1674,23 @@ timeout while opening socket"""
         local_device = self.local_device_var.get().strip() or "auto"
         local_runtime = self.local_runtime_var.get().strip() or "host"
         train_mode = self.train_mode.get().strip()
-        training_options, training_options_error = self.collect_training_options()
+        training_options, training_options_error = self.training_service.collect_training_options(
+            {
+                "strategy": self.training_strategy_var.get(),
+                "epochs": self.epochs_var.get(),
+                "batch_size": self.batch_size_var.get(),
+                "learning_rate": self.learning_rate_var.get(),
+                "weight_decay": self.weight_decay_var.get(),
+                "max_length": self.max_length_var.get(),
+                "cv_folds": self.cv_folds_var.get(),
+                "max_trials": self.max_trials_var.get(),
+                "tune_lrs": self.tune_lrs_var.get(),
+                "tune_batch_sizes": self.tune_batch_sizes_var.get(),
+                "tune_epochs": self.tune_epochs_var.get(),
+                "tune_weight_decays": self.tune_weight_decays_var.get(),
+                "tune_max_lengths": self.tune_max_lengths_var.get(),
+            }
+        )
 
         print("\n--- [DEBUG] STARTING TRAINING WORKFLOW ---")
         print(f"[DEBUG] CSV Path: {csv_path}")
@@ -5417,6 +1715,9 @@ timeout while opening socket"""
         if train_mode == "azure" and not tenant_id:
             messagebox.showwarning("Warning", "Please provide your Azure Tenant ID.")
             return
+        if train_mode == "azure" and not AZURE_AVAILABLE:
+            messagebox.showerror("Azure Dependencies Missing", "Azure SDK dependencies are not installed in this Python environment.")
+            return
         if not os.path.exists("train.py"):
             messagebox.showerror("Error", "Could not find 'train.py' in the app directory.")
             return
@@ -5427,7 +1728,7 @@ timeout while opening socket"""
             messagebox.showerror("Training Configuration Error", "Training configuration could not be resolved.")
             return
         if train_mode == "azure":
-            valid_training_sizes = self.get_azure_training_instance_candidates(azure_compute)
+            valid_training_sizes = self.azure_platform_service.get_azure_training_instance_candidates(azure_compute)
             if not azure_instance_type:
                 azure_instance_type = valid_training_sizes[0] if valid_training_sizes else ""
                 self.azure_training_instance_var.set(azure_instance_type)
@@ -5438,16 +1739,13 @@ timeout while opening socket"""
                 )
                 return
 
-        mlflow_config, mlflow_error = self.resolve_mlflow_config(
-            require_tracking_uri=False,
-            soft_disable=True,
-        )
+        mlflow_config, mlflow_error = self.build_mlflow_config_from_ui(require_tracking_uri=False, soft_disable=True)
         if mlflow_error:
             messagebox.showerror("MLflow Configuration Error", mlflow_error)
             return
 
-        if bool(mlflow_config.get("enabled")):
-            if train_mode == "azure" and mlflow_config.get("backend") == "local":
+        if mlflow_config.enabled:
+            if train_mode == "azure" and mlflow_config.backend == "local":
                 messagebox.showerror(
                     "MLflow Configuration Error",
                     (
@@ -5457,7 +1755,7 @@ timeout while opening socket"""
                 )
                 return
 
-            if mlflow_config.get("backend") == "custom_uri" and not clean_optional_string(mlflow_config.get("tracking_uri")):
+            if mlflow_config.backend == "custom_uri" and not clean_optional_string(mlflow_config.tracking_uri):
                 messagebox.showerror(
                     "MLflow Configuration Error",
                     "MLflow backend is `custom_uri` but Tracking URI is empty.",
@@ -5466,8 +1764,8 @@ timeout while opening socket"""
 
             if (
                 train_mode == "local"
-                and mlflow_config.get("backend") == "azure"
-                and not clean_optional_string(mlflow_config.get("tracking_uri"))
+                and mlflow_config.backend == "azure"
+                and not clean_optional_string(mlflow_config.tracking_uri)
             ):
                 messagebox.showerror(
                     "MLflow Configuration Error",
@@ -5478,28 +1776,11 @@ timeout while opening socket"""
                 )
                 return
 
-        if train_mode == "azure":
-            run_source = "azure_gpu" if azure_compute == "gpu" else "azure_cpu"
-            pipeline_context = self.prepare_training_pipeline_context(csv_path, mlflow_config, run_source)
-            if not self.start_training_session():
-                messagebox.showwarning("Training In Progress", "A training workflow is already running.")
-                return
-            self.status_var.set("Initializing authentication...")
-            try:
-                threading.Thread(
-                    target=self.run_azure_training,
-                    args=(csv_path, sub_id, tenant_id, azure_compute, azure_instance_type, mlflow_config, pipeline_context, training_options),
-                    daemon=True,
-                ).start()
-            except Exception:
-                self.finish_training_session()
-                raise
-        else:
+        if train_mode != "azure":
             if local_device != "cuda":
                 local_runtime = "host"
-
             if local_device == "cuda" and local_runtime == "host":
-                available, check_error = self.check_host_cuda_available()
+                available, check_error = self.training_service.check_host_cuda_available()
                 if not available:
                     hint = (
                         "CUDA is not available in the host Python environment.\n\n"
@@ -5510,511 +1791,28 @@ timeout while opening socket"""
                     messagebox.showerror("CUDA Not Available", hint)
                     return
 
-            run_source = "local_container" if local_runtime == "container" else "local_host"
-            pipeline_context = self.prepare_training_pipeline_context(csv_path, mlflow_config, run_source)
-            mlflow_env = self.build_training_mlflow_env(mlflow_config, pipeline_context, run_source)
-
-            if not self.start_training_session():
-                messagebox.showwarning("Training In Progress", "A training workflow is already running.")
-                return
-            self.status_var.set("Preparing local training...")
-            try:
-                threading.Thread(
-                    target=self.run_local_training,
-                    args=(csv_path, local_device, local_runtime, mlflow_env, training_options),
-                    daemon=True,
-                ).start()
-            except Exception:
-                self.finish_training_session()
-                raise
-
-    def check_host_cuda_available(self):
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", "import torch; print('1' if torch.cuda.is_available() else '0')"],
-                capture_output=True,
-                text=True,
-                check=True,
+        if not self.start_training_session():
+            messagebox.showwarning("Training In Progress", "A training workflow is already running.")
+            return
+        self.status_var.set("Preparing training...")
+        job = self.training_service.submit_training(
+            TrainingRequest(
+                csv_path=csv_path,
+                environment_mode=train_mode,
+                local_device=local_device,
+                local_runtime=local_runtime,
+                azure_sub_id=sub_id,
+                azure_tenant_id=tenant_id,
+                azure_compute=azure_compute,
+                azure_instance_type=azure_instance_type,
+                training_options=training_options,
+                mlflow_config=mlflow_config,
             )
-            return result.stdout.strip() == "1", None
-        except Exception as exc:
-            return False, str(exc)
+        )
+        self.current_training_job_id = job.job_id
 
-    def run_local_training(self, csv_path, device, runtime, mlflow_env, training_options):
-        process = None
-        backend = "container" if runtime == "container" else "host"
-        try:
-            self._raise_if_training_cancelled()
-            project_dir = os.path.dirname(os.path.abspath(__file__))
-            extra_train_args = self.build_train_cli_args(training_options)
 
-            if backend == "container":
-                docker_script = os.path.join(project_dir, "scripts", "train_docker.sh")
-                if not os.path.exists(docker_script):
-                    raise FileNotFoundError("Could not find scripts/train_docker.sh in the app directory.")
-                command_args = ["bash", docker_script, csv_path, *extra_train_args]
-                process_env = os.environ.copy()
-                process_env["DEVICE"] = device
-                process_env.update(mlflow_env)
-            else:
-                train_script = os.path.join(project_dir, "train.py")
-                if not os.path.exists(train_script):
-                    raise FileNotFoundError("Could not find 'train.py' in the app directory.")
-                command_args = [sys.executable, train_script, "--data", csv_path, *extra_train_args]
-                process_env = os.environ.copy()
-                if device == "cpu":
-                    process_env["CUDA_VISIBLE_DEVICES"] = "-1"
-                process_env.update(mlflow_env)
 
-            self.root.after(
-                0,
-                lambda: self.status_var.set(
-                    f"Starting local {backend} training on device: {device}..."
-                ),
-            )
-
-            process = subprocess.Popen(
-                command_args,
-                cwd=project_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=process_env,
-            )
-            with self.training_state_lock:
-                self.local_training_process = process
-
-            if process.stdout:
-                while True:
-                    line = process.stdout.readline()
-                    if not line:
-                        if process.poll() is not None:
-                            break
-                        time.sleep(0.1)
-                        continue
-                    clean_line = line.strip()
-                    if clean_line:
-                        print(f"[LOCAL-TRAIN] {clean_line}")
-                        self.root.after(
-                            0,
-                            lambda msg=clean_line: self.status_var.set(msg[:150]),
-                        )
-                    if self.training_cancel_event.is_set() and process.poll() is None:
-                        try:
-                            process.terminate()
-                        except Exception:
-                            pass
-
-            return_code = process.wait()
-            if self.training_cancel_event.is_set():
-                self.root.after(0, lambda: self.status_var.set("Local training was interrupted."))
-                self.root.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "Training Interrupted",
-                        "Local training was interrupted before completion.",
-                    ),
-                )
-                return
-
-            if return_code != 0:
-                raise RuntimeError(f"Local training failed with exit code {return_code}.")
-
-            model_path = os.path.abspath(os.path.join(project_dir, "outputs", "final_model"))
-            training_metadata = read_json(os.path.join(project_dir, "outputs", "last_training_mlflow.json")) or {}
-            archived_model_dir = clean_optional_string(training_metadata.get("model_version_model_dir"))
-            selected_model_dir = archived_model_dir or model_path
-            self.root.after(0, lambda: self.status_var.set("Local training completed successfully."))
-            self.root.after(0, lambda path=selected_model_dir: self.refresh_hosted_model_inventory(path))
-            self.root.after(
-                0,
-                lambda latest=model_path, archived=archived_model_dir: messagebox.showinfo(
-                    "Success",
-                    (
-                        f"Local {backend} model training completed.\n\n"
-                        f"Latest model path:\n{latest}\n\n"
-                        + (
-                            f"Versioned model path:\n{archived}"
-                            if archived
-                            else "No immutable model version path was recorded."
-                        )
-                    ),
-                ),
-            )
-        except TrainingInterrupted:
-            self.root.after(0, lambda: self.status_var.set("Local training was interrupted."))
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Training Interrupted",
-                    "Local training was interrupted before completion.",
-                ),
-            )
-        except Exception as e:
-            if self.training_cancel_event.is_set():
-                self.root.after(0, lambda: self.status_var.set("Local training was interrupted."))
-                self.root.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "Training Interrupted",
-                        "Local training was interrupted before completion.",
-                    ),
-                )
-            else:
-                print("\n--- [DEBUG] LOCAL TRAINING EXCEPTION ---")
-                traceback.print_exc()
-                print("----------------------------------------\n")
-                self.root.after(
-                    0,
-                    lambda err=str(e): messagebox.showerror(
-                        "Training Error",
-                        f"An error occurred during local training.\n\n{err}",
-                    ),
-                )
-                self.root.after(0, lambda: self.status_var.set("Local training failed."))
-        finally:
-            with self.training_state_lock:
-                self.local_training_process = None
-            self.root.after(0, self.finish_training_session)
-
-    def run_azure_training(self, csv_path, sub_id, tenant_id, azure_compute, preferred_instance_type, mlflow_config, pipeline_context, training_options):
-        ml_client = None
-        returned_job_name = ""
-        job_status = ""
-        compute_mode = "gpu" if azure_compute == "gpu" else "cpu"
-        if compute_mode == "gpu":
-            compute_name = "gpu-cluster-temp"
-        else:
-            compute_name = "cpu-cluster-temp"
-        compute_size = ""
-        attempted_compute_sizes: list[str] = []
-        compute_created = False
-        resource_group = self.RESOURCE_GROUP
-        workspace_name = self.WORKSPACE_NAME
-
-        try:
-            self._raise_if_training_cancelled()
-            print(f"[DEBUG] Attempting Interactive Browser Login to Tenant: {tenant_id}")
-            self.root.after(0, lambda: self.status_var.set("Please log in to Azure in your web browser..."))
-            
-            # Authenticate directly to the correct Tenant
-            credential = InteractiveBrowserCredential(tenant_id=tenant_id)
-            ml_client = MLClient(credential, sub_id, resource_group, workspace_name)
-            print("[DEBUG] MLClient instantiated successfully.")
-            with self.training_state_lock:
-                self.azure_ml_client_for_cancel = ml_client
-
-            # --- Check / Create Resource Group ---
-            self._raise_if_training_cancelled()
-            print(f"[DEBUG] Checking existence of Resource Group: {resource_group}")
-            self.root.after(0, lambda: self.status_var.set("Checking Resource Group..."))
-            resource_client = ResourceManagementClient(credential, sub_id)
-            
-            try:
-                resource_client.resource_groups.get(resource_group)
-                print(f"[DEBUG] SUCCESS: Resource Group '{resource_group}' already exists. Skipping creation.")
-            except Exception as e:
-                print(f"[DEBUG] Resource group not found. Reason: {e}")
-                print(f"[DEBUG] Attempting to create Resource Group '{resource_group}'...")
-                self.root.after(0, lambda: self.status_var.set("Creating Resource Group..."))
-                resource_client.resource_groups.create_or_update(
-                    resource_group, 
-                    {"location": "eastus"}
-                )
-                print(f"[DEBUG] SUCCESS: Resource Group '{resource_group}' created.")
-
-            # --- Auto-Register Machine Learning Services ---
-            self._raise_if_training_cancelled()
-            print("[DEBUG] Verifying Microsoft.MachineLearningServices provider registration...")
-            self.root.after(0, lambda: self.status_var.set("Verifying Azure ML registration..."))
-            resource_client.providers.register('Microsoft.MachineLearningServices')
-            
-            while True:
-                self._raise_if_training_cancelled()
-                provider_info = resource_client.providers.get('Microsoft.MachineLearningServices')
-                print(f"[DEBUG] Provider State: {provider_info.registration_state}")
-                if provider_info.registration_state == 'Registered':
-                    print("[DEBUG] SUCCESS: Provider is fully Registered.")
-                    break
-                self.root.after(0, lambda: self.status_var.set("Activating ML Services on Azure (takes 1-2 mins)..."))
-                time.sleep(10)
-
-            # --- Check / Create Workspace ---
-            self._raise_if_training_cancelled()
-            print(f"[DEBUG] Checking existence of ML Workspace: {workspace_name}")
-            self.root.after(0, lambda: self.status_var.set("Ensuring Azure ML Workspace exists..."))
-            try:
-                ml_client.workspaces.get(workspace_name)
-                print(f"[DEBUG] SUCCESS: Workspace '{workspace_name}' already exists. Skipping creation.")
-            except Exception as e:
-                print(f"[DEBUG] Workspace not found or inaccessible. Reason: {e}")
-                print(f"[DEBUG] Attempting to create ML Workspace '{workspace_name}' (This takes a minute)...")
-                self.root.after(0, lambda: self.status_var.set("Creating ML Workspace..."))
-                ws = Workspace(name=workspace_name, location="eastus")
-                ml_client.workspaces.begin_create(ws).result()
-                print(f"[DEBUG] SUCCESS: Workspace '{workspace_name}' created.")
-
-            resolved_mlflow_config = dict(mlflow_config)
-            run_source = "azure_gpu" if compute_mode == "gpu" else "azure_cpu"
-            tracking_uri = clean_optional_string(resolved_mlflow_config.get("tracking_uri"))
-
-            if bool(resolved_mlflow_config.get("enabled")) and resolved_mlflow_config.get("backend") == "azure":
-                tracking_uri = self._resolve_azure_mlflow_tracking_uri(ml_client)
-                resolved_mlflow_config["tracking_uri"] = tracking_uri
-
-            if bool(resolved_mlflow_config.get("enabled")) and not tracking_uri:
-                raise ValueError(
-                    "MLflow is enabled for Azure training but tracking URI is unresolved. "
-                    "Use backend `azure` (with resolvable workspace URI) or `custom_uri`."
-                )
-
-            pipeline_context_local = dict(pipeline_context)
-            if (
-                bool(resolved_mlflow_config.get("enabled"))
-                and not clean_optional_string(pipeline_context_local.get("parent_run_id"))
-            ):
-                parent_run_id = self.create_pipeline_parent_run(
-                    resolved_mlflow_config,
-                    str(pipeline_context_local.get("pipeline_id", "")),
-                    run_source,
-                )
-                pipeline_context_local["parent_run_id"] = parent_run_id
-                sidecar_existing = read_sidecar_for_csv(csv_path) or {}
-                sidecar_existing["parent_run_id"] = parent_run_id
-                sidecar_existing["tracking_uri"] = clean_optional_string(sidecar_existing.get("tracking_uri")) or clean_optional_string(
-                    resolved_mlflow_config.get("tracking_uri", "")
-                )
-                sidecar_existing["experiment_name"] = clean_optional_string(sidecar_existing.get("experiment_name")) or clean_optional_string(
-                    resolved_mlflow_config.get("experiment_name", "")
-                )
-                sidecar_existing["training_tracking_uri"] = clean_optional_string(resolved_mlflow_config.get("tracking_uri", ""))
-                sidecar_existing["training_experiment_name"] = clean_optional_string(resolved_mlflow_config.get("experiment_name", ""))
-                if "created_at" not in sidecar_existing:
-                    sidecar_existing["created_at"] = now_utc_iso()
-                write_sidecar_for_csv(csv_path, sidecar_existing)
-
-            mlflow_env = self.build_training_mlflow_env(resolved_mlflow_config, pipeline_context_local, run_source)
-            export_segment = self.build_shell_export_segment(mlflow_env)
-            mlflow_install_fragment = "mlflow==2.9.2 " if bool_from_env(mlflow_env.get("MLOPS_ENABLED", "0")) else ""
-            train_cli_segment = self.build_train_cli_segment(training_options)
-            train_cli_segment = f" {train_cli_segment}" if train_cli_segment else ""
-
-            # --- Create Compute Cluster ---
-            self._raise_if_training_cancelled()
-            print(f"[DEBUG] Checking/Provisioning Compute Cluster: {compute_name}...")
-            compute_candidates = self.prioritize_instance_candidates(
-                self.get_azure_training_instance_candidates(compute_mode),
-                preferred_instance_type,
-            )
-            last_compute_error = None
-            for instance_type in compute_candidates:
-                attempted_compute_sizes.append(instance_type)
-                self.root.after(
-                    0,
-                    lambda size=instance_type: self.status_var.set(
-                        f"Provisioning {compute_mode.upper()} cluster ({size})..."
-                    ),
-                )
-                try:
-                    compute = AmlCompute(
-                        name=compute_name,
-                        type="amlcompute",
-                        size=instance_type,
-                        min_instances=0,
-                        max_instances=1,
-                        idle_time_before_scale_down=120
-                    )
-                    ml_client.compute.begin_create_or_update(compute).result()
-                    compute_size = instance_type
-                    break
-                except Exception as exc:
-                    last_compute_error = exc
-                    if self.is_azure_quota_error(exc) and instance_type != compute_candidates[-1]:
-                        print(
-                            f"[AZURE-TRAIN] Compute size {instance_type} is unavailable due to quota. "
-                            "Trying the next fallback size."
-                        )
-                        continue
-                    raise
-
-            if not compute_size:
-                if last_compute_error is not None:
-                    raise last_compute_error
-                raise RuntimeError("No Azure training compute size could be provisioned.")
-            compute_created = True
-            print(f"[DEBUG] SUCCESS: Compute cluster '{compute_name}' is ready with size '{compute_size}'.")
-            self._raise_if_training_cancelled()
-
-            # --- Define and Submit Job ---
-            print(f"[DEBUG] Defining training job using target CSV: {csv_path}")
-            self.root.after(0, lambda: self.status_var.set("Uploading data and starting DeBERTa training..."))
-            
-            # THE FIX: Convert Windows backslashes to forward slashes for Azure URI compatibility
-            safe_csv_path = csv_path.replace("\\", "/")
-            print(f"[DEBUG] Normalized safe path for Azure: {safe_csv_path}")
-
-            job = command(
-                inputs={
-                    "training_data": Input(type="uri_file", path=safe_csv_path, mode="download")
-                },
-                compute=compute_name,
-                environment="AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest", 
-                code=".", 
-                # Install versions that remain compatible with the curated Torch 1.10 Azure image.
-                command=(
-                    "pip install --upgrade "
-                    "numpy==1.23.5 "
-                    "pandas==1.5.3 "
-                    "transformers==4.24.0 "
-                    "sentencepiece==0.1.99 "
-                    "protobuf==3.20.3 "
-                    "scikit-learn==1.1.3 "
-                    f"{mlflow_install_fragment}"
-                    f"&& {export_segment} "
-                    f"&& USE_TF=0 python train.py --data ${{inputs.training_data}}{train_cli_segment}"
-                ),
-                experiment_name="deberta-log-classification",
-            )
-
-            print("[DEBUG] Submitting job to Azure...")
-            returned_job = ml_client.jobs.create_or_update(job)
-            print(f"[DEBUG] SUCCESS: Job submitted! Job Name: {returned_job.name}")
-            returned_job_name = returned_job.name
-            with self.training_state_lock:
-                self.azure_active_job_name = returned_job_name
-
-            # --- Polling Loop ---
-            print("[DEBUG] Beginning polling loop for job completion...")
-            while True:
-                if self.training_cancel_event.is_set() and returned_job_name:
-                    try:
-                        self._request_azure_cancel_once(ml_client, returned_job_name)
-                    except Exception:
-                        print("[DEBUG] Azure cancellation request failed during polling.")
-                        traceback.print_exc()
-
-                job_status = ml_client.jobs.get(returned_job_name).status
-                print(f"[DEBUG] Azure Job Status: {job_status}")
-                self.root.after(0, lambda s=job_status: self.status_var.set(f"Training in progress. Azure Status: {s}"))
-                if job_status in ["Completed", "Failed", "Canceled"]:
-                    break
-                time.sleep(15)
-
-            if job_status == "Failed":
-                print("[DEBUG] FATAL: Job failed on the Azure side.")
-                raise Exception("The training job failed on the Azure machine. Check Azure Portal logs.")
-            if job_status == "Canceled" or self.training_cancel_event.is_set():
-                self.root.after(0, lambda: self.status_var.set("Azure training was interrupted."))
-                self.root.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "Training Interrupted",
-                        "Azure training was interrupted before completion.",
-                    ),
-                )
-                return
-
-            # --- Download Model ---
-            print("[DEBUG] Job Completed! Attempting to download outputs...")
-            self.root.after(0, lambda: self.status_var.set("Training Complete! Downloading model..."))
-            download_path = "./downloaded_model"
-            ml_client.jobs.download(name=returned_job_name, download_path=download_path, all=False)
-            print(f"[DEBUG] SUCCESS: Files downloaded to {download_path}")
-            self.cache_downloaded_training_mlflow_metadata(download_path)
-            preferred_model_path = ""
-            try:
-                preferred_model_path = discover_model_dir(download_path)
-            except Exception:
-                preferred_model_path = ""
-
-            self.root.after(0, lambda path=preferred_model_path: self.refresh_hosted_model_inventory(path))
-            self.root.after(
-                0,
-                lambda size=compute_size: messagebox.showinfo(
-                    "Success",
-                    f"Model trained and downloaded to:\n{os.path.abspath(download_path)}\n\nAzure VM Size:\n{size}",
-                ),
-            )
-
-        except TrainingInterrupted:
-            if ml_client and returned_job_name:
-                try:
-                    self._request_azure_cancel_once(ml_client, returned_job_name)
-                except Exception:
-                    print("[DEBUG] Failed to request Azure cancellation while handling interrupt.")
-                    traceback.print_exc()
-            self.root.after(0, lambda: self.status_var.set("Azure training was interrupted."))
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Training Interrupted",
-                    "Azure training was interrupted before completion.",
-                ),
-            )
-        except Exception as e:
-            if self.training_cancel_event.is_set():
-                self.root.after(0, lambda: self.status_var.set("Azure training was interrupted."))
-                self.root.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "Training Interrupted",
-                        "Azure training was interrupted before completion.",
-                    ),
-                )
-            else:
-                print("\n--- [DEBUG] AN EXCEPTION OCCURRED ---")
-                traceback.print_exc() 
-                print("--------------------------------------\n")
-                
-                self.root.after(
-                    0,
-                    lambda err=str(e), attempted=list(attempted_compute_sizes): messagebox.showerror(
-                        "Training Error",
-                        (
-                            "An error occurred. Check the terminal for full details.\n\n"
-                            + (
-                                "Azure training could not provision a VM size from this list:\n- "
-                                + "\n- ".join(attempted)
-                                + f"\n\n{err}"
-                                if attempted and self.is_azure_quota_error(e)
-                                else err
-                            )
-                        ),
-                    ),
-                )
-                self.root.after(0, lambda: self.status_var.set("Process halted due to error."))
-
-        finally:
-            # --- THE CRITICAL CLEANUP BLOCK ---
-            print("[DEBUG] Entering cleanup block...")
-            if ml_client and returned_job_name and self.training_cancel_event.is_set():
-                try:
-                    self._request_azure_cancel_once(ml_client, returned_job_name)
-                except Exception:
-                    print("[DEBUG] Azure cancellation re-check failed in cleanup.")
-                    traceback.print_exc()
-
-            if ml_client and compute_created:
-                self.root.after(0, lambda: self.status_var.set("Destroying compute cluster to prevent charges..."))
-                print(f"[DEBUG] Issuing delete command for compute cluster '{compute_name}'...")
-                try:
-                    ml_client.compute.begin_delete(compute_name).result()
-                    print(f"[DEBUG] SUCCESS: Compute cluster '{compute_name}' permanently deleted.")
-                except Exception as cleanup_error:
-                    print("\n--- [DEBUG] FATAL CLEANUP ERROR ---")
-                    print(f"FAILED TO DELETE CLUSTER {compute_name}. You may be charged!")
-                    traceback.print_exc()
-                    print("--------------------------------------\n")
-            else:
-                print("[DEBUG] Cleanup bypassed: Compute cluster was never fully created.")
-            
-            with self.training_state_lock:
-                self.azure_ml_client_for_cancel = None
-                self.azure_active_job_name = ""
-
-            print("[DEBUG] WORKFLOW FINISHED.\n")
-            self.root.after(0, self.finish_training_session)
 
     def show_error(self, message):
         self.status_var.set("Process halted.")

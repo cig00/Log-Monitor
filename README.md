@@ -13,6 +13,75 @@ The desktop app now uses a modular-monolith architecture: `app.py` remains the T
 
 The project also includes Docker, Apptainer, and Slurm helpers for reproducible training outside the desktop UI.
 
+## Error Regression Automation
+
+Two CLI programs support the error-to-report-to-fix workflow:
+
+1. `analyze_log_error.py`
+   - accepts an expected error message and a log file
+   - finds the first matching log line
+   - extracts git diffs for the selected window around that first occurrence
+   - sends the error context and diffs to the OpenAI API
+   - writes JSON and Markdown reports
+   - creates a Jira bug when Jira environment variables are configured
+
+2. `create_error_fix_pr.py`
+   - reads the JSON report
+   - creates a fix branch
+   - asks the OpenAI API for a unified diff patch, or runs an optional local fixer command
+   - commits the resulting patch
+   - pushes the branch and opens a GitHub PR with `gh pr create`
+
+Example analysis:
+
+```bash
+python analyze_log_error.py \
+  --log-file /path/to/app.log \
+  --error-message "database timeout" \
+  --repo . \
+  --days-before 3
+```
+
+If you want to force the analysis to skip Jira:
+
+```bash
+python analyze_log_error.py --log-file /path/to/app.log --error-message "database timeout" --no-jira
+```
+
+Required Jira environment variables when posting issues:
+
+```bash
+export JIRA_BASE_URL="https://your-domain.atlassian.net"
+export JIRA_EMAIL="you@example.com"
+export JIRA_API_TOKEN="..."
+export JIRA_PROJECT_KEY="OPS"
+export JIRA_ISSUE_TYPE="Bug"
+```
+
+Required OpenAI environment variables:
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="gpt-4.1-mini"
+```
+
+Optional command overrides are still supported for local coding agents. These commands must read the prompt from stdin:
+
+```bash
+export COPILOT_COMMAND="your-analysis-command"
+export COPILOT_FIX_COMMAND="your-code-fix-command"
+```
+
+Then create a fix PR from a report:
+
+```bash
+python create_error_fix_pr.py \
+  --report outputs/error_reports/error_analysis_YYYYMMDDTHHMMSSZ.json \
+  --repo .
+```
+
+The PR program expects the GitHub CLI (`gh`) to be authenticated unless you pass `--skip-push`.
+
 ## What The Project Does
 
 At a high level, the application turns unlabeled operational logs into a hosted classifier:

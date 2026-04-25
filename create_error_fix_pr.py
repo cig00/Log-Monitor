@@ -208,7 +208,7 @@ def _apply_unified_diff(repo: Path, unified_diff: str) -> str | None:
 
 
 def _save_failed_patch(repo: Path, branch_name: str, unified_diff: str, apply_error: str) -> Path:
-    output_dir = repo / "outputs" / "failed_patches"
+    output_dir = repo / ".git" / "failed_patches"
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     safe_branch = branch_name.replace("/", "_")

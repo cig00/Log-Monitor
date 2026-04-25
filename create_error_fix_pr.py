@@ -76,7 +76,14 @@ def main() -> int:
         if not fix_plan.unified_diff:
             print("OpenAI returned an empty unified diff.")
             return 1
-        _apply_unified_diff(repo, fix_plan.unified_diff)
+        apply_error = _apply_unified_diff(repo, fix_plan.unified_diff)
+        if apply_error:
+            failed_patch_path = _save_failed_patch(repo, branch_name, fix_plan.unified_diff, apply_error)
+            print("OpenAI returned a patch, but git could not apply it.")
+            print(f"git apply error: {apply_error}")
+            print(f"Failed patch saved to: {failed_patch_path}")
+            print("No commit or PR was created.")
+            return 1
 
     status = _git(repo, ["status", "--porcelain"]).strip()
     if not status:
@@ -187,7 +194,7 @@ def _collect_repository_context(repo: Path, *, max_files: int = 25, max_chars: i
     return context
 
 
-def _apply_unified_diff(repo: Path, unified_diff: str) -> None:
+def _apply_unified_diff(repo: Path, unified_diff: str) -> str | None:
     completed = subprocess.run(
         ["git", "-C", str(repo), "apply", "--whitespace=fix"],
         input=unified_diff,
@@ -196,7 +203,28 @@ def _apply_unified_diff(repo: Path, unified_diff: str) -> None:
         check=False,
     )
     if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip())
+        return completed.stderr.strip() or completed.stdout.strip()
+    return None
+
+
+def _save_failed_patch(repo: Path, branch_name: str, unified_diff: str, apply_error: str) -> Path:
+    output_dir = repo / "outputs" / "failed_patches"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_branch = branch_name.replace("/", "_")
+    patch_path = output_dir / f"{safe_branch}_{stamp}.patch"
+    patch_path.write_text(
+        "\n".join(
+            [
+                f"# git apply error: {apply_error}",
+                "",
+                unified_diff,
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return patch_path
 
 
 def _git(repo: Path, args: list[str]) -> str:

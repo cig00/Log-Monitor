@@ -113,7 +113,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["azure_data_asset_id"], "/asset/id")
         self.assertEqual(fake_client.data.created.type, "uri_file")
         self.assertEqual(fake_client.data.created.tags, {"pipeline_id": "abc"})
-        self.assertEqual(len(service.sanitize_azure_asset_version("a" * 64)), 50)
+        self.assertEqual(len(service.sanitize_azure_asset_version("a" * 64)), 30)
 
 
 if __name__ == "__main__":

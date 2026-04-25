@@ -569,7 +569,7 @@ Azure training flow:
 
 Azure job notes:
 
-- Azure data asset versions are derived from the local dataset SHA-256 hash and truncated to Azure's 50-character version limit, so identical labeled CSV content reuses the same version.
+- Azure data asset versions are derived from the local dataset SHA-256 hash and truncated to Azure's 30-character version limit, so identical labeled CSV content reuses the same version.
 - The registered data asset URI is written into the CSV sidecar and training metadata as `azure_data_asset_uri`.
 - The job uses the curated environment `AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest`.
 - MLflow env vars are injected into the Azure job when tracking is enabled.
@@ -674,11 +674,8 @@ Azure scoring notes:
 Azure hosting instance selection:
 
 - CPU tries these sizes in order:
-  - `Standard_D2as_v4`
-  - `Standard_DS2_v2`
-  - `Standard_DS1_v2`
-  - `Standard_F2s_v2`
   - `Standard_DS3_v2`
+  - `Standard_E4s_v3`
 - GPU tries:
   - `Standard_NC4as_T4_v3`
   - `Standard_NC6s_v3`

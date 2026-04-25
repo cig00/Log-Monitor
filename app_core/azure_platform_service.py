@@ -6,6 +6,7 @@ import re
 import tempfile
 import time
 import zipfile
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -90,7 +91,7 @@ class AzurePlatformService:
             cleaned = (cleaned + "logmonitor")[:max_length]
         return cleaned or "logmonitorstore"
 
-    def sanitize_azure_asset_version(self, raw_value: str, max_length: int = 50) -> str:
+    def sanitize_azure_asset_version(self, raw_value: str, max_length: int = 30) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "-", clean_optional_string(raw_value))
         cleaned = re.sub(r"-+", "-", cleaned).strip("-._")
         cleaned = cleaned[:max_length].strip("-._")
@@ -161,7 +162,7 @@ class AzurePlatformService:
         if clean_optional_string(azure_compute).lower() == "gpu":
             return self.dedupe_instance_candidates(["Standard_NC4as_T4_v3", "Standard_NC6s_v3"])
         return self.dedupe_instance_candidates(
-            ["Standard_D2as_v4", "Standard_DS2_v2", "Standard_DS1_v2", "Standard_F2s_v2", "Standard_E2s_v3", "Standard_E4s_v3", "Standard_DS3_v2"]
+            ["Standard_DS3_v2", "Standard_E4s_v3"]
         )
 
     def get_azure_batch_timezone_options(self) -> list[str]:
@@ -176,6 +177,135 @@ class AzurePlatformService:
             "Pacific Standard Time": "America/Los_Angeles",
         }
         return mapping.get(clean_optional_string(timezone_name), "UTC")
+
+    def wait_for_azure_poller(
+        self,
+        poller,
+        *,
+        action: str,
+        emit: Reporter | None = None,
+        timeout_seconds: int = 3600,
+        poll_interval_seconds: int = 30,
+    ):
+        deadline = time.time() + max(int(timeout_seconds), 1)
+        started_at = time.time()
+        interval = max(int(poll_interval_seconds), 1)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for Azure operation: {action}.")
+            try:
+                return poller.result(timeout=min(interval, remaining))
+            except AttributeError as exc:
+                message = clean_optional_string(exc)
+                if "auth_mode" in message or "endpoint_compute_type" in message:
+                    if emit:
+                        emit(f"{action} returned an incomplete Azure SDK response; verifying the resource directly...")
+                    return None
+                raise
+            except FutureTimeoutError:
+                if emit:
+                    elapsed_minutes = (time.time() - started_at) / 60.0
+                    status_text = ""
+                    try:
+                        status_text = clean_optional_string(poller.status())
+                    except Exception:
+                        status_text = ""
+                    suffix = f" Status: {status_text}" if status_text else ""
+                    emit(f"{action} still running ({elapsed_minutes:.1f} min elapsed).{suffix}")
+
+    def wait_for_online_endpoint_ready(
+        self,
+        ml_client,
+        endpoint_name: str,
+        *,
+        action: str = "Waiting for Azure online endpoint",
+        emit: Reporter | None = None,
+        timeout_seconds: int = 1800,
+        poll_interval_seconds: int = 15,
+    ):
+        deadline = time.time() + max(int(timeout_seconds), 1)
+        interval = max(int(poll_interval_seconds), 1)
+        last_state = ""
+        while time.time() < deadline:
+            endpoint = ml_client.online_endpoints.get(endpoint_name)
+            if endpoint is not None:
+                state = clean_optional_string(getattr(endpoint, "provisioning_state", ""))
+                if state:
+                    last_state = state
+                state_lower = state.lower()
+                if state_lower == "succeeded":
+                    return endpoint
+                if state_lower in {"failed", "canceled"}:
+                    raise RuntimeError(f"Azure endpoint '{endpoint_name}' provisioning {state_lower}.")
+            if emit:
+                emit(f"{action}: {last_state or 'pending'}")
+            time.sleep(interval)
+        raise TimeoutError(
+            f"Timed out waiting for Azure endpoint '{endpoint_name}' to become ready."
+            + (f" Last state: {last_state}." if last_state else "")
+        )
+
+    def get_raw_online_deployment(self, ml_client, endpoint_name: str, deployment_name: str):
+        deployments_client = ml_client.online_deployments
+        raw_client = getattr(deployments_client, "_online_deployment", None)
+        resource_group_name = clean_optional_string(getattr(deployments_client, "_resource_group_name", ""))
+        workspace_name = clean_optional_string(getattr(deployments_client, "_workspace_name", ""))
+        init_kwargs = getattr(deployments_client, "_init_kwargs", {})
+        if raw_client is None or not resource_group_name or not workspace_name:
+            return deployments_client.get(name=deployment_name, endpoint_name=endpoint_name)
+        return raw_client.get(
+            endpoint_name=endpoint_name,
+            deployment_name=deployment_name,
+            resource_group_name=resource_group_name,
+            workspace_name=workspace_name,
+            **init_kwargs,
+        )
+
+    def wait_for_online_deployment_ready(
+        self,
+        ml_client,
+        endpoint_name: str,
+        deployment_name: str,
+        *,
+        action: str = "Waiting for Azure online deployment",
+        emit: Reporter | None = None,
+        timeout_seconds: int = 3600,
+        poll_interval_seconds: int = 30,
+    ):
+        deadline = time.time() + max(int(timeout_seconds), 1)
+        interval = max(int(poll_interval_seconds), 1)
+        last_state = ""
+        while time.time() < deadline:
+            try:
+                deployment = self.get_raw_online_deployment(ml_client, endpoint_name, deployment_name)
+                properties = getattr(deployment, "properties", None)
+                state = clean_optional_string(
+                    getattr(deployment, "provisioning_state", "")
+                    or getattr(properties, "provisioning_state", "")
+                )
+                if state:
+                    last_state = state
+                state_lower = state.lower()
+                if state_lower == "succeeded":
+                    return deployment
+                if state_lower in {"failed", "canceled"}:
+                    raise RuntimeError(f"Azure deployment '{deployment_name}' provisioning {state_lower}.")
+            except AttributeError as exc:
+                if "endpoint_compute_type" not in clean_optional_string(exc):
+                    raise
+                last_state = last_state or "response incomplete"
+            except Exception as exc:
+                if "not found" not in clean_optional_string(exc).lower():
+                    raise
+                last_state = last_state or "not found"
+            if emit:
+                emit(f"{action}: {last_state or 'pending'}")
+            time.sleep(interval)
+        raise TimeoutError(
+            f"Timed out waiting for Azure deployment '{deployment_name}' to become ready."
+            + (f" Last state: {last_state}." if last_state else "")
+        )
 
     def parse_daily_time(self, raw_value: str) -> tuple[int, int]:
         clean_value = clean_optional_string(raw_value)
@@ -654,7 +784,21 @@ class AzurePlatformService:
         if emit:
             emit("Creating Azure online endpoint...")
         endpoint = ManagedOnlineEndpoint(name=endpoint_name, auth_mode=endpoint_auth_mode, description="Hosted prediction API for Log Monitor")
-        ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+        self.wait_for_azure_poller(
+            ml_client.online_endpoints.begin_create_or_update(endpoint),
+            action="Creating Azure online endpoint",
+            emit=emit,
+            timeout_seconds=1800,
+        )
+        endpoint_details = self.wait_for_online_endpoint_ready(
+            ml_client,
+            endpoint_name,
+            action="Waiting for Azure online endpoint to finish creating",
+            emit=emit,
+            timeout_seconds=1800,
+        )
+        if endpoint_details is None:
+            raise RuntimeError(f"Azure endpoint '{endpoint_name}' was not found after create/update completed.")
         selected_instance_type = ""
         last_error = None
         for instance_type in instance_candidates:
@@ -667,11 +811,24 @@ class AzurePlatformService:
                     endpoint_name=endpoint_name,
                     model=registered_model,
                     environment=environment,
-                    code_configuration=CodeConfiguration(code=self.project_dir, scoring_script="azure_score.py"),
+                    code_configuration=CodeConfiguration(code=str(self.project_dir), scoring_script="azure_score.py"),
                     instance_type=instance_type,
                     instance_count=1,
                 )
-                ml_client.online_deployments.begin_create_or_update(deployment).result()
+                self.wait_for_azure_poller(
+                    ml_client.online_deployments.begin_create_or_update(deployment),
+                    action=f"Deploying model to Azure endpoint ({instance_type})",
+                    emit=emit,
+                    timeout_seconds=3600,
+                )
+                self.wait_for_online_deployment_ready(
+                    ml_client,
+                    endpoint_name,
+                    deployment_name,
+                    action=f"Waiting for Azure deployment ({instance_type})",
+                    emit=emit,
+                    timeout_seconds=3600,
+                )
                 selected_instance_type = instance_type
                 break
             except Exception as exc:
@@ -683,9 +840,27 @@ class AzurePlatformService:
             if last_error is not None:
                 raise last_error
             raise RuntimeError("Azure deployment did not complete and no scoring instance was selected.")
+        endpoint = ml_client.online_endpoints.get(endpoint_name) or ManagedOnlineEndpoint(
+            name=endpoint_name,
+            auth_mode=endpoint_auth_mode,
+            description="Hosted prediction API for Log Monitor",
+        )
+        if not clean_optional_string(getattr(endpoint, "auth_mode", "")):
+            endpoint.auth_mode = endpoint_auth_mode
         endpoint.traffic = {deployment_name: 100}
-        ml_client.online_endpoints.begin_create_or_update(endpoint).result()
-        endpoint_details = ml_client.online_endpoints.get(endpoint_name)
+        self.wait_for_azure_poller(
+            ml_client.online_endpoints.begin_create_or_update(endpoint),
+            action="Routing Azure online endpoint traffic",
+            emit=emit,
+            timeout_seconds=900,
+        )
+        endpoint_details = self.wait_for_online_endpoint_ready(
+            ml_client,
+            endpoint_name,
+            action="Waiting for Azure online endpoint traffic routing",
+            emit=emit,
+            timeout_seconds=900,
+        )
         scoring_uri = clean_optional_string(getattr(endpoint_details, "scoring_uri", ""))
         if not scoring_uri:
             raise RuntimeError("Azure deployment completed but no scoring URI was returned.")
@@ -805,7 +980,7 @@ class AzurePlatformService:
             model=registered_model,
             environment=environment,
             compute=compute_name,
-            code_configuration=CodeConfiguration(code=self.project_dir, scoring_script="azure_batch_score.py"),
+            code_configuration=CodeConfiguration(code=str(self.project_dir), scoring_script="azure_batch_score.py"),
             settings=ModelBatchDeploymentSettings(mini_batch_size=1, instance_count=1),
         )
         ml_client.batch_deployments.begin_create_or_update(deployment).result()

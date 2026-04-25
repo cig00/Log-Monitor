@@ -158,6 +158,122 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(fake_client.data.created.tags, {"pipeline_id": "abc"})
         self.assertEqual(len(service.sanitize_azure_asset_version("a" * 64)), 30)
 
+    def test_azure_platform_deploys_serverless_endpoint_from_catalog_model_id(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+
+        class FakeServerlessEndpoint:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakePoller:
+            def result(self, timeout=None):
+                return SimpleNamespace(provisioning_state="Succeeded")
+
+        class FakeServerlessEndpointOperations:
+            def __init__(self):
+                self.created = None
+
+            def begin_create_or_update(self, endpoint):
+                self.created = endpoint
+                return FakePoller()
+
+            def get(self, name):
+                return SimpleNamespace(
+                    name=name,
+                    provisioning_state="Succeeded",
+                    scoring_uri=f"https://{name}.eastus.inference.ai.azure.com/v1/chat/completions",
+                    auth_mode="key",
+                )
+
+            def list(self):
+                return [
+                    SimpleNamespace(
+                        name=self.created.name,
+                        model_id=self.created.model_id,
+                        provisioning_state="Succeeded",
+                        scoring_uri=f"https://{self.created.name}.eastus.inference.ai.azure.com/v1/chat/completions",
+                        auth_mode="key",
+                    )
+                ]
+
+        fake_ops = FakeServerlessEndpointOperations()
+        fake_client = SimpleNamespace(serverless_endpoints=fake_ops)
+
+        self.assertEqual(service.get_default_serverless_model_id(), "azureml://registries/azureml/models/Phi-4-mini-instruct")
+        self.assertEqual(
+            service.build_default_serverless_endpoint_name(
+                "azureml://registries/azureml/models/Phi-4-mini-instruct/versions/1",
+                suffix="1234567890",
+            ),
+            "log-monitor-phi-4-mini-instruct-1234567890",
+        )
+
+        with mock.patch("app_core.azure_platform_service.ServerlessEndpoint", FakeServerlessEndpoint):
+            result = service.deploy_azure_serverless_endpoint(
+                fake_client,
+                model_id="azureml://registries/azureml/models/Phi-3-mini/versions/7",
+                endpoint_name="1 Custom Endpoint",
+            )
+
+        self.assertEqual(fake_ops.created.name, "log-monitor-1-custom-endpoint")
+        self.assertEqual(fake_ops.created.model_id, "azureml://registries/azureml/models/Phi-3-mini")
+        self.assertEqual(fake_ops.created.auth_mode, "key")
+        self.assertEqual(result["endpoint_name"], "log-monitor-1-custom-endpoint")
+        self.assertIn("/v1/chat/completions", result["api_url"])
+        self.assertTrue(result["visible_in_workspace_list"])
+        self.assertEqual(result["workspace_serverless_endpoint_names"], ["log-monitor-1-custom-endpoint"])
+
+    def test_azure_platform_creates_serverless_endpoint_with_documented_arm_shape(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        calls = []
+
+        def fake_management_request(credential, method, url, payload=None, expected_statuses=(200, 201, 202)):
+            calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "payload": payload,
+                    "expected_statuses": expected_statuses,
+                }
+            )
+            if method == "GET":
+                return {
+                    "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.MachineLearningServices/workspaces/ws/serverlessEndpoints/log-monitor-phi",
+                    "name": "log-monitor-phi",
+                    "type": "Microsoft.MachineLearningServices/workspaces/serverlessEndpoints",
+                    "location": "eastus",
+                    "kind": "ServerlessEndpoint",
+                    "sku": {"name": "Consumption"},
+                    "properties": {
+                        "provisioningState": "Succeeded",
+                        "authMode": "Key",
+                        "modelSettings": {"modelId": "azureml://registries/azureml/models/Phi-4-mini-instruct"},
+                    },
+                }
+            return {}
+
+        service.azure_management_json_request = fake_management_request
+        resource = service.create_arm_serverless_endpoint(
+            credential=object(),
+            sub_id="sub",
+            endpoint_name="log-monitor-phi",
+            model_id="azureml://registries/azureml/models/Phi-4-mini-instruct",
+            location="eastus",
+        )
+
+        put_call = calls[0]
+        self.assertEqual(put_call["method"], "PUT")
+        self.assertIn("api-version=2024-04-01-preview", put_call["url"])
+        self.assertEqual(put_call["payload"]["kind"], "ServerlessEndpoint")
+        self.assertEqual(put_call["payload"]["sku"], {"name": "Consumption"})
+        self.assertEqual(put_call["payload"]["properties"]["authMode"], "Key")
+        self.assertEqual(
+            put_call["payload"]["properties"]["modelSettings"]["modelId"],
+            "azureml://registries/azureml/models/Phi-4-mini-instruct",
+        )
+        self.assertEqual(service.get_arm_provisioning_state(resource), "Succeeded")
+
 
 if __name__ == "__main__":
     unittest.main()

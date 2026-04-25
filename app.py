@@ -5,6 +5,7 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import os
 import sys
+import time
 import traceback
 import webbrowser
 from dataclasses import asdict
@@ -136,6 +137,16 @@ class LogProcessorApp:
         self.azure_host_tenant_var = tk.StringVar(value="")
         self.azure_host_compute_var = tk.StringVar(value="cpu")
         self.azure_host_service_var = tk.StringVar(value="queued_batch")
+        default_serverless_model_id = self.azure_platform_service.get_default_serverless_model_id()
+        default_serverless_endpoint_name = self.azure_platform_service.build_default_serverless_endpoint_name(
+            default_serverless_model_id,
+            suffix=str(int(time.time())),
+        )
+        self.azure_serverless_endpoint_name_is_auto = True
+        self.azure_serverless_endpoint_name_setting = False
+        self.azure_serverless_last_auto_endpoint_name = default_serverless_endpoint_name
+        self.azure_serverless_model_id_var = tk.StringVar(value=default_serverless_model_id)
+        self.azure_serverless_endpoint_name_var = tk.StringVar(value=default_serverless_endpoint_name)
         self.azure_batch_input_var = tk.StringVar(value="")
         self.azure_batch_time_var = tk.StringVar(value="02:00")
         self.azure_batch_timezone_var = tk.StringVar(value="UTC")
@@ -145,6 +156,7 @@ class LogProcessorApp:
         self.azure_llmops_url_var = tk.StringVar(value="")
         self.azure_hosted_endpoint_name_var = tk.StringVar(value="")
         self.azure_host_sub_var.trace_add("write", lambda *_: self.refresh_azure_dashboard_links())
+        self.azure_serverless_endpoint_name_var.trace_add("write", self.on_azure_serverless_endpoint_name_changed)
         self.prompt_test_window = None
         self.prompt_test_tree = None
         self.prompt_test_run_btn = None
@@ -526,7 +538,34 @@ class LogProcessorApp:
             value="queued_batch",
             command=self.on_hosting_mode_change,
         )
-        self.azure_host_queue_batch_radio.grid(row=5, column=2, columnspan=2, sticky="w", padx=5, pady=5)
+        self.azure_host_queue_batch_radio.grid(row=5, column=2, sticky="w", padx=5, pady=5)
+        self.azure_host_serverless_radio = ttk.Radiobutton(
+            hosting_frame,
+            text="Serverless endpoint",
+            variable=self.azure_host_service_var,
+            value="serverless",
+            command=self.on_hosting_mode_change,
+        )
+        self.azure_host_serverless_radio.grid(row=5, column=3, sticky="w", padx=5, pady=5)
+
+        self.azure_serverless_model_id_label = ttk.Label(hosting_frame, text="Serverless Model ID:")
+        self.azure_serverless_model_id_label.grid(row=6, column=0, sticky="w", padx=5, pady=5)
+        self.azure_serverless_model_id_entry = ttk.Entry(
+            hosting_frame,
+            textvariable=self.azure_serverless_model_id_var,
+            width=30,
+        )
+        self.azure_serverless_model_id_entry.grid(row=6, column=1, sticky="ew", padx=5, pady=5)
+        self.azure_serverless_model_id_entry.bind("<FocusOut>", self.on_azure_serverless_model_id_focus_out)
+
+        self.azure_serverless_endpoint_name_label = ttk.Label(hosting_frame, text="Endpoint Name:")
+        self.azure_serverless_endpoint_name_label.grid(row=6, column=2, sticky="w", padx=5, pady=5)
+        self.azure_serverless_endpoint_name_entry = ttk.Entry(
+            hosting_frame,
+            textvariable=self.azure_serverless_endpoint_name_var,
+            width=20,
+        )
+        self.azure_serverless_endpoint_name_entry.grid(row=6, column=3, sticky="ew", padx=5, pady=5)
 
         self.azure_host_sub_label = ttk.Label(hosting_frame, text="Azure Host Sub ID:")
         self.azure_host_sub_label.grid(row=7, column=0, sticky="w", padx=5, pady=5)
@@ -590,6 +629,17 @@ class LogProcessorApp:
             justify="left",
         )
         self.azure_batch_note_label.grid(row=10, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
+
+        self.azure_serverless_note_label = ttk.Label(
+            hosting_frame,
+            text=(
+                "Serverless hosting uses an auto-filled Azure ML catalog model ID and endpoint name. "
+                "You can edit either field; the local generated model folder is not uploaded."
+            ),
+            wraplength=460,
+            justify="left",
+        )
+        self.azure_serverless_note_label.grid(row=10, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
 
         self.host_service_btn = ttk.Button(
             hosting_frame,
@@ -1001,6 +1051,46 @@ class LogProcessorApp:
     def on_azure_host_compute_change(self, event=None):
         self.refresh_azure_host_instance_options()
 
+    def on_azure_serverless_endpoint_name_changed(self, *_):
+        if self.azure_serverless_endpoint_name_setting:
+            return
+        current_endpoint_name = clean_optional_string(self.azure_serverless_endpoint_name_var.get())
+        if current_endpoint_name and current_endpoint_name != self.azure_serverless_last_auto_endpoint_name:
+            self.azure_serverless_endpoint_name_is_auto = False
+
+    def on_azure_serverless_model_id_focus_out(self, event=None):
+        self.ensure_azure_serverless_defaults(refresh_endpoint=False)
+
+    def set_azure_serverless_endpoint_name(self, endpoint_name: str, *, auto: bool):
+        clean_endpoint_name = clean_optional_string(endpoint_name)
+        self.azure_serverless_endpoint_name_setting = True
+        try:
+            self.azure_serverless_endpoint_name_var.set(clean_endpoint_name)
+        finally:
+            self.azure_serverless_endpoint_name_setting = False
+        if auto:
+            self.azure_serverless_last_auto_endpoint_name = clean_endpoint_name
+            self.azure_serverless_endpoint_name_is_auto = True
+
+    def ensure_azure_serverless_defaults(self, refresh_endpoint: bool = False):
+        model_id = clean_optional_string(self.azure_serverless_model_id_var.get())
+        if not model_id:
+            model_id = self.azure_platform_service.get_default_serverless_model_id()
+            self.azure_serverless_model_id_var.set(model_id)
+        normalized_model_id = self.azure_platform_service.normalize_serverless_model_id(model_id)
+        if normalized_model_id and normalized_model_id != model_id:
+            self.azure_serverless_model_id_var.set(normalized_model_id)
+            model_id = normalized_model_id
+
+        endpoint_name = clean_optional_string(self.azure_serverless_endpoint_name_var.get())
+        should_generate_endpoint = not endpoint_name or self.azure_serverless_endpoint_name_is_auto
+        if should_generate_endpoint:
+            generated_endpoint_name = self.azure_platform_service.build_default_serverless_endpoint_name(
+                model_id,
+                suffix=str(int(time.time())),
+            )
+            self.set_azure_serverless_endpoint_name(generated_endpoint_name, auto=True)
+
 
 
 
@@ -1065,15 +1155,21 @@ class LogProcessorApp:
         is_azure = self.hosting_mode_var.get().strip() == "azure"
         azure_service = self.azure_host_service_var.get().strip()
         is_queued_batch = is_azure and azure_service == "queued_batch"
+        is_serverless = is_azure and azure_service == "serverless"
+        if is_serverless:
+            self.ensure_azure_serverless_defaults(refresh_endpoint=False)
         show_batch_schedule = is_queued_batch
         azure_widgets = [
             self.azure_host_service_label,
             self.azure_host_online_radio,
             self.azure_host_queue_batch_radio,
+            self.azure_host_serverless_radio,
             self.azure_host_sub_label,
             self.azure_host_sub_entry,
             self.azure_host_tenant_label,
             self.azure_host_tenant_entry,
+        ]
+        azure_compute_widgets = [
             self.azure_host_compute_label,
             self.azure_host_compute_combo,
             self.azure_host_instance_label,
@@ -1084,8 +1180,24 @@ class LogProcessorApp:
                 widget.grid()
             else:
                 widget.grid_remove()
+        for widget in azure_compute_widgets:
+            if is_azure and not is_serverless:
+                widget.grid()
+            else:
+                widget.grid_remove()
         for widget in (self.azure_batch_time_label, self.azure_batch_time_entry, self.azure_batch_timezone_label, self.azure_batch_timezone_combo, self.azure_batch_note_label):
             if show_batch_schedule:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        for widget in (
+            self.azure_serverless_model_id_label,
+            self.azure_serverless_model_id_entry,
+            self.azure_serverless_endpoint_name_label,
+            self.azure_serverless_endpoint_name_entry,
+            self.azure_serverless_note_label,
+        ):
+            if is_serverless:
                 widget.grid()
             else:
                 widget.grid_remove()
@@ -1287,19 +1399,27 @@ class LogProcessorApp:
 
 
     def start_hosting_thread(self):
+        hosting_mode = self.hosting_mode_var.get().strip() or "local"
+        azure_service = clean_optional_string(self.azure_host_service_var.get()) or "queued_batch"
+        is_serverless = hosting_mode == "azure" and azure_service == "serverless"
         model_path = clean_optional_string(self.hosted_model_path_var.get())
-        if not model_path:
+        resolved_model_dir = ""
+        if not model_path and not is_serverless:
             messagebox.showwarning("Hosting", "Please select the generated model directory first.")
             return
 
-        try:
-            resolved_model_dir = discover_model_dir(model_path)
-        except Exception as exc:
-            messagebox.showerror("Hosting", f"Could not locate a saved model in that path.\n\n{exc}")
-            return
+        if model_path:
+            try:
+                resolved_model_dir = discover_model_dir(model_path)
+            except Exception as exc:
+                if not is_serverless:
+                    messagebox.showerror("Hosting", f"Could not locate a saved model in that path.\n\n{exc}")
+                    return
+                resolved_model_dir = model_path
 
-        self.hosted_model_path_var.set(resolved_model_dir)
-        self.refresh_hosted_model_inventory(preferred_path=resolved_model_dir)
+        if resolved_model_dir:
+            self.hosted_model_path_var.set(resolved_model_dir)
+            self.refresh_hosted_model_inventory(preferred_path=resolved_model_dir)
         self.hosting_api_url_var.set("")
         self.hosting_mode_summary_var.set("")
 
@@ -1307,7 +1427,6 @@ class LogProcessorApp:
             messagebox.showwarning("Hosting In Progress", "A hosting workflow is already running.")
             return
 
-        hosting_mode = self.hosting_mode_var.get().strip() or "local"
         request_kwargs = {
             "model_dir": resolved_model_dir,
             "mode": hosting_mode,
@@ -1321,22 +1440,33 @@ class LogProcessorApp:
             tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
             azure_compute = clean_optional_string(self.azure_host_compute_var.get()) or "cpu"
             azure_instance_type = clean_optional_string(self.azure_host_instance_var.get())
-            azure_service = clean_optional_string(self.azure_host_service_var.get()) or "queued_batch"
+            if azure_service == "serverless":
+                self.ensure_azure_serverless_defaults(refresh_endpoint=True)
+            serverless_model_id = clean_optional_string(self.azure_serverless_model_id_var.get())
+            serverless_endpoint_name = clean_optional_string(self.azure_serverless_endpoint_name_var.get())
             batch_input_uri = clean_optional_string(self.azure_batch_input_var.get())
             batch_time = clean_optional_string(self.azure_batch_time_var.get())
             batch_timezone = clean_optional_string(self.azure_batch_timezone_var.get()) or "UTC"
             self.azure_host_sub_var.set(sub_id)
             self.azure_host_tenant_var.set(tenant_id)
             self.azure_host_compute_var.set(azure_compute)
-            valid_host_sizes = self.azure_platform_service.get_azure_host_instance_candidates(azure_compute)
-            if not azure_instance_type:
-                azure_instance_type = valid_host_sizes[0] if valid_host_sizes else ""
-                self.azure_host_instance_var.set(azure_instance_type)
-            if valid_host_sizes and azure_instance_type not in valid_host_sizes:
-                self.finish_hosting_action()
-                messagebox.showwarning("Hosting", "Please select a supported Azure VM size for hosting.")
-                return
-            if azure_service == "batch":
+            if azure_service != "serverless":
+                valid_host_sizes = self.azure_platform_service.get_azure_host_instance_candidates(azure_compute)
+                if not azure_instance_type:
+                    azure_instance_type = valid_host_sizes[0] if valid_host_sizes else ""
+                    self.azure_host_instance_var.set(azure_instance_type)
+                if valid_host_sizes and azure_instance_type not in valid_host_sizes:
+                    self.finish_hosting_action()
+                    messagebox.showwarning("Hosting", "Please select a supported Azure VM size for hosting.")
+                    return
+            if azure_service == "serverless":
+                batch_hour = 0
+                batch_minute = 0
+                if not serverless_model_id:
+                    self.finish_hosting_action()
+                    messagebox.showwarning("Hosting", "Please provide a Serverless Model ID from the Azure ML model catalog.")
+                    return
+            elif azure_service == "batch":
                 if not batch_input_uri:
                     self.finish_hosting_action()
                     messagebox.showwarning("Hosting", "Please provide a batch input URI for the daily batch schedule.")
@@ -1382,6 +1512,8 @@ class LogProcessorApp:
                     "azure_compute": azure_compute,
                     "azure_instance_type": azure_instance_type,
                     "azure_service": azure_service,
+                    "azure_serverless_model_id": serverless_model_id,
+                    "azure_serverless_endpoint_name": serverless_endpoint_name,
                     "batch_input_uri": batch_input_uri,
                     "batch_hour": batch_hour,
                     "batch_minute": batch_minute,

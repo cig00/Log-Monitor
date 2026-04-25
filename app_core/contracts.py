@@ -56,6 +56,8 @@ class HostingRequest:
     azure_compute: str = "cpu"
     azure_instance_type: str = ""
     azure_service: str = "queued_batch"
+    azure_serverless_model_id: str = ""
+    azure_serverless_endpoint_name: str = ""
     batch_input_uri: str = ""
     batch_hour: int = 0
     batch_minute: int = 0

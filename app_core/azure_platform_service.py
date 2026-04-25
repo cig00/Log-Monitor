@@ -34,6 +34,10 @@ try:
         RecurrenceTrigger,
         Workspace,
     )
+    try:
+        from azure.ai.ml.entities import ServerlessEndpoint
+    except Exception:
+        ServerlessEndpoint = None
     from azure.identity import InteractiveBrowserCredential
     from azure.mgmt.resource import ResourceManagementClient
     AZURE_AVAILABLE = True
@@ -57,6 +61,7 @@ except Exception:
     ModelBatchDeploymentSettings = Any
     RecurrencePattern = Any
     RecurrenceTrigger = Any
+    ServerlessEndpoint = None
     Workspace = Any
     InteractiveBrowserCredential = Any
     ResourceManagementClient = Any
@@ -66,6 +71,7 @@ from mlops_utils import clean_optional_string, read_json
 
 
 Reporter = Callable[[str], None]
+DEFAULT_SERVERLESS_MODEL_ID = "azureml://registries/azureml/models/Phi-4-mini-instruct"
 
 
 class AzurePlatformService:
@@ -79,6 +85,40 @@ class AzurePlatformService:
         cleaned = re.sub(r"-+", "-", cleaned).strip("-")
         cleaned = cleaned[:max_length].strip("-")
         return cleaned or "log-monitor"
+
+    def sanitize_azure_endpoint_name(self, raw_value: str, max_length: int = 52) -> str:
+        cleaned = re.sub(r"[^a-z0-9-]", "-", clean_optional_string(raw_value).lower())
+        cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+        if not cleaned or not cleaned[0].isalpha():
+            cleaned = f"log-monitor-{cleaned}".strip("-")
+        cleaned = cleaned[:max_length].strip("-")
+        return cleaned or "log-monitor-endpoint"
+
+    def get_default_serverless_model_id(self) -> str:
+        return DEFAULT_SERVERLESS_MODEL_ID
+
+    def normalize_serverless_model_id(self, raw_value: str) -> str:
+        clean_value = clean_optional_string(raw_value).strip()
+        clean_value = re.sub(r"/versions/[^/]+/?$", "", clean_value)
+        return clean_value
+
+    def extract_serverless_model_name(self, model_id: str) -> str:
+        normalized_model_id = self.normalize_serverless_model_id(model_id)
+        if not normalized_model_id:
+            return "model"
+        parts = [part for part in normalized_model_id.replace("\\", "/").split("/") if part]
+        return parts[-1] if parts else "model"
+
+    def build_default_serverless_endpoint_name(self, model_id: str, suffix: str = "") -> str:
+        clean_suffix = self.sanitize_azure_name(suffix, max_length=12) if clean_optional_string(suffix) else ""
+        base_max_length = 52 - len(clean_suffix) - (1 if clean_suffix else 0)
+        base_name = self.sanitize_azure_endpoint_name(
+            f"log-monitor-{self.extract_serverless_model_name(model_id)}",
+            max_length=max(base_max_length, 20),
+        )
+        if clean_suffix:
+            return self.sanitize_azure_endpoint_name(f"{base_name}-{clean_suffix}")
+        return base_name
 
     def ensure_azure_dependencies(self) -> None:
         if not AZURE_AVAILABLE:
@@ -126,12 +166,57 @@ class AzurePlatformService:
             return ""
         return f"https://ml.azure.com/experiments?{query}"
 
+    def build_azure_endpoints_studio_url(self, sub_id: str, tenant_id: str = "") -> str:
+        query = self.build_azure_studio_query(sub_id, tenant_id)
+        if not query:
+            return ""
+        return f"https://ml.azure.com/endpoints?{query}&reloadCount=1"
+
     def build_azure_dashboard_urls(self, sub_id: str, tenant_id: str = "") -> tuple[str, str]:
         query = self.build_azure_studio_query(sub_id, tenant_id)
         if not query:
             return "", ""
         url = f"https://ml.azure.com/experiments?{query}"
         return url, url
+
+    def build_serverless_endpoint_resource_id(self, sub_id: str, endpoint_name: str) -> str:
+        clean_sub_id = clean_optional_string(sub_id)
+        clean_endpoint_name = clean_optional_string(endpoint_name)
+        if not clean_sub_id or not clean_endpoint_name:
+            return ""
+        return (
+            f"/subscriptions/{clean_sub_id}/resourceGroups/{self.resource_group}"
+            f"/providers/Microsoft.MachineLearningServices/workspaces/{self.workspace_name}"
+            f"/serverlessEndpoints/{clean_endpoint_name}"
+        )
+
+    def build_serverless_endpoint_portal_url(self, sub_id: str, tenant_id: str, endpoint_name: str) -> str:
+        resource_id = self.build_serverless_endpoint_resource_id(sub_id, endpoint_name)
+        if not resource_id:
+            return ""
+        tenant_fragment = f"@{tenant_id}/" if clean_optional_string(tenant_id) else ""
+        return f"https://portal.azure.com/#{tenant_fragment}resource{resource_id}/overview"
+
+    def build_serverless_endpoint_management_url(self, sub_id: str, endpoint_name: str, api_version: str = "2024-04-01-preview") -> str:
+        clean_sub_id = clean_optional_string(sub_id)
+        clean_endpoint_name = clean_optional_string(endpoint_name)
+        if not clean_sub_id or not clean_endpoint_name:
+            return ""
+        return (
+            f"https://management.azure.com/subscriptions/{clean_sub_id}/resourceGroups/{self.resource_group}"
+            f"/providers/Microsoft.MachineLearningServices/workspaces/{self.workspace_name}"
+            f"/serverlessEndpoints/{clean_endpoint_name}?api-version={api_version}"
+        )
+
+    def build_serverless_endpoint_collection_management_url(self, sub_id: str, api_version: str = "2024-04-01-preview") -> str:
+        clean_sub_id = clean_optional_string(sub_id)
+        if not clean_sub_id:
+            return ""
+        return (
+            f"https://management.azure.com/subscriptions/{clean_sub_id}/resourceGroups/{self.resource_group}"
+            f"/providers/Microsoft.MachineLearningServices/workspaces/{self.workspace_name}"
+            f"/serverlessEndpoints?api-version={api_version}"
+        )
 
     def dedupe_instance_candidates(self, candidates: list[str]) -> list[str]:
         unique_candidates: list[str] = []
@@ -243,6 +328,41 @@ class AzurePlatformService:
             time.sleep(interval)
         raise TimeoutError(
             f"Timed out waiting for Azure endpoint '{endpoint_name}' to become ready."
+            + (f" Last state: {last_state}." if last_state else "")
+        )
+
+    def wait_for_serverless_endpoint_ready(
+        self,
+        ml_client,
+        endpoint_name: str,
+        *,
+        action: str = "Waiting for Azure serverless endpoint",
+        emit: Reporter | None = None,
+        timeout_seconds: int = 1800,
+        poll_interval_seconds: int = 15,
+    ):
+        deadline = time.time() + max(int(timeout_seconds), 1)
+        interval = max(int(poll_interval_seconds), 1)
+        last_state = ""
+        while time.time() < deadline:
+            endpoint = ml_client.serverless_endpoints.get(endpoint_name)
+            if endpoint is not None:
+                state = clean_optional_string(
+                    getattr(endpoint, "provisioning_state", "")
+                    or getattr(endpoint, "endpoint_state", "")
+                )
+                if state:
+                    last_state = state
+                state_lower = state.lower()
+                if state_lower in {"succeeded", "ready", "healthy"}:
+                    return endpoint
+                if state_lower in {"failed", "canceled", "unhealthy"}:
+                    raise RuntimeError(f"Azure serverless endpoint '{endpoint_name}' provisioning {state_lower}.")
+            if emit:
+                emit(f"{action}: {last_state or 'pending'}")
+            time.sleep(interval)
+        raise TimeoutError(
+            f"Timed out waiting for Azure serverless endpoint '{endpoint_name}' to become ready."
             + (f" Last state: {last_state}." if last_state else "")
         )
 
@@ -394,6 +514,147 @@ class AzurePlatformService:
                 return parsed
             except Exception:
                 return {"raw_body": body_text}
+
+    def get_azure_workspace_location(self, ml_client) -> str:
+        try:
+            workspace = ml_client.workspaces.get(self.workspace_name)
+            return clean_optional_string(getattr(workspace, "location", "")) or "eastus"
+        except Exception:
+            return "eastus"
+
+    def get_arm_provisioning_state(self, resource: dict) -> str:
+        properties = resource.get("properties") if isinstance(resource, dict) else {}
+        if not isinstance(properties, dict):
+            properties = {}
+        return clean_optional_string(
+            properties.get("provisioningState")
+            or properties.get("provisioning_state")
+            or resource.get("provisioningState")
+            or resource.get("provisioning_state")
+        )
+
+    def wait_for_arm_serverless_endpoint_ready(
+        self,
+        credential,
+        sub_id: str,
+        endpoint_name: str,
+        *,
+        api_version: str = "2024-04-01-preview",
+        emit: Reporter | None = None,
+        timeout_seconds: int = 1800,
+        poll_interval_seconds: int = 15,
+    ) -> dict:
+        url = self.build_serverless_endpoint_management_url(sub_id, endpoint_name, api_version=api_version)
+        deadline = time.time() + max(int(timeout_seconds), 1)
+        interval = max(int(poll_interval_seconds), 1)
+        last_state = ""
+        last_resource: dict = {}
+        while time.time() < deadline:
+            resource = self.azure_management_json_request(credential, "GET", url)
+            if isinstance(resource, dict):
+                last_resource = resource
+                state = self.get_arm_provisioning_state(resource)
+                if state:
+                    last_state = state
+                state_lower = state.lower()
+                if state_lower == "succeeded":
+                    return resource
+                if state_lower in {"failed", "canceled"}:
+                    raise RuntimeError(f"Azure serverless endpoint '{endpoint_name}' ARM provisioning {state_lower}.")
+            if emit:
+                emit(f"Waiting for Azure serverless endpoint ARM resource: {last_state or 'pending'}")
+            time.sleep(interval)
+        raise TimeoutError(
+            f"Timed out waiting for Azure serverless endpoint ARM resource '{endpoint_name}' to become ready."
+            + (f" Last state: {last_state}." if last_state else "")
+            + (f" Last response: {json.dumps(last_resource)[:1000]}" if last_resource else "")
+        )
+
+    def summarize_arm_serverless_endpoint_resource(self, resource: dict) -> dict[str, Any]:
+        if not isinstance(resource, dict):
+            return {}
+        properties = resource.get("properties") if isinstance(resource.get("properties"), dict) else {}
+        model_settings = properties.get("modelSettings") if isinstance(properties.get("modelSettings"), dict) else {}
+        inference_endpoint = properties.get("inferenceEndpoint") if isinstance(properties.get("inferenceEndpoint"), dict) else {}
+        sku = resource.get("sku") if isinstance(resource.get("sku"), dict) else {}
+        return {
+            "id": clean_optional_string(resource.get("id")),
+            "name": clean_optional_string(resource.get("name")),
+            "type": clean_optional_string(resource.get("type")),
+            "location": clean_optional_string(resource.get("location")),
+            "kind": clean_optional_string(resource.get("kind")),
+            "sku_name": clean_optional_string(sku.get("name")),
+            "provisioning_state": self.get_arm_provisioning_state(resource),
+            "auth_mode": clean_optional_string(properties.get("authMode") or properties.get("auth_mode")),
+            "model_id": clean_optional_string(model_settings.get("modelId")),
+            "target_uri": clean_optional_string(
+                inference_endpoint.get("targetUri")
+                or inference_endpoint.get("target_uri")
+                or inference_endpoint.get("uri")
+                or properties.get("scoringUri")
+                or properties.get("scoring_uri")
+            ),
+        }
+
+    def list_arm_serverless_endpoint_resources(
+        self,
+        credential,
+        sub_id: str,
+        api_version: str = "2024-04-01-preview",
+    ) -> list[dict[str, Any]]:
+        url = self.build_serverless_endpoint_collection_management_url(sub_id, api_version=api_version)
+        response = self.azure_management_json_request(credential, "GET", url)
+        raw_resources = response.get("value", []) if isinstance(response, dict) else []
+        resources: list[dict[str, Any]] = []
+        for resource in raw_resources:
+            if isinstance(resource, dict):
+                resources.append(self.summarize_arm_serverless_endpoint_resource(resource))
+        return resources
+
+    def create_arm_serverless_endpoint(
+        self,
+        credential,
+        sub_id: str,
+        endpoint_name: str,
+        model_id: str,
+        location: str,
+        auth_mode: str = "Key",
+        api_version: str = "2024-04-01-preview",
+        emit: Reporter | None = None,
+    ) -> dict:
+        clean_endpoint_name = self.sanitize_azure_endpoint_name(endpoint_name)
+        clean_model_id = self.normalize_serverless_model_id(model_id)
+        clean_location = clean_optional_string(location) or "eastus"
+        clean_auth_mode = clean_optional_string(auth_mode) or "Key"
+        payload = {
+            "location": clean_location,
+            "kind": "ServerlessEndpoint",
+            "sku": {"name": "Consumption"},
+            "properties": {
+                "authMode": clean_auth_mode,
+                "modelSettings": {
+                    "modelId": clean_model_id,
+                },
+            },
+        }
+        if emit:
+            emit("Creating Azure serverless endpoint ARM resource...")
+        self.azure_management_json_request(
+            credential,
+            "PUT",
+            self.build_serverless_endpoint_management_url(sub_id, clean_endpoint_name, api_version=api_version),
+            payload=payload,
+            expected_statuses=(200, 201, 202),
+        )
+        return self.wait_for_arm_serverless_endpoint_ready(
+            credential,
+            sub_id,
+            clean_endpoint_name,
+            api_version=api_version,
+            emit=emit,
+            timeout_seconds=1800,
+            poll_interval_seconds=15,
+        )
 
     def load_azure_function_bridge_template(self) -> dict:
         template = read_json(str(self.project_dir / "azure_function_bridge_infra.json"))
@@ -870,6 +1131,164 @@ class AzurePlatformService:
             "instance_type": selected_instance_type,
             "api_url": scoring_uri,
             "attempted_instance_types": attempted_instance_types,
+        }
+
+    def extract_serverless_scoring_uri(self, endpoint: Any) -> str:
+        scoring_uri = clean_optional_string(getattr(endpoint, "scoring_uri", ""))
+        if scoring_uri:
+            return scoring_uri
+        inference_endpoint = getattr(endpoint, "inference_endpoint", None)
+        if inference_endpoint is None:
+            inference_endpoint = getattr(endpoint, "inferenceEndpoint", None)
+        if isinstance(inference_endpoint, dict):
+            for key in ("uri", "target_uri", "targetUri", "scoring_uri", "scoringUri"):
+                scoring_uri = clean_optional_string(inference_endpoint.get(key))
+                if scoring_uri:
+                    return scoring_uri
+        if inference_endpoint is not None:
+            for attr in ("uri", "target_uri", "targetUri", "scoring_uri", "scoringUri"):
+                scoring_uri = clean_optional_string(getattr(inference_endpoint, attr, ""))
+                if scoring_uri:
+                    return scoring_uri
+        return ""
+
+    def summarize_serverless_endpoint(self, endpoint: Any) -> dict[str, str]:
+        return {
+            "name": clean_optional_string(getattr(endpoint, "name", "")),
+            "model_id": clean_optional_string(getattr(endpoint, "model_id", "")),
+            "api_url": self.extract_serverless_scoring_uri(endpoint),
+            "auth_mode": clean_optional_string(getattr(endpoint, "auth_mode", "")),
+            "provisioning_state": clean_optional_string(getattr(endpoint, "provisioning_state", "")),
+        }
+
+    def list_azure_serverless_endpoints(self, ml_client) -> list[dict[str, str]]:
+        self.ensure_azure_dependencies()
+        endpoints: list[dict[str, str]] = []
+        for endpoint in ml_client.serverless_endpoints.list():
+            summary = self.summarize_serverless_endpoint(endpoint)
+            if summary["name"]:
+                endpoints.append(summary)
+        return endpoints
+
+    def deploy_azure_serverless_endpoint(
+        self,
+        ml_client,
+        model_id: str,
+        endpoint_name: str,
+        endpoint_auth_mode: str = "key",
+        credential=None,
+        sub_id: str = "",
+        emit: Reporter | None = None,
+    ) -> dict:
+        self.ensure_azure_dependencies()
+        clean_model_id = self.normalize_serverless_model_id(model_id)
+        if not clean_model_id:
+            raise ValueError("Azure serverless hosting needs a model ID from the Azure ML model catalog.")
+        clean_endpoint_name = self.sanitize_azure_endpoint_name(endpoint_name)
+        arm_resource: dict[str, Any] = {}
+        arm_creation_error = ""
+        arm_api_version = "2024-04-01-preview"
+        creation_method = f"arm-{arm_api_version}"
+        if clean_model_id != clean_optional_string(model_id).strip() and emit:
+            emit("Removed the version suffix from the serverless model ID; Azure deploys the latest catalog version.")
+
+        if credential is not None and clean_optional_string(sub_id):
+            try:
+                arm_resource = self.summarize_arm_serverless_endpoint_resource(
+                    self.create_arm_serverless_endpoint(
+                        credential=credential,
+                        sub_id=sub_id,
+                        endpoint_name=clean_endpoint_name,
+                        model_id=clean_model_id,
+                        location=self.get_azure_workspace_location(ml_client),
+                        auth_mode="Key" if endpoint_auth_mode.lower() == "key" else endpoint_auth_mode,
+                        api_version=arm_api_version,
+                        emit=emit,
+                    )
+                )
+            except Exception as exc:
+                arm_creation_error = clean_optional_string(exc)
+                if emit:
+                    emit(f"ARM serverless endpoint creation failed; falling back to Azure ML SDK. {arm_creation_error}")
+
+        if not arm_resource:
+            creation_method = "sdk-serverless-endpoints"
+            if ServerlessEndpoint is None:
+                raise RuntimeError("This Python environment needs a newer `azure-ai-ml` package to create serverless endpoints.")
+            if emit:
+                emit("Creating Azure serverless endpoint with Azure ML SDK...")
+            endpoint = ServerlessEndpoint(
+                name=clean_endpoint_name,
+                model_id=clean_model_id,
+                auth_mode=endpoint_auth_mode,
+            )
+            self.wait_for_azure_poller(
+                ml_client.serverless_endpoints.begin_create_or_update(endpoint),
+                action="Creating Azure serverless endpoint",
+                emit=emit,
+                timeout_seconds=1800,
+                poll_interval_seconds=15,
+            )
+        endpoint_details = self.wait_for_serverless_endpoint_ready(
+            ml_client,
+            clean_endpoint_name,
+            action="Waiting for Azure serverless endpoint to finish creating",
+            emit=emit,
+            timeout_seconds=1800,
+            poll_interval_seconds=15,
+        )
+        scoring_uri = self.extract_serverless_scoring_uri(endpoint_details)
+        if not scoring_uri:
+            raise RuntimeError("Azure serverless endpoint completed but no target URI was returned.")
+        workspace_serverless_endpoints: list[dict[str, str]] = []
+        workspace_serverless_endpoint_names: list[str] = []
+        serverless_list_error = ""
+        visible_in_workspace_list = False
+        arm_serverless_endpoint_names: list[str] = []
+        arm_serverless_endpoints: list[dict[str, Any]] = []
+        arm_list_error = ""
+        visible_in_arm_resource_list = False
+        if emit:
+            emit("Verifying serverless endpoint in the workspace list...")
+        try:
+            workspace_serverless_endpoints = self.list_azure_serverless_endpoints(ml_client)
+            workspace_serverless_endpoint_names = [
+                clean_optional_string(endpoint.get("name"))
+                for endpoint in workspace_serverless_endpoints
+                if clean_optional_string(endpoint.get("name"))
+            ]
+            visible_in_workspace_list = clean_endpoint_name in workspace_serverless_endpoint_names
+        except Exception as exc:
+            serverless_list_error = clean_optional_string(exc)
+        if credential is not None and clean_optional_string(sub_id):
+            try:
+                arm_serverless_endpoints = self.list_arm_serverless_endpoint_resources(credential, sub_id)
+                arm_serverless_endpoint_names = [
+                    clean_optional_string(endpoint.get("name"))
+                    for endpoint in arm_serverless_endpoints
+                    if clean_optional_string(endpoint.get("name"))
+                ]
+                visible_in_arm_resource_list = clean_endpoint_name in arm_serverless_endpoint_names
+            except Exception as exc:
+                arm_list_error = clean_optional_string(exc)
+        return {
+            "endpoint_name": clean_endpoint_name,
+            "model_id": clean_model_id,
+            "endpoint_auth_mode": clean_optional_string(getattr(endpoint_details, "auth_mode", "")) or endpoint_auth_mode,
+            "api_url": scoring_uri,
+            "provisioning_state": clean_optional_string(getattr(endpoint_details, "provisioning_state", "")),
+            "creation_method": creation_method,
+            "arm_api_version": arm_api_version,
+            "arm_creation_error": arm_creation_error,
+            "arm_resource": arm_resource,
+            "visible_in_arm_resource_list": visible_in_arm_resource_list,
+            "arm_list_error": arm_list_error,
+            "arm_serverless_endpoint_names": arm_serverless_endpoint_names,
+            "arm_serverless_endpoints": arm_serverless_endpoints,
+            "visible_in_workspace_list": visible_in_workspace_list,
+            "serverless_list_error": serverless_list_error,
+            "workspace_serverless_endpoint_names": workspace_serverless_endpoint_names,
+            "workspace_serverless_endpoints": workspace_serverless_endpoints,
         }
 
     def create_daily_batch_schedule(

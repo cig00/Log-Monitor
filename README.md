@@ -300,11 +300,17 @@ Use the `Hosting` section:
 - `Host Target`:
   - `Local`
   - `Azure`
+- `Azure Service`:
+  - `Queued batch API (daily)` for the app's log API + daily Azure ML batch scoring pipeline
+  - `Real-time endpoint` for a managed online endpoint backed by Azure compute
+  - `Serverless endpoint` for a model-catalog or Foundry model ID shown in Azure ML Studio
 
 The selected model path can be:
 
 - the exact `final_model` directory, or
 - a parent directory that contains a discoverable model folder
+
+Serverless endpoint hosting does not use the local generated model directory. The app pre-fills `Serverless Model ID` with `azureml://registries/azureml/models/Phi-4-mini-instruct` and generates a unique endpoint name automatically. You can edit either field; if the model ID includes `/versions/...`, the app strips that suffix because Azure serverless deployments use the latest catalog version.
 
 The app resolves the actual model directory by searching for:
 
@@ -335,6 +341,8 @@ Response:
 ```
 
 Azure hosting is asynchronous batch inference rather than a direct `POST /predict` call.
+
+The Serverless endpoint option is the exception: it creates an Azure ML Serverless endpoint from a catalog model ID and returns that endpoint target URI.
 
 Typical Azure batch input file example:
 
@@ -405,9 +413,12 @@ Local runtime policy:
 - `Generated Model`
 - `Host Target`
 - Azure-host-only fields:
+  - `Azure Service`
   - `Azure Host Sub ID`
   - `Azure Host Tenant`
   - `Azure Host Compute`
+  - `Serverless Model ID`
+  - `Endpoint Name`
 - outputs:
   - `Endpoint URL`
   - `Hosting Status`
@@ -654,7 +665,11 @@ Local observability dependency handling:
 
 ## Azure Hosting
 
-Azure hosting deploys the selected model to an Azure ML batch endpoint.
+Azure hosting supports three service choices:
+
+- `Queued batch API (daily)` deploys the selected model behind an Azure Function log API, queue, storage container, and daily Azure ML batch run.
+- `Real-time endpoint` deploys the selected model to a managed online endpoint backed by Azure compute.
+- `Serverless endpoint` creates an Azure ML Serverless endpoint from a model catalog or Foundry model ID. This path does not upload the local generated model directory.
 
 Azure hosting flow:
 
@@ -667,6 +682,17 @@ Azure hosting flow:
 7. set the deployment as the endpoint default
 8. return the endpoint scoring URI
 
+Serverless endpoint flow:
+
+1. authenticate and ensure workspace existence
+2. default the model catalog ID when the field is empty
+3. generate an Azure-valid endpoint name from the model name and a timestamp
+4. normalize the model catalog ID by removing any trailing `/versions/...`
+5. create the endpoint through the documented ARM `Microsoft.MachineLearningServices/workspaces/serverlessEndpoints` resource using API version `2024-04-01-preview`, which is the API version used in the Foundry serverless deployment docs
+6. fall back to `ml_client.serverless_endpoints` only if ARM creation fails
+7. verify the endpoint appears in both the ARM resource list and the workspace serverless endpoint list returned by the Azure SDK
+8. return the serverless target URI, the Azure ML Studio endpoints URL, and a direct Azure Portal hidden-resource URL
+
 Azure scoring notes:
 
 - the endpoint is asynchronous and intended for background scoring
@@ -674,6 +700,8 @@ Azure scoring notes:
 - results are written to Azure Storage when each batch job completes
 - batch endpoint authentication uses Microsoft Entra ID
 - the scoring entrypoint loads the model from `AZUREML_MODEL_DIR`
+- serverless endpoints use endpoint keys from Azure ML Studio and are billed as serverless/standard deployments
+- if Studio does not immediately show a newly created serverless endpoint, check the summary for the endpoint name, target URI, SDK list verification, and direct Portal resource link
 
 Azure hosting instance selection:
 

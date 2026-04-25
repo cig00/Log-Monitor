@@ -181,11 +181,120 @@ class HostingService:
 
     def _run_azure_hosting(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
         service_kind = clean_optional_string(request.azure_service) or "queued_batch"
+        if service_kind == "serverless":
+            return self._run_azure_serverless_hosting(ctx, request)
         if service_kind == "online":
             return self._run_azure_online_hosting(ctx, request)
         if service_kind == "queued_batch":
             return self._run_azure_queued_batch_hosting(ctx, request)
         return self._run_azure_batch_hosting(ctx, request)
+
+    def _run_azure_serverless_hosting(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
+        if not AZURE_AVAILABLE:
+            raise RuntimeError("Azure dependencies are not installed in this Python environment.")
+        model_id = self.azure_platform_service.normalize_serverless_model_id(request.azure_serverless_model_id)
+        if not model_id:
+            raise ValueError("Azure serverless hosting needs a model ID from the Azure ML model catalog.")
+
+        ctx.emit("progress", "Preparing Azure serverless hosting...")
+        credential = self.azure_platform_service.create_interactive_credential(request.azure_tenant_id)
+        ml_client = self.azure_platform_service.ensure_azure_workspace(
+            request.azure_sub_id,
+            request.azure_tenant_id,
+            emit=lambda msg: ctx.emit("progress", msg),
+            credential=credential,
+        )
+        timestamp = int(time.time())
+        model_hint = model_id.rstrip("/").split("/")[-1] or "model"
+        endpoint_name = clean_optional_string(request.azure_serverless_endpoint_name)
+        if not endpoint_name:
+            endpoint_name = f"log-monitor-serverless-{model_hint}-{timestamp}"
+        endpoint_name = self.azure_platform_service.sanitize_azure_endpoint_name(endpoint_name)
+        deployment_meta = self.azure_platform_service.deploy_azure_serverless_endpoint(
+            ml_client=ml_client,
+            model_id=model_id,
+            endpoint_name=endpoint_name,
+            endpoint_auth_mode="key",
+            credential=credential,
+            sub_id=request.azure_sub_id,
+            emit=lambda msg: ctx.emit("progress", msg),
+        )
+        scoring_uri = clean_optional_string(deployment_meta.get("api_url"))
+        endpoints_studio_url = self.azure_platform_service.build_azure_endpoints_studio_url(request.azure_sub_id, request.azure_tenant_id)
+        mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
+        endpoint_resource_id = self.azure_platform_service.build_serverless_endpoint_resource_id(
+            request.azure_sub_id,
+            clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+        )
+        endpoint_portal_url = self.azure_platform_service.build_serverless_endpoint_portal_url(
+            request.azure_sub_id,
+            request.azure_tenant_id,
+            clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+        )
+        visible_in_workspace_list = bool(deployment_meta.get("visible_in_workspace_list"))
+        serverless_list_error = clean_optional_string(deployment_meta.get("serverless_list_error"))
+        visible_in_arm_resource_list = bool(deployment_meta.get("visible_in_arm_resource_list"))
+        arm_list_error = clean_optional_string(deployment_meta.get("arm_list_error"))
+        creation_method = clean_optional_string(deployment_meta.get("creation_method"))
+        visibility_note = "Verified in both the ARM resource list and the Azure ML SDK workspace list."
+        if not visible_in_arm_resource_list and arm_list_error:
+            visibility_note = f"Azure SDK created the endpoint, but ARM resource listing failed: {arm_list_error}"
+        elif not visible_in_arm_resource_list:
+            visibility_note = "Azure SDK created the endpoint, but the ARM resource list did not return it yet."
+        if serverless_list_error:
+            visibility_note = f"Azure created the endpoint, but the workspace list check failed: {serverless_list_error}"
+        elif visible_in_arm_resource_list and not visible_in_workspace_list:
+            visibility_note = "Azure ARM created the endpoint, but the Azure ML SDK list did not return it yet. Refresh Studio or use the Portal link below."
+        elif not visible_in_workspace_list:
+            visibility_note = "Azure created the endpoint, but the workspace list did not return it yet. Use the resource link below or refresh Studio."
+        metadata_path = self.model_catalog_service.save_last_hosting_metadata(
+            {
+                "mode": "azure_serverless",
+                "service_kind": "serverless",
+                "model_dir": clean_optional_string(request.model_dir),
+                "serverless_model_id": model_id,
+                "endpoint_name": clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+                "endpoint_auth_mode": clean_optional_string(deployment_meta.get("endpoint_auth_mode")) or "key",
+                "provisioning_state": clean_optional_string(deployment_meta.get("provisioning_state")),
+                "creation_method": creation_method,
+                "arm_api_version": clean_optional_string(deployment_meta.get("arm_api_version")),
+                "arm_creation_error": clean_optional_string(deployment_meta.get("arm_creation_error")),
+                "arm_resource": deployment_meta.get("arm_resource", {}),
+                "visible_in_arm_resource_list": visible_in_arm_resource_list,
+                "arm_list_error": arm_list_error,
+                "arm_serverless_endpoint_names": deployment_meta.get("arm_serverless_endpoint_names", []),
+                "arm_serverless_endpoints": deployment_meta.get("arm_serverless_endpoints", []),
+                "visible_in_workspace_list": visible_in_workspace_list,
+                "serverless_list_error": serverless_list_error,
+                "workspace_serverless_endpoint_names": deployment_meta.get("workspace_serverless_endpoint_names", []),
+                "serverless_endpoint_resource_id": endpoint_resource_id,
+                "serverless_endpoint_portal_url": endpoint_portal_url,
+                "serverless_endpoints_studio_url": endpoints_studio_url,
+                "api_url": scoring_uri,
+                "azure_subscription_id": request.azure_sub_id,
+                "azure_tenant_id": request.azure_tenant_id,
+                "mlops_url": mlops_url,
+                "llmops_url": llmops_url,
+                "created_at": now_utc_iso(),
+            }
+        )
+        return {
+            "operation": "hosting",
+            "message": "Azure serverless endpoint is ready.",
+            "api_url": scoring_uri,
+            "endpoint_name": clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+            "mlops_url": endpoints_studio_url or mlops_url,
+            "llmops_url": llmops_url,
+            "metadata_path": metadata_path,
+            "summary": (
+                f"Azure serverless endpoint is ready.\nTarget URI: {scoring_uri}\n"
+                f"Model ID: {model_id}\nEndpoint Name: {clean_optional_string(deployment_meta.get('endpoint_name')) or endpoint_name}\n"
+                f"Creation: {creation_method}\n"
+                f"{visibility_note}\n"
+                f"Studio: {endpoints_studio_url}\nPortal Resource: {endpoint_portal_url}\n"
+                "Authentication: endpoint keys from Azure ML Studio."
+            ),
+        }
 
     def _run_azure_online_hosting(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
         if not AZURE_AVAILABLE:

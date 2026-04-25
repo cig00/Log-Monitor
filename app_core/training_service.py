@@ -12,6 +12,7 @@ from typing import Any
 from mlops_utils import (
     bool_from_env,
     clean_optional_string,
+    compute_file_sha256,
     discover_model_dir,
     now_utc_iso,
     read_json,
@@ -293,6 +294,32 @@ class TrainingService:
                     sidecar_existing["created_at"] = now_utc_iso()
                 write_sidecar_for_csv(request.csv_path, sidecar_existing)
 
+            data_version_id = clean_optional_string(pipeline_context_local.get("data_version_id")) or compute_file_sha256(request.csv_path)
+            azure_data_asset_info: dict[str, str] = {}
+            ctx.emit("progress", "Registering labeled dataset as an Azure ML Data asset...")
+            azure_data_asset_info = self.azure_platform_service.register_azure_data_asset(
+                ml_client=ml_client,
+                csv_path=request.csv_path,
+                asset_name="log-monitor-labeled-data",
+                asset_version=data_version_id,
+                description="Log Monitor labeled training dataset.",
+                tags={
+                    "created_by": "log-monitor",
+                    "pipeline_id": clean_optional_string(pipeline_context_local.get("pipeline_id")),
+                    "data_version_id": data_version_id,
+                    "source_filename": Path(request.csv_path).name,
+                    "run_source": run_source,
+                },
+            )
+            pipeline_context_local.update(azure_data_asset_info)
+            sidecar_existing = read_sidecar_for_csv(request.csv_path) or {}
+            sidecar_existing.update(azure_data_asset_info)
+            sidecar_existing["azure_data_asset_registered_at"] = now_utc_iso()
+            write_sidecar_for_csv(request.csv_path, sidecar_existing)
+            azure_data_asset_uri = clean_optional_string(azure_data_asset_info.get("azure_data_asset_uri"))
+            if azure_data_asset_uri:
+                ctx.emit("progress", f"Dataset registered in Azure ML Studio: {azure_data_asset_uri}")
+
             mlflow_env = self.mlops_service.build_training_mlflow_env(
                 resolved_mlflow_config,
                 pipeline_context_local,
@@ -336,6 +363,7 @@ class TrainingService:
                 mlflow_install_fragment=mlflow_install_fragment,
                 export_segment=export_segment,
                 train_cli_segment=train_cli_segment,
+                data_input_path=clean_optional_string(azure_data_asset_info.get("azure_data_asset_uri")),
             )
             while True:
                 ctx.check_cancelled()
@@ -358,12 +386,18 @@ class TrainingService:
                 preferred_model_path = discover_model_dir(download_path)
             except Exception:
                 pass
+            completion_message = f"Model trained and downloaded to {os.path.abspath(download_path)}"
+            if azure_data_asset_uri:
+                completion_message += f"\nAzure data asset: {azure_data_asset_uri}"
             return {
                 "operation": "training",
-                "message": f"Model trained and downloaded to {os.path.abspath(download_path)}",
+                "message": completion_message,
                 "download_path": os.path.abspath(download_path),
                 "selected_model_dir": preferred_model_path,
                 "instance_type": compute_size,
+                "azure_data_asset_name": azure_data_asset_info.get("azure_data_asset_name", ""),
+                "azure_data_asset_version": azure_data_asset_info.get("azure_data_asset_version", ""),
+                "azure_data_asset_uri": azure_data_asset_info.get("azure_data_asset_uri", ""),
             }
         finally:
             if ml_client and compute_created:

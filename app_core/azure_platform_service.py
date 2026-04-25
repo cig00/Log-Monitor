@@ -21,6 +21,7 @@ try:
         AzureBlobDatastore,
         BatchEndpoint,
         CodeConfiguration,
+        Data,
         Environment,
         JobSchedule,
         ManagedOnlineDeployment,
@@ -45,6 +46,7 @@ except Exception:
     AzureBlobDatastore = Any
     BatchEndpoint = Any
     CodeConfiguration = Any
+    Data = Any
     Environment = Any
     JobSchedule = Any
     ManagedOnlineDeployment = Any
@@ -87,6 +89,12 @@ class AzurePlatformService:
         if len(cleaned) < 3:
             cleaned = (cleaned + "logmonitor")[:max_length]
         return cleaned or "logmonitorstore"
+
+    def sanitize_azure_asset_version(self, raw_value: str, max_length: int = 255) -> str:
+        cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "-", clean_optional_string(raw_value))
+        cleaned = re.sub(r"-+", "-", cleaned).strip("-._")
+        cleaned = cleaned[:max_length].strip("-._")
+        return cleaned or "1"
 
     def build_azure_workspace_id(self, sub_id: str) -> str:
         return (
@@ -513,6 +521,59 @@ class AzurePlatformService:
         )
         ml_client.compute.begin_create_or_update(compute).result()
 
+    def register_azure_data_asset(
+        self,
+        ml_client,
+        csv_path: str,
+        *,
+        asset_name: str,
+        asset_version: str,
+        description: str = "",
+        tags: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        self.ensure_azure_dependencies()
+        resolved_csv = Path(csv_path).expanduser().resolve()
+        if not resolved_csv.exists():
+            raise FileNotFoundError(f"Training CSV does not exist: {resolved_csv}")
+
+        clean_name = self.sanitize_azure_name(asset_name, max_length=255)
+        clean_version = self.sanitize_azure_asset_version(asset_version)
+        clean_tags = {
+            clean_optional_string(key): clean_optional_string(value)
+            for key, value in (tags or {}).items()
+            if clean_optional_string(key) and clean_optional_string(value)
+        }
+        azureml_uri = f"azureml:{clean_name}:{clean_version}"
+        try:
+            existing_asset = ml_client.data.get(name=clean_name, version=clean_version)
+        except Exception:
+            existing_asset = None
+        if existing_asset is not None:
+            return {
+                "azure_data_asset_name": clean_name,
+                "azure_data_asset_version": clean_version,
+                "azure_data_asset_uri": azureml_uri,
+                "azure_data_asset_id": clean_optional_string(getattr(existing_asset, "id", "")),
+                "azure_data_asset_path": clean_optional_string(getattr(existing_asset, "path", "")),
+            }
+
+        data_asset = Data(
+            path=str(resolved_csv),
+            type=AssetTypes.URI_FILE,
+            name=clean_name,
+            version=clean_version,
+            description=clean_optional_string(description),
+            tags=clean_tags,
+        )
+        registered_asset = ml_client.data.create_or_update(data_asset)
+        return {
+            "azure_data_asset_name": clean_name,
+            "azure_data_asset_version": clean_version,
+            "azure_data_asset_uri": azureml_uri,
+            "azure_data_asset_id": clean_optional_string(getattr(registered_asset, "id", "")),
+            "azure_data_asset_path": clean_optional_string(getattr(registered_asset, "path", "")),
+        }
+
     def submit_azure_training_job(
         self,
         ml_client,
@@ -521,12 +582,13 @@ class AzurePlatformService:
         mlflow_install_fragment: str,
         export_segment: str,
         train_cli_segment: str,
+        data_input_path: str = "",
         experiment_name: str = "deberta-log-classification",
     ) -> str:
         self.ensure_azure_dependencies()
         if command is None:
             raise RuntimeError("Azure ML command job creation is unavailable in this Python environment.")
-        safe_csv_path = csv_path.replace("\\", "/")
+        safe_csv_path = clean_optional_string(data_input_path) or csv_path.replace("\\", "/")
         train_job = command(
             inputs={"training_data": Input(type="uri_file", path=safe_csv_path, mode="download")},
             compute=compute_name,

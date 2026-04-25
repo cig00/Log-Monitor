@@ -275,6 +275,7 @@ The metadata JSON contains:
 - `runtime_mode`
 - dataset hashes
 - data version fields
+- Azure data asset fields, when training runs on Azure
 - data-prep lineage
 - `selection_summary`
 - `test_metrics`
@@ -546,28 +547,30 @@ Azure training flow:
 2. verify or create the Azure resource group
 3. register `Microsoft.MachineLearningServices`
 4. verify or create the Azure ML workspace
-5. provision a temporary AML compute cluster
-6. submit an Azure ML command job
-7. install pinned training dependencies inside the Azure job
-8. run `train.py`
-9. poll until `Completed`, `Failed`, or `Canceled`
-10. download artifacts into:
+5. register the labeled CSV as an Azure ML Data asset named `log-monitor-labeled-data`
+6. provision a temporary AML compute cluster
+7. submit an Azure ML command job that reads from the registered data asset version
+8. install pinned training dependencies inside the Azure job
+9. run `train.py`
+10. poll until `Completed`, `Failed`, or `Canceled`
+11. download artifacts into:
 
 ```text
 ./downloaded_model
 ```
 
-11. cache training metadata into:
+12. cache training metadata into:
 
 ```text
 ./outputs/last_training_mlflow.json
 ```
 
-12. delete the temporary training compute cluster during cleanup
+13. delete the temporary training compute cluster during cleanup
 
 Azure job notes:
 
-- Windows dataset paths are normalized to forward-slash form for Azure input URIs.
+- Azure data asset versions are derived from the local dataset SHA-256 hash, so identical labeled CSV content reuses the same version.
+- The registered data asset URI is written into the CSV sidecar and training metadata as `azure_data_asset_uri`.
 - The job uses the curated environment `AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest`.
 - MLflow env vars are injected into the Azure job when tracking is enabled.
 

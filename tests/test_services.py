@@ -4,8 +4,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+from app_core.azure_platform_service import AzurePlatformService
 from app_core.github_service import GitHubService
 from app_core.mlops_service import MlopsService
 from app_core.model_catalog_service import ModelCatalogService
@@ -71,6 +73,46 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertFalse(config.enabled)
         self.assertEqual(self.mlops.load_prompt(), "prompt body")
+
+    def test_azure_platform_registers_versioned_data_asset(self):
+        dataset_path = self.project_dir / "labeled.csv"
+        dataset_path.write_text("LogMessage,class\nhello,Noise\n", encoding="utf-8")
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+
+        class FakeDataEntity:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakeDataOperations:
+            def __init__(self):
+                self.created = None
+
+            def create_or_update(self, data_asset):
+                self.created = data_asset
+                return SimpleNamespace(id="/asset/id", path="azureml://datastores/workspaceblobstore/paths/labeled.csv")
+
+        fake_client = SimpleNamespace(data=FakeDataOperations())
+        fake_asset_types = SimpleNamespace(URI_FILE="uri_file")
+
+        with mock.patch("app_core.azure_platform_service.Data", FakeDataEntity), mock.patch(
+            "app_core.azure_platform_service.AssetTypes",
+            fake_asset_types,
+        ):
+            result = service.register_azure_data_asset(
+                fake_client,
+                str(dataset_path),
+                asset_name="Log Monitor Labeled Data",
+                asset_version="sha:bad version",
+                tags={"pipeline_id": "abc", "empty": ""},
+            )
+
+        self.assertEqual(result["azure_data_asset_name"], "log-monitor-labeled-data")
+        self.assertEqual(result["azure_data_asset_version"], "sha-bad-version")
+        self.assertEqual(result["azure_data_asset_uri"], "azureml:log-monitor-labeled-data:sha-bad-version")
+        self.assertEqual(result["azure_data_asset_id"], "/asset/id")
+        self.assertEqual(fake_client.data.created.type, "uri_file")
+        self.assertEqual(fake_client.data.created.tags, {"pipeline_id": "abc"})
 
 
 if __name__ == "__main__":

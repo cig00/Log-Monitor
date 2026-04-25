@@ -206,6 +206,11 @@ class MlopsService:
             "data_version_id",
             "data_version_dir",
             "data_version_path",
+            "azure_data_asset_name",
+            "azure_data_asset_version",
+            "azure_data_asset_uri",
+            "azure_data_asset_id",
+            "azure_data_asset_path",
         ):
             value = clean_optional_string(pipeline_context.get(key, ""))
             if value:

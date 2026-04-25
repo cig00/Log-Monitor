@@ -815,6 +815,12 @@ def main():
             lambda: mlflow.log_param("data_version_id", clean_optional_string(lineage_tags.get("data_version_id", ""))),
             "log data_version_id",
         )
+    if clean_optional_string(lineage_tags.get("azure_data_asset_uri", "")):
+        safe_mlflow_call(
+            mlflow_enabled,
+            lambda: mlflow.log_param("azure_data_asset_uri", clean_optional_string(lineage_tags.get("azure_data_asset_uri", ""))),
+            "log azure_data_asset_uri",
+        )
 
     metadata_payload = {
         "run_id": run_id,
@@ -835,6 +841,11 @@ def main():
         "data_version_id": clean_optional_string(lineage_tags.get("data_version_id", "")),
         "data_version_dir": clean_optional_string(lineage_tags.get("data_version_dir", "")),
         "data_version_path": clean_optional_string(lineage_tags.get("data_version_path", "")),
+        "azure_data_asset_name": clean_optional_string(lineage_tags.get("azure_data_asset_name", "")),
+        "azure_data_asset_version": clean_optional_string(lineage_tags.get("azure_data_asset_version", "")),
+        "azure_data_asset_uri": clean_optional_string(lineage_tags.get("azure_data_asset_uri", "")),
+        "azure_data_asset_id": clean_optional_string(lineage_tags.get("azure_data_asset_id", "")),
+        "azure_data_asset_path": clean_optional_string(lineage_tags.get("azure_data_asset_path", "")),
         "prompt_hash": clean_optional_string(lineage_tags.get("prompt_hash", "")),
         "llm_model": clean_optional_string(lineage_tags.get("llm_model", "")),
         "dataset_metadata": dataset_meta,

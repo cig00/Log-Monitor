@@ -32,10 +32,65 @@ class DataPrepService:
             metadata={"operation": "data_prep", "input_path": request.input_path, "output_path": request.output_path},
         )
 
+    def evaluate_prompt_test_cases(
+        self,
+        *,
+        api_key: str,
+        model_name: str,
+        prompt_text: str,
+        cases: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        clean_prompt = clean_optional_string(prompt_text)
+        if not clean_prompt:
+            raise ValueError("Prompt text is empty.")
+        logs = [clean_optional_string(case.get("message")) for case in cases]
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "system", "content": clean_prompt}, {"role": "user", "content": json.dumps(logs)}],
+            "response_format": {"type": "json_object"},
+        }
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        response = requests.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=120)
+        response.raise_for_status()
+        result_json = response.json()
+        llm_content = result_json["choices"][0]["message"]["content"]
+        parsed = json.loads(llm_content)
+        results_array = parsed.get("results", []) if isinstance(parsed, dict) else []
+        evaluated_cases = []
+        for index, case in enumerate(cases):
+            expected = clean_optional_string(case.get("expected"))
+            got = ""
+            if index < len(results_array) and isinstance(results_array[index], dict):
+                got = clean_optional_string(results_array[index].get("class"))
+            evaluated_cases.append(
+                {
+                    "name": clean_optional_string(case.get("name")) or f"Case {index + 1}",
+                    "message": clean_optional_string(case.get("message")),
+                    "expected": expected,
+                    "got": got or "Noise",
+                    "match": expected == (got or "Noise"),
+                }
+            )
+        return {
+            "cases": evaluated_cases,
+            "usage": result_json.get("usage", {}) if isinstance(result_json, dict) else {},
+        }
+
     def _run(self, ctx: JobContext, request: DataPrepRequest) -> dict[str, Any]:
         processed_logs = []
         usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        system_prompt = self.mlops_service.load_prompt()
+        system_prompt = clean_optional_string(request.prompt_text) or self.mlops_service.load_prompt()
+        prompt_version_info = self.mlops_service.archive_prompt_version(
+            system_prompt,
+            {
+                "operation": "data_prep",
+                "llm_model": clean_optional_string(request.model_name),
+                "prompt_source": clean_optional_string(request.prompt_source) or ("ui_editor" if clean_optional_string(request.prompt_text) else "prompt_txt"),
+            },
+        )
+        prompt_label = clean_optional_string(prompt_version_info.get("prompt_version_label"))
+        if prompt_label:
+            ctx.emit("progress", f"Using prompt version {prompt_label}.")
         df = pd.read_csv(request.input_path)
         input_file_hash = compute_file_sha256(request.input_path)
 
@@ -101,6 +156,13 @@ class DataPrepService:
             {
                 "llm_model": clean_optional_string(request.model_name),
                 "prompt_hash": prompt_sha256(system_prompt),
+                "prompt_version_id": prompt_version_info.get("prompt_version_id", ""),
+                "prompt_version_label": prompt_version_info.get("prompt_version_label", ""),
+                "prompt_version_dir": prompt_version_info.get("prompt_version_dir", ""),
+                "prompt_version_path": prompt_version_info.get("prompt_version_path", ""),
+                "prompt_metadata_path": prompt_version_info.get("prompt_metadata_path", ""),
+                "prompt_comparison_path": prompt_version_info.get("prompt_comparison_path", ""),
+                "previous_prompt_version_id": prompt_version_info.get("previous_prompt_version_id", ""),
                 "input_dataset_hash": input_file_hash,
                 "output_dataset_hash": output_file_hash,
                 "source_input_path": request.input_path,
@@ -119,12 +181,20 @@ class DataPrepService:
             output_hash=output_file_hash,
             usage_totals=usage_totals,
             data_version_info=data_version_info,
+            prompt_version_info=prompt_version_info,
         )
         sidecar_payload = {
             "pipeline_id": mlops_lineage.get("pipeline_id", ""),
             "parent_run_id": mlops_lineage.get("parent_run_id", ""),
             "data_prep_run_id": mlops_lineage.get("data_prep_run_id", ""),
             "prompt_hash": mlops_lineage.get("prompt_hash", ""),
+            "prompt_version_id": mlops_lineage.get("prompt_version_id", ""),
+            "prompt_version_label": mlops_lineage.get("prompt_version_label", ""),
+            "prompt_version_dir": mlops_lineage.get("prompt_version_dir", ""),
+            "prompt_version_path": mlops_lineage.get("prompt_version_path", ""),
+            "prompt_metadata_path": mlops_lineage.get("prompt_metadata_path", ""),
+            "prompt_comparison_path": mlops_lineage.get("prompt_comparison_path", ""),
+            "previous_prompt_version_id": mlops_lineage.get("previous_prompt_version_id", ""),
             "llm_model": mlops_lineage.get("llm_model", ""),
             "input_dataset_hash": mlops_lineage.get("input_dataset_hash", ""),
             "output_dataset_hash": mlops_lineage.get("output_dataset_hash", ""),
@@ -143,4 +213,6 @@ class DataPrepService:
             "message": f"Data processed successfully! Saved to {request.output_path}",
             "output_path": request.output_path,
             "row_count": len(output_df),
+            "prompt_version_id": prompt_version_info.get("prompt_version_id", ""),
+            "prompt_version_label": prompt_label,
         }

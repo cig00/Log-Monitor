@@ -39,6 +39,28 @@ class LogProcessorApp:
         "gpt-4o",
         "gpt-5.2",
     )
+    DEFAULT_PROMPT_TEST_CASES = [
+        {
+            "name": "Missing Environment Variable",
+            "message": "Error: application startup failed because MAIL_HOST environment variable is missing",
+            "expected": "CONFIGURATION",
+        },
+        {
+            "name": "Disk Space",
+            "message": "kernel: write failed on /var/log/app.log, no space left on device",
+            "expected": "SYSTEM",
+        },
+        {
+            "name": "Code Exception",
+            "message": "Traceback: TypeError unsupported operand type for +: 'NoneType' and 'str'",
+            "expected": "Error",
+        },
+        {
+            "name": "Canceled Work",
+            "message": "processed Canceled after user interrupted the background task",
+            "expected": "Noise",
+        },
+    ]
 
     def __init__(self, root):
         self.root = root
@@ -93,6 +115,7 @@ class LogProcessorApp:
         self.current_hosting_job_id = ""
         self.current_repo_job_id = ""
         self.current_branch_job_id = ""
+        self.current_prompt_test_job_id = ""
         self.mlflow_ui_process = None
         self.training_state_lock = threading.Lock()
         self.training_active = False
@@ -122,6 +145,13 @@ class LogProcessorApp:
         self.azure_llmops_url_var = tk.StringVar(value="")
         self.azure_hosted_endpoint_name_var = tk.StringVar(value="")
         self.azure_host_sub_var.trace_add("write", lambda *_: self.refresh_azure_dashboard_links())
+        self.prompt_test_window = None
+        self.prompt_test_tree = None
+        self.prompt_test_run_btn = None
+        self.prompt_test_cases = []
+        self.prompt_test_row_ids = []
+        self.prompt_version_choice_var = tk.StringVar(value="default")
+        self.prompt_version_choices: list[dict[str, str]] = []
 
         # UI Styling
         style = ttk.Style()
@@ -183,8 +213,52 @@ class LogProcessorApp:
         )
         self.openai_model_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
 
+        prompt_frame = ttk.LabelFrame(file_frame, text="Prompt Lab", padding=(8, 8))
+        prompt_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=5, pady=(8, 5))
+        prompt_frame.columnconfigure(0, weight=1)
+        prompt_frame.rowconfigure(1, weight=1)
+
+        prompt_picker = ttk.Frame(prompt_frame)
+        prompt_picker.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        prompt_picker.columnconfigure(1, weight=1)
+        ttk.Label(prompt_picker, text="Version:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.prompt_version_combo = ttk.Combobox(
+            prompt_picker,
+            textvariable=self.prompt_version_choice_var,
+            state="readonly",
+            width=42,
+        )
+        self.prompt_version_combo.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.prompt_version_combo.bind("<<ComboboxSelected>>", self.on_prompt_version_selected)
+        self.refresh_prompt_version_choices()
+
+        self.prompt_text_widget = tk.Text(
+            prompt_frame,
+            height=10,
+            wrap="word",
+            undo=True,
+            font=("Consolas", 9),
+        )
+        self.prompt_text_widget.grid(row=1, column=0, sticky="nsew")
+        prompt_scroll = ttk.Scrollbar(prompt_frame, orient="vertical", command=self.prompt_text_widget.yview)
+        prompt_scroll.grid(row=1, column=1, sticky="ns")
+        self.prompt_text_widget.configure(yscrollcommand=prompt_scroll.set)
+        self.reload_prompt_text()
+
+        prompt_actions = ttk.Frame(prompt_frame)
+        prompt_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        prompt_actions.columnconfigure(4, weight=1)
+        self.reload_prompt_btn = ttk.Button(prompt_actions, text="Reload Prompt", command=self.reload_prompt_text)
+        self.reload_prompt_btn.grid(row=0, column=0, padx=(0, 6))
+        self.refresh_prompt_versions_btn = ttk.Button(prompt_actions, text="Refresh Versions", command=self.refresh_prompt_version_choices)
+        self.refresh_prompt_versions_btn.grid(row=0, column=1, padx=(0, 6))
+        self.prompt_tests_btn = ttk.Button(prompt_actions, text="Run Prompt Tests", command=lambda: self.show_prompt_test_window(run_immediately=True))
+        self.prompt_tests_btn.grid(row=0, column=2, padx=(0, 6))
+        self.compare_prompts_btn = ttk.Button(prompt_actions, text="Compare Prompt Versions", command=self.show_prompt_comparison)
+        self.compare_prompts_btn.grid(row=0, column=3, padx=(0, 6))
+
         self.prepare_btn = ttk.Button(file_frame, text="Prepare Data (OpenAI)", command=self.prepare_data)
-        self.prepare_btn.grid(row=3, column=0, columnspan=3, pady=10)
+        self.prepare_btn.grid(row=4, column=0, columnspan=3, pady=10)
 
         # --- Model Training Section ---
         train_frame = ttk.LabelFrame(self.content_frame, text="Model Training (DeBERTa)", padding=(10, 10))
@@ -732,6 +806,8 @@ class LogProcessorApp:
             self._handle_repo_event(event)
         elif event.job_id == self.current_branch_job_id:
             self._handle_branch_event(event)
+        elif event.job_id == self.current_prompt_test_job_id:
+            self._handle_prompt_test_event(event)
 
     def _handle_data_prep_event(self, event):
         if event.status not in {"succeeded", "failed", "canceled"}:
@@ -740,6 +816,7 @@ class LogProcessorApp:
         self.prepare_btn.config(state="normal")
         if event.status == "succeeded":
             self.status_var.set("Data processed successfully!")
+            self.refresh_prompt_version_choices()
             messagebox.showinfo("Success", event.payload.get("message", "Data processed successfully."))
             return
         if event.status == "canceled":
@@ -817,6 +894,22 @@ class LogProcessorApp:
             self.status_var.set("Branch load canceled.")
             return
         self.show_error(event.payload.get("message", "Failed to load branches."))
+
+    def _handle_prompt_test_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_prompt_test_job_id = ""
+        if self.prompt_test_run_btn is not None:
+            self.prompt_test_run_btn.config(state="normal")
+        if event.status == "succeeded":
+            cases = event.payload.get("cases", [])
+            self.update_prompt_test_results(cases)
+            passed = sum(1 for case in cases if case.get("match"))
+            self.status_var.set(f"Prompt tests completed: {passed}/{len(cases)} passed.")
+            return
+        message = event.payload.get("message", "Prompt tests failed.")
+        self.status_var.set(message)
+        messagebox.showerror("Prompt Tests", message)
 
     # --- GitHub Repos/Branches Methods ---
     def start_repo_thread(self):
@@ -1622,10 +1715,308 @@ class LogProcessorApp:
         if self.training_service.cancel(self.current_training_job_id):
             self.status_var.set("Interrupt requested. Stopping training...")
 
+    def reload_prompt_text(self):
+        if not hasattr(self, "prompt_text_widget"):
+            return
+        try:
+            prompt_text = self.mlops_service.load_prompt()
+        except Exception as exc:
+            messagebox.showerror("Prompt", str(exc))
+            return
+        self.prompt_text_widget.delete("1.0", tk.END)
+        self.prompt_text_widget.insert("1.0", prompt_text)
+        if hasattr(self, "prompt_version_choice_var"):
+            self.prompt_version_choice_var.set("default")
+
+    def refresh_prompt_version_choices(self):
+        choices = [{"label": "default", "version_id": "", "source": "default"}]
+        try:
+            versions = list(reversed(self.mlops_service.list_prompt_versions()))
+        except Exception:
+            versions = []
+        for version in versions:
+            version_id = clean_optional_string(version.get("prompt_version_id"))
+            label = clean_optional_string(version.get("prompt_version_label")) or version_id[:12]
+            created_at = clean_optional_string(version.get("created_at")).replace("T", " ")[:19]
+            source = clean_optional_string(version.get("prompt_source"))
+            display_parts = [label]
+            if created_at:
+                display_parts.append(created_at)
+            if source:
+                display_parts.append(source)
+            choices.append({"label": " | ".join(display_parts), "version_id": version_id, "source": source or "archived"})
+        self.prompt_version_choices = choices
+        if hasattr(self, "prompt_version_combo"):
+            labels = [choice["label"] for choice in choices]
+            self.prompt_version_combo["values"] = labels
+            current = clean_optional_string(self.prompt_version_choice_var.get()) or "default"
+            if current not in labels:
+                self.prompt_version_choice_var.set("default")
+
+    def get_selected_prompt_version_choice(self) -> dict[str, str]:
+        selected = clean_optional_string(self.prompt_version_choice_var.get()) or "default"
+        for choice in self.prompt_version_choices:
+            if choice.get("label") == selected:
+                return dict(choice)
+        return {"label": "default", "version_id": "", "source": "default"}
+
+    def on_prompt_version_selected(self, event=None):
+        del event
+        choice = self.get_selected_prompt_version_choice()
+        version_id = clean_optional_string(choice.get("version_id"))
+        try:
+            if version_id:
+                prompt_text = self.mlops_service.read_prompt_version_text(version_id)
+            else:
+                prompt_text = self.mlops_service.load_prompt()
+        except Exception as exc:
+            messagebox.showerror("Prompt Versions", str(exc))
+            return
+        self.prompt_text_widget.delete("1.0", tk.END)
+        self.prompt_text_widget.insert("1.0", prompt_text)
+
+    def get_prompt_text_from_ui(self) -> str:
+        if not hasattr(self, "prompt_text_widget"):
+            return self.mlops_service.load_prompt()
+        return self.prompt_text_widget.get("1.0", "end-1c").strip()
+
+    def get_prompt_source_from_ui(self) -> str:
+        choice = self.get_selected_prompt_version_choice()
+        version_id = clean_optional_string(choice.get("version_id"))
+        if version_id:
+            return f"derived_from:{version_id}"
+        return "default"
+
+    def get_prompt_test_cases(self) -> list[dict]:
+        if not self.prompt_test_cases:
+            self.prompt_test_cases = [dict(case) for case in self.DEFAULT_PROMPT_TEST_CASES]
+        return self.prompt_test_cases
+
+    def show_prompt_test_window(self, run_immediately: bool = False):
+        if self.prompt_test_window is not None and self.prompt_test_window.winfo_exists():
+            self.prompt_test_window.lift()
+            if run_immediately:
+                self.run_prompt_tests()
+            return
+
+        self.prompt_test_cases = [dict(case) for case in self.get_prompt_test_cases()]
+        self.prompt_test_row_ids = []
+        window = tk.Toplevel(self.root)
+        self.prompt_test_window = window
+        window.title("Prompt Unit Tests")
+        window.geometry("980x620")
+        window.minsize(760, 440)
+        window.protocol("WM_DELETE_WINDOW", self.close_prompt_test_window)
+
+        outer = ttk.Frame(window, padding=(10, 10))
+        outer.pack(fill="both", expand=True)
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+
+        columns = ("name", "message", "expected", "got", "result")
+        tree = ttk.Treeview(outer, columns=columns, show="headings", height=12)
+        self.prompt_test_tree = tree
+        tree.heading("name", text="Test Case")
+        tree.heading("message", text="Log Message")
+        tree.heading("expected", text="Expected")
+        tree.heading("got", text="Got")
+        tree.heading("result", text="Result")
+        tree.column("name", width=170, anchor="w")
+        tree.column("message", width=420, anchor="w")
+        tree.column("expected", width=120, anchor="center")
+        tree.column("got", width=120, anchor="center")
+        tree.column("result", width=90, anchor="center")
+        tree.tag_configure("pass", background="#d9f7df", foreground="#14532d")
+        tree.tag_configure("fail", background="#ffe1e1", foreground="#7f1d1d")
+        tree.tag_configure("pending", background="#eef2ff", foreground="#1e3a8a")
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(outer, orient="vertical", command=tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=tree_scroll.set)
+
+        editor = ttk.LabelFrame(outer, text="Add Custom Test Case", padding=(8, 8))
+        editor.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        editor.columnconfigure(1, weight=1)
+        ttk.Label(editor, text="Name:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        self.prompt_test_name_var = tk.StringVar(value="Custom Case")
+        ttk.Entry(editor, textvariable=self.prompt_test_name_var).grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(editor, text="Expected:").grid(row=0, column=2, sticky="w", padx=(10, 6), pady=3)
+        self.prompt_test_expected_var = tk.StringVar(value="Error")
+        ttk.Combobox(
+            editor,
+            textvariable=self.prompt_test_expected_var,
+            values=["Error", "CONFIGURATION", "SYSTEM", "Noise"],
+            state="readonly",
+            width=18,
+        ).grid(row=0, column=3, sticky="ew", pady=3)
+        ttk.Label(editor, text="Log Message:").grid(row=1, column=0, sticky="nw", padx=(0, 6), pady=3)
+        self.prompt_test_message_text = tk.Text(editor, height=3, wrap="word")
+        self.prompt_test_message_text.grid(row=1, column=1, columnspan=3, sticky="ew", pady=3)
+
+        actions = ttk.Frame(outer)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        actions.columnconfigure(3, weight=1)
+        ttk.Button(actions, text="Add Test Case", command=self.add_prompt_test_case).grid(row=0, column=0, padx=(0, 6))
+        self.prompt_test_run_btn = ttk.Button(actions, text="Run Tests", command=self.run_prompt_tests)
+        self.prompt_test_run_btn.grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(actions, text="Reset Built-ins", command=self.reset_prompt_test_cases).grid(row=0, column=2, padx=(0, 6))
+
+        self.refresh_prompt_test_tree()
+        if run_immediately:
+            self.run_prompt_tests()
+
+    def close_prompt_test_window(self):
+        if self.prompt_test_window is not None:
+            self.prompt_test_window.destroy()
+        self.prompt_test_window = None
+        self.prompt_test_tree = None
+        self.prompt_test_run_btn = None
+        self.prompt_test_row_ids = []
+
+    def refresh_prompt_test_tree(self):
+        if self.prompt_test_tree is None:
+            return
+        self.prompt_test_tree.delete(*self.prompt_test_tree.get_children())
+        self.prompt_test_row_ids = []
+        for case in self.get_prompt_test_cases():
+            row_id = self.prompt_test_tree.insert(
+                "",
+                "end",
+                values=(
+                    clean_optional_string(case.get("name")),
+                    clean_optional_string(case.get("message")),
+                    clean_optional_string(case.get("expected")),
+                    clean_optional_string(case.get("got")),
+                    clean_optional_string(case.get("result")) or "Not run",
+                ),
+                tags=("pending",),
+            )
+            self.prompt_test_row_ids.append(row_id)
+
+    def add_prompt_test_case(self):
+        if self.prompt_test_window is None:
+            return
+        message = self.prompt_test_message_text.get("1.0", "end-1c").strip()
+        expected = self.prompt_test_expected_var.get().strip()
+        name = self.prompt_test_name_var.get().strip() or "Custom Case"
+        if not message:
+            messagebox.showwarning("Prompt Tests", "Enter a log message for the custom test case.")
+            return
+        self.get_prompt_test_cases().append({"name": name, "message": message, "expected": expected})
+        self.prompt_test_message_text.delete("1.0", tk.END)
+        self.refresh_prompt_test_tree()
+
+    def reset_prompt_test_cases(self):
+        self.prompt_test_cases = [dict(case) for case in self.DEFAULT_PROMPT_TEST_CASES]
+        self.refresh_prompt_test_tree()
+
+    def run_prompt_tests(self):
+        api_key = self.openai_api_key_entry.get().strip()
+        model_name = self.openai_model_var.get().strip()
+        prompt_text = self.get_prompt_text_from_ui()
+        if not api_key:
+            messagebox.showwarning("Prompt Tests", "Please enter your OpenAI API key.")
+            return
+        if not model_name:
+            messagebox.showwarning("Prompt Tests", "Please select or enter an OpenAI model name.")
+            return
+        if not prompt_text:
+            messagebox.showwarning("Prompt Tests", "Prompt text is empty.")
+            return
+        if self.current_prompt_test_job_id:
+            messagebox.showwarning("Prompt Tests", "Prompt tests are already running.")
+            return
+        cases = [dict(case) for case in self.get_prompt_test_cases()]
+        if not cases:
+            messagebox.showwarning("Prompt Tests", "No prompt test cases are available.")
+            return
+        self.show_prompt_test_window(run_immediately=False)
+        for row_id in self.prompt_test_row_ids:
+            self.prompt_test_tree.item(row_id, tags=("pending",))
+        if self.prompt_test_run_btn is not None:
+            self.prompt_test_run_btn.config(state="disabled")
+        self.status_var.set("Running prompt tests...")
+        job = self.job_manager.submit(
+            "prompt_tests",
+            lambda ctx: self.data_prep_service.evaluate_prompt_test_cases(
+                api_key=api_key,
+                model_name=model_name,
+                prompt_text=prompt_text,
+                cases=cases,
+            ),
+            metadata={"operation": "prompt_tests", "case_count": len(cases)},
+        )
+        self.current_prompt_test_job_id = job.job_id
+
+    def update_prompt_test_results(self, cases: list[dict]):
+        if self.prompt_test_tree is None:
+            return
+        for index, case in enumerate(cases):
+            if index >= len(self.prompt_test_row_ids):
+                continue
+            got = clean_optional_string(case.get("got"))
+            expected = clean_optional_string(case.get("expected"))
+            is_match = bool(case.get("match"))
+            row_id = self.prompt_test_row_ids[index]
+            values = (
+                clean_optional_string(case.get("name")),
+                clean_optional_string(case.get("message")),
+                expected,
+                got,
+                "Pass" if is_match else "Fail",
+            )
+            self.prompt_test_tree.item(row_id, values=values, tags=("pass" if is_match else "fail",))
+
+    def show_prompt_comparison(self):
+        try:
+            comparison = self.mlops_service.compare_prompt_versions()
+        except Exception as exc:
+            messagebox.showerror("Prompt Versions", str(exc))
+            return
+
+        diff_text = clean_optional_string(comparison.get("diff"))
+        message = clean_optional_string(comparison.get("message"))
+        old_meta = comparison.get("old") if isinstance(comparison.get("old"), dict) else {}
+        new_meta = comparison.get("new") if isinstance(comparison.get("new"), dict) else {}
+
+        if not diff_text:
+            if message:
+                messagebox.showinfo("Prompt Versions", message)
+                return
+            diff_text = "No textual prompt changes."
+
+        old_label = clean_optional_string(old_meta.get("prompt_version_label")) or clean_optional_string(old_meta.get("prompt_version_id"))[:12]
+        new_label = clean_optional_string(new_meta.get("prompt_version_label")) or clean_optional_string(new_meta.get("prompt_version_id"))[:12]
+        header = (
+            f"Old prompt: {old_label or 'not available'}\n"
+            f"New prompt: {new_label or 'not available'}\n\n"
+        )
+
+        window = tk.Toplevel(self.root)
+        window.title("Prompt Version Comparison")
+        window.geometry("900x600")
+        window.minsize(640, 420)
+
+        frame = ttk.Frame(window, padding=(8, 8))
+        frame.pack(fill="both", expand=True)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        text_widget = tk.Text(frame, wrap="none", font=("Consolas", 10))
+        y_scroll = ttk.Scrollbar(frame, orient="vertical", command=text_widget.yview)
+        x_scroll = ttk.Scrollbar(frame, orient="horizontal", command=text_widget.xview)
+        text_widget.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        text_widget.insert("1.0", header + diff_text)
+        text_widget.configure(state="disabled")
+
     def prepare_data(self):
         api_key = self.openai_api_key_entry.get().strip()
         model_name = self.openai_model_var.get().strip()
         input_path = self.filepath_entry.get().strip()
+        prompt_text = self.get_prompt_text_from_ui()
         
         if not api_key:
             messagebox.showwarning("Warning", "Please enter your OpenAI API key.")
@@ -1635,6 +2026,9 @@ class LogProcessorApp:
             return
         if not input_path:
             messagebox.showwarning("Warning", "Please select a log file first.")
+            return
+        if not prompt_text:
+            messagebox.showwarning("Warning", "Prompt text is empty.")
             return
 
         save_path = filedialog.asksaveasfilename(
@@ -1659,6 +2053,8 @@ class LogProcessorApp:
                 api_key=api_key,
                 model_name=model_name,
                 mlflow_config=mlflow_config,
+                prompt_text=prompt_text,
+                prompt_source=self.get_prompt_source_from_ui(),
             )
         )
         self.current_data_prep_job_id = job.job_id

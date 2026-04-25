@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import html
 import json
 import os
@@ -75,6 +76,161 @@ class MlopsService:
         if not prompt_path.exists():
             raise FileNotFoundError("Could not find 'prompt.txt' in the application directory.")
         return prompt_path.read_text(encoding="utf-8")
+
+    def get_prompt_versions_root(self) -> Path:
+        root = self.project_dir / "outputs" / "prompt_versions"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def list_prompt_versions(self) -> list[dict]:
+        root = self.get_prompt_versions_root()
+        versions: list[dict] = []
+        for metadata_path in root.glob("*/metadata.json"):
+            payload = read_json(str(metadata_path)) or {}
+            if payload:
+                payload.setdefault("prompt_metadata_path", str(metadata_path.resolve()))
+                versions.append(payload)
+        return sorted(
+            versions,
+            key=lambda item: (
+                clean_optional_string(item.get("created_at")),
+                clean_optional_string(item.get("prompt_version_id")),
+            ),
+        )
+
+    def read_prompt_version_text(self, prompt_version_id: str) -> str:
+        clean_version = clean_optional_string(prompt_version_id)
+        if not clean_version:
+            raise ValueError("Prompt version id is empty.")
+        matches = [
+            version
+            for version in self.list_prompt_versions()
+            if clean_optional_string(version.get("prompt_version_id")).startswith(clean_version)
+            or clean_optional_string(version.get("prompt_hash")).startswith(clean_version)
+        ]
+        if not matches:
+            raise FileNotFoundError(f"Prompt version not found: {prompt_version_id}")
+        if len(matches) > 1 and all(
+            clean_optional_string(match.get("prompt_version_id")) != clean_version
+            and clean_optional_string(match.get("prompt_hash")) != clean_version
+            for match in matches
+        ):
+            raise ValueError(f"Prompt version prefix is ambiguous: {prompt_version_id}")
+        prompt_path = clean_optional_string(matches[-1].get("prompt_version_path"))
+        if not prompt_path:
+            raise FileNotFoundError(f"Prompt version has no prompt artifact path: {prompt_version_id}")
+        return Path(prompt_path).read_text(encoding="utf-8")
+
+    def build_prompt_diff(self, old_prompt: str, new_prompt: str, old_label: str, new_label: str) -> str:
+        diff_lines = difflib.unified_diff(
+            old_prompt.splitlines(),
+            new_prompt.splitlines(),
+            fromfile=old_label,
+            tofile=new_label,
+            lineterm="",
+        )
+        return "\n".join(diff_lines)
+
+    def compare_prompt_versions(self, old_version_id: str = "", new_version_id: str = "") -> dict:
+        versions = self.list_prompt_versions()
+        if not versions:
+            return {"message": "No prompt versions have been archived yet.", "diff": "", "old": {}, "new": {}}
+        if not new_version_id:
+            new = versions[-1]
+        else:
+            new = next(
+                (
+                    version
+                    for version in versions
+                    if clean_optional_string(version.get("prompt_version_id")).startswith(clean_optional_string(new_version_id))
+                    or clean_optional_string(version.get("prompt_hash")).startswith(clean_optional_string(new_version_id))
+                ),
+                None,
+            )
+            if new is None:
+                raise FileNotFoundError(f"Prompt version not found: {new_version_id}")
+
+        if not old_version_id:
+            earlier_versions = [
+                version
+                for version in versions
+                if clean_optional_string(version.get("prompt_version_id")) != clean_optional_string(new.get("prompt_version_id"))
+            ]
+            if not earlier_versions:
+                return {"message": "Only one prompt version is available.", "diff": "", "old": {}, "new": new}
+            old = earlier_versions[-1]
+        else:
+            old = next(
+                (
+                    version
+                    for version in versions
+                    if clean_optional_string(version.get("prompt_version_id")).startswith(clean_optional_string(old_version_id))
+                    or clean_optional_string(version.get("prompt_hash")).startswith(clean_optional_string(old_version_id))
+                ),
+                None,
+            )
+            if old is None:
+                raise FileNotFoundError(f"Prompt version not found: {old_version_id}")
+
+        old_text = self.read_prompt_version_text(clean_optional_string(old.get("prompt_version_id")))
+        new_text = self.read_prompt_version_text(clean_optional_string(new.get("prompt_version_id")))
+        old_label = f"prompt:{clean_optional_string(old.get('prompt_version_id'))[:12]}"
+        new_label = f"prompt:{clean_optional_string(new.get('prompt_version_id'))[:12]}"
+        diff_text = self.build_prompt_diff(old_text, new_text, old_label, new_label)
+        return {"message": "", "diff": diff_text, "old": old, "new": new}
+
+    def archive_prompt_version(self, prompt_text: str, metadata: dict | None = None) -> dict:
+        prompt_hash = prompt_sha256(prompt_text)
+        root = self.get_prompt_versions_root()
+        version_dir = root / prompt_hash
+        version_dir.mkdir(parents=True, exist_ok=True)
+        prompt_path = version_dir / "prompt.txt"
+        metadata_path = version_dir / "metadata.json"
+        comparison_path = version_dir / "comparison_from_previous.diff"
+
+        existing_metadata = read_json(str(metadata_path)) or {}
+        previous_versions = [
+            version
+            for version in self.list_prompt_versions()
+            if clean_optional_string(version.get("prompt_version_id")) != prompt_hash
+        ]
+        previous_version = previous_versions[-1] if previous_versions else {}
+        previous_version_id = clean_optional_string(previous_version.get("prompt_version_id"))
+
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+        payload = {
+            "prompt_version_id": prompt_hash,
+            "prompt_hash": prompt_hash,
+            "prompt_version_label": prompt_hash[:12],
+            "prompt_version_dir": str(version_dir.resolve()),
+            "prompt_version_path": str(prompt_path.resolve()),
+            "prompt_metadata_path": str(metadata_path.resolve()),
+            "prompt_comparison_path": str(comparison_path.resolve()) if previous_version_id else "",
+            "previous_prompt_version_id": previous_version_id,
+            "created_at": clean_optional_string(existing_metadata.get("created_at")) or now_utc_iso(),
+            "source_prompt_path": str((self.project_dir / "prompt.txt").resolve()),
+            "char_count": len(prompt_text),
+            "line_count": len(prompt_text.splitlines()),
+        }
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                if value is None:
+                    continue
+                payload[clean_optional_string(key)] = value
+
+        if previous_version_id:
+            previous_prompt = self.read_prompt_version_text(previous_version_id)
+            diff_text = self.build_prompt_diff(
+                previous_prompt,
+                prompt_text,
+                f"prompt:{previous_version_id[:12]}",
+                f"prompt:{prompt_hash[:12]}",
+            )
+            comparison_path.write_text(diff_text or "No textual prompt changes.\n", encoding="utf-8")
+            (root / "latest_comparison.diff").write_text(diff_text or "No textual prompt changes.\n", encoding="utf-8")
+
+        write_json(str(metadata_path), payload)
+        return payload
 
     def resolve_azure_mlflow_tracking_uri(self, ml_client: Any | None) -> str:
         if self.azure_tracking_uri:
@@ -206,6 +362,13 @@ class MlopsService:
             "data_version_id",
             "data_version_dir",
             "data_version_path",
+            "prompt_version_id",
+            "prompt_version_label",
+            "prompt_version_dir",
+            "prompt_version_path",
+            "prompt_metadata_path",
+            "prompt_comparison_path",
+            "previous_prompt_version_id",
             "azure_data_asset_name",
             "azure_data_asset_version",
             "azure_data_asset_uri",
@@ -284,6 +447,13 @@ class MlopsService:
             "input_dataset_hash": clean_optional_string(sidecar.get("input_dataset_hash")),
             "output_dataset_hash": clean_optional_string(sidecar.get("output_dataset_hash")),
             "llm_model": clean_optional_string(sidecar.get("llm_model")),
+            "prompt_version_id": clean_optional_string(sidecar.get("prompt_version_id")),
+            "prompt_version_label": clean_optional_string(sidecar.get("prompt_version_label")),
+            "prompt_version_dir": clean_optional_string(sidecar.get("prompt_version_dir")),
+            "prompt_version_path": clean_optional_string(sidecar.get("prompt_version_path")),
+            "prompt_metadata_path": clean_optional_string(sidecar.get("prompt_metadata_path")),
+            "prompt_comparison_path": clean_optional_string(sidecar.get("prompt_comparison_path")),
+            "previous_prompt_version_id": clean_optional_string(sidecar.get("previous_prompt_version_id")),
             "data_version_id": clean_optional_string(sidecar.get("data_version_id")),
             "data_version_dir": clean_optional_string(sidecar.get("data_version_dir")),
             "data_version_path": clean_optional_string(sidecar.get("data_version_path")),
@@ -298,6 +468,13 @@ class MlopsService:
             "input_dataset_hash": context["input_dataset_hash"],
             "output_dataset_hash": context["output_dataset_hash"],
             "llm_model": context["llm_model"],
+            "prompt_version_id": context["prompt_version_id"],
+            "prompt_version_label": context["prompt_version_label"],
+            "prompt_version_dir": context["prompt_version_dir"],
+            "prompt_version_path": context["prompt_version_path"],
+            "prompt_metadata_path": context["prompt_metadata_path"],
+            "prompt_comparison_path": context["prompt_comparison_path"],
+            "previous_prompt_version_id": context["previous_prompt_version_id"],
             "data_version_id": context["data_version_id"],
             "data_version_dir": context["data_version_dir"],
             "data_version_path": context["data_version_path"],
@@ -328,12 +505,21 @@ class MlopsService:
         output_hash: str,
         usage_totals: dict[str, int],
         data_version_info: dict | None = None,
+        prompt_version_info: dict | None = None,
     ) -> dict:
+        prompt_version_info = prompt_version_info or {}
         payload = {
             "pipeline_id": str(uuid.uuid4()),
             "parent_run_id": "",
             "data_prep_run_id": "",
             "prompt_hash": prompt_sha256(system_prompt),
+            "prompt_version_id": clean_optional_string(prompt_version_info.get("prompt_version_id", "")),
+            "prompt_version_label": clean_optional_string(prompt_version_info.get("prompt_version_label", "")),
+            "prompt_version_dir": clean_optional_string(prompt_version_info.get("prompt_version_dir", "")),
+            "prompt_version_path": clean_optional_string(prompt_version_info.get("prompt_version_path", "")),
+            "prompt_metadata_path": clean_optional_string(prompt_version_info.get("prompt_metadata_path", "")),
+            "prompt_comparison_path": clean_optional_string(prompt_version_info.get("prompt_comparison_path", "")),
+            "previous_prompt_version_id": clean_optional_string(prompt_version_info.get("previous_prompt_version_id", "")),
             "llm_model": clean_optional_string(llm_model),
             "input_dataset_hash": input_hash,
             "output_dataset_hash": output_hash,
@@ -351,6 +537,11 @@ class MlopsService:
         try:
             mlflow.set_tracking_uri(payload["tracking_uri"])
             mlflow.set_experiment(payload["experiment_name"])
+            data_prep_tags = {"run_type": "data_prep", "pipeline_id": payload["pipeline_id"]}
+            if payload["prompt_version_id"]:
+                data_prep_tags["prompt_version_id"] = payload["prompt_version_id"]
+            if payload["prompt_hash"]:
+                data_prep_tags["prompt_hash"] = payload["prompt_hash"]
             with mlflow.start_run(
                 run_name=f"pipeline-{payload['pipeline_id']}",
                 tags={"run_type": "pipeline", "pipeline_id": payload["pipeline_id"], "run_source": "data_prep"},
@@ -359,7 +550,7 @@ class MlopsService:
                 with mlflow.start_run(
                     run_name="data-prep",
                     nested=True,
-                    tags={"run_type": "data_prep", "pipeline_id": payload["pipeline_id"]},
+                    tags=data_prep_tags,
                 ) as child_run:
                     payload["data_prep_run_id"] = child_run.info.run_id
                     input_meta = dataframe_metadata(input_df, label_col="class")
@@ -368,6 +559,12 @@ class MlopsService:
                     mlflow.log_param("input_filename", os.path.basename(input_path))
                     mlflow.log_param("output_filename", os.path.basename(output_path))
                     mlflow.log_param("prompt_hash", payload["prompt_hash"])
+                    if payload["prompt_version_id"]:
+                        mlflow.log_param("prompt_version_id", payload["prompt_version_id"])
+                    if payload["prompt_version_label"]:
+                        mlflow.log_param("prompt_version_label", payload["prompt_version_label"])
+                    if payload["previous_prompt_version_id"]:
+                        mlflow.log_param("previous_prompt_version_id", payload["previous_prompt_version_id"])
                     mlflow.log_param("input_dataset_hash", payload["input_dataset_hash"])
                     mlflow.log_param("output_dataset_hash", payload["output_dataset_hash"])
                     if payload["data_version_id"]:
@@ -376,12 +573,17 @@ class MlopsService:
                         mlflow.log_param("data_version_path", payload["data_version_path"])
                     mlflow.log_metric("input_rows", int(input_meta.get("row_count", 0)))
                     mlflow.log_metric("output_rows", int(output_meta.get("row_count", 0)))
+                    mlflow.log_metric("prompt_chars", int(prompt_version_info.get("char_count", len(system_prompt)) or 0))
+                    mlflow.log_metric("prompt_lines", int(prompt_version_info.get("line_count", len(system_prompt.splitlines())) or 0))
                     for metric_name, metric_value in usage_totals.items():
                         mlflow.log_metric(metric_name, int(metric_value))
                     with tempfile.TemporaryDirectory() as tmp_dir:
                         prompt_preview_path = os.path.join(tmp_dir, "prompt_preview.txt")
                         with open(prompt_preview_path, "w", encoding="utf-8") as file_obj:
                             file_obj.write(safe_prompt_preview(system_prompt, max_chars=2000))
+                        prompt_artifact_path = os.path.join(tmp_dir, "prompt.txt")
+                        with open(prompt_artifact_path, "w", encoding="utf-8") as file_obj:
+                            file_obj.write(system_prompt)
                         metadata_path = os.path.join(tmp_dir, "data_prep_metadata.json")
                         write_json(
                             metadata_path,
@@ -390,6 +592,11 @@ class MlopsService:
                                 "input_path": input_path,
                                 "output_path": output_path,
                                 "prompt_hash": payload["prompt_hash"],
+                                "prompt_version_id": payload["prompt_version_id"],
+                                "prompt_version_label": payload["prompt_version_label"],
+                                "prompt_version_path": payload["prompt_version_path"],
+                                "prompt_comparison_path": payload["prompt_comparison_path"],
+                                "previous_prompt_version_id": payload["previous_prompt_version_id"],
                                 "input_dataset_hash": payload["input_dataset_hash"],
                                 "output_dataset_hash": payload["output_dataset_hash"],
                                 "data_version_id": payload["data_version_id"],
@@ -400,6 +607,11 @@ class MlopsService:
                                 "created_at": payload["created_at"],
                             },
                         )
+                        local_prompt_metadata_path = os.path.join(tmp_dir, "prompt_metadata.json")
+                        write_json(local_prompt_metadata_path, prompt_version_info)
+                        comparison_source_path = payload["prompt_comparison_path"]
+                        if comparison_source_path and os.path.exists(comparison_source_path):
+                            shutil.copy2(comparison_source_path, os.path.join(tmp_dir, "prompt_comparison.diff"))
                         sample_path = os.path.join(tmp_dir, "output_sample.csv")
                         dataframe_sample(output_df, max_rows=100, max_cell_chars=200).to_csv(sample_path, index=False)
                         mlflow.log_artifacts(tmp_dir, artifact_path="data_prep")

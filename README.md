@@ -371,6 +371,10 @@ The desktop UI provides:
 - `Log File (CSV)`: raw logs
 - `OpenAI API Key`: required for labeling
 - `OpenAI Model`: OpenAI model used for labeling
+- `Prompt Lab`: editable labeling prompt, initialized from `prompt.txt`
+- `Version`: choose `default` or an archived prompt version as the editable starting point
+- `Run Prompt Tests`: runs the current prompt against built-in and custom test cases and shows `Expected`, `Got`, and pass/fail results
+- `Compare Prompt Versions`: opens a diff between the two latest archived prompt versions
 - `Prepare Data (OpenAI)`: starts LLM labeling
 
 ### Model Training
@@ -699,7 +703,10 @@ When MLflow is enabled, the app tracks both data preparation and training.
 The labeling pipeline logs:
 
 - prompt hash
-- prompt preview artifact
+- immutable prompt version ID
+- full prompt artifact and prompt preview artifact
+- prompt metadata, including prompt length and previous prompt version
+- prompt comparison diff when a previous prompt version exists
 - input dataset hash
 - output dataset hash
 - input/output dataset metadata
@@ -721,6 +728,13 @@ That sidecar carries lineage such as:
 - `parent_run_id`
 - `data_prep_run_id`
 - `prompt_hash`
+- `prompt_version_id`
+- `prompt_version_label`
+- `prompt_version_dir`
+- `prompt_version_path`
+- `prompt_metadata_path`
+- `prompt_comparison_path`
+- `previous_prompt_version_id`
 - `llm_model`
 - `input_dataset_hash`
 - `output_dataset_hash`
@@ -730,6 +744,26 @@ That sidecar carries lineage such as:
 - tracking URI / experiment name
 - data-prep tracking URI / experiment name
 - training tracking URI / experiment name
+
+The Prompt Lab in the desktop UI starts with the contents of `prompt.txt`, but users can edit the prompt before running data preparation. The exact UI prompt used for labeling is what gets archived and logged.
+
+The Prompt Lab version dropdown shows `default` for the current `prompt.txt` plus archived prompt versions. Selecting an archived version loads it into the editor as a starting point; edits do not mutate that version. Running data preparation archives the edited text as a new immutable prompt version.
+
+Prompt versions are archived locally under:
+
+```text
+./outputs/prompt_versions/<prompt_sha256>/
+```
+
+Each prompt version directory contains:
+
+- `prompt.txt`
+- `metadata.json`
+- `comparison_from_previous.diff` when there is a previous version
+
+The desktop UI also provides `Compare Prompt Versions`, which opens a unified diff between the two latest archived prompt versions.
+
+Prompt unit tests can be run from the UI before labeling. Built-in and custom test cases compare expected classes against LLM-returned classes and color each row green or red.
 
 ### Training Tracking
 
@@ -749,6 +783,7 @@ Training logs:
 - selected config parameters
 - `model_version_id`
 - `data_version_id` when dataset lineage is available
+- `prompt_version_id` when prompt lineage is available
 - resolved device and runtime mode
 - dataset metadata
 - split metadata

@@ -1,5 +1,6 @@
 agents.md
 outputs/
+outputs/prompt_versions/
 downloaded_model/
 __pycache__/
 mlruns/

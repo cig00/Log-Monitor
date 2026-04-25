@@ -28,6 +28,8 @@ class DataPrepRequest:
     api_key: str
     model_name: str
     mlflow_config: MlflowConfig
+    prompt_text: str = ""
+    prompt_source: str = ""
 
 
 @dataclass(slots=True)

@@ -815,6 +815,12 @@ def main():
             lambda: mlflow.log_param("data_version_id", clean_optional_string(lineage_tags.get("data_version_id", ""))),
             "log data_version_id",
         )
+    if clean_optional_string(lineage_tags.get("prompt_version_id", "")):
+        safe_mlflow_call(
+            mlflow_enabled,
+            lambda: mlflow.log_param("prompt_version_id", clean_optional_string(lineage_tags.get("prompt_version_id", ""))),
+            "log prompt_version_id",
+        )
     if clean_optional_string(lineage_tags.get("azure_data_asset_uri", "")):
         safe_mlflow_call(
             mlflow_enabled,
@@ -847,6 +853,13 @@ def main():
         "azure_data_asset_id": clean_optional_string(lineage_tags.get("azure_data_asset_id", "")),
         "azure_data_asset_path": clean_optional_string(lineage_tags.get("azure_data_asset_path", "")),
         "prompt_hash": clean_optional_string(lineage_tags.get("prompt_hash", "")),
+        "prompt_version_id": clean_optional_string(lineage_tags.get("prompt_version_id", "")),
+        "prompt_version_label": clean_optional_string(lineage_tags.get("prompt_version_label", "")),
+        "prompt_version_dir": clean_optional_string(lineage_tags.get("prompt_version_dir", "")),
+        "prompt_version_path": clean_optional_string(lineage_tags.get("prompt_version_path", "")),
+        "prompt_metadata_path": clean_optional_string(lineage_tags.get("prompt_metadata_path", "")),
+        "prompt_comparison_path": clean_optional_string(lineage_tags.get("prompt_comparison_path", "")),
+        "previous_prompt_version_id": clean_optional_string(lineage_tags.get("previous_prompt_version_id", "")),
         "llm_model": clean_optional_string(lineage_tags.get("llm_model", "")),
         "dataset_metadata": dataset_meta,
         "split_metadata": split_metadata,

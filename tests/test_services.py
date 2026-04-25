@@ -8,10 +8,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 from app_core.azure_platform_service import AzurePlatformService
+from app_core.data_prep_service import DataPrepService
 from app_core.github_service import GitHubService
 from app_core.mlops_service import MlopsService
 from app_core.model_catalog_service import ModelCatalogService
-from app_core.runtime import ArtifactStore
+from app_core.runtime import ArtifactStore, JobManager, StateStore
 
 
 class ServiceTests(unittest.TestCase):
@@ -21,6 +22,8 @@ class ServiceTests(unittest.TestCase):
         (self.project_dir / "outputs").mkdir(parents=True, exist_ok=True)
         (self.project_dir / "prompt.txt").write_text("prompt body", encoding="utf-8")
         self.artifact_store = ArtifactStore(str(self.project_dir))
+        self.state_store = StateStore(self.artifact_store.state_db_path)
+        self.job_manager = JobManager(self.state_store)
         self.model_catalog = ModelCatalogService(str(self.project_dir), self.artifact_store)
         self.mlops = MlopsService(
             str(self.project_dir),
@@ -30,6 +33,7 @@ class ServiceTests(unittest.TestCase):
             workspace_name="ws",
             local_tracking_uri=str(self.project_dir / "mlruns"),
         )
+        self.data_prep = DataPrepService(self.job_manager, self.mlops, self.model_catalog)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -73,6 +77,45 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertFalse(config.enabled)
         self.assertEqual(self.mlops.load_prompt(), "prompt body")
+
+    def test_mlops_service_versions_and_compares_prompts(self):
+        first = self.mlops.archive_prompt_version("classify logs\nreturn json", {"llm_model": "gpt-test"})
+        second = self.mlops.archive_prompt_version("classify logs by root cause\nreturn json", {"llm_model": "gpt-test"})
+
+        self.assertTrue(Path(first["prompt_version_path"]).exists())
+        self.assertTrue(Path(second["prompt_version_path"]).exists())
+        self.assertEqual(first["prompt_hash"], first["prompt_version_id"])
+        self.assertEqual(second["previous_prompt_version_id"], first["prompt_version_id"])
+        self.assertTrue(Path(second["prompt_comparison_path"]).exists())
+
+        versions = self.mlops.list_prompt_versions()
+        self.assertEqual(len(versions), 2)
+        comparison = self.mlops.compare_prompt_versions()
+        self.assertIn("-classify logs", comparison["diff"])
+        self.assertIn("+classify logs by root cause", comparison["diff"])
+
+    def test_data_prep_service_evaluates_prompt_test_cases(self):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps({"results": [{"class": "CONFIGURATION"}, {"class": "Noise"}]})}}],
+            "usage": {"total_tokens": 12},
+        }
+        cases = [
+            {"name": "Config", "message": "missing MAIL_HOST", "expected": "CONFIGURATION"},
+            {"name": "Noise", "message": "processed Canceled", "expected": "Noise"},
+        ]
+        with mock.patch("app_core.data_prep_service.requests.post", return_value=response):
+            result = self.data_prep.evaluate_prompt_test_cases(
+                api_key="key",
+                model_name="gpt-test",
+                prompt_text="classify logs",
+                cases=cases,
+            )
+
+        self.assertEqual(result["usage"]["total_tokens"], 12)
+        self.assertTrue(all(case["match"] for case in result["cases"]))
+        self.assertEqual(result["cases"][0]["got"], "CONFIGURATION")
 
     def test_azure_platform_registers_versioned_data_asset(self):
         dataset_path = self.project_dir / "labeled.csv"

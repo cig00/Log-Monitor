@@ -90,7 +90,7 @@ class AzurePlatformService:
             cleaned = (cleaned + "logmonitor")[:max_length]
         return cleaned or "logmonitorstore"
 
-    def sanitize_azure_asset_version(self, raw_value: str, max_length: int = 255) -> str:
+    def sanitize_azure_asset_version(self, raw_value: str, max_length: int = 50) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "-", clean_optional_string(raw_value))
         cleaned = re.sub(r"-+", "-", cleaned).strip("-._")
         cleaned = cleaned[:max_length].strip("-._")

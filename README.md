@@ -569,7 +569,7 @@ Azure training flow:
 
 Azure job notes:
 
-- Azure data asset versions are derived from the local dataset SHA-256 hash, so identical labeled CSV content reuses the same version.
+- Azure data asset versions are derived from the local dataset SHA-256 hash and truncated to Azure's 50-character version limit, so identical labeled CSV content reuses the same version.
 - The registered data asset URI is written into the CSV sidecar and training metadata as `azure_data_asset_uri`.
 - The job uses the curated environment `AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest`.
 - MLflow env vars are injected into the Azure job when tracking is enabled.

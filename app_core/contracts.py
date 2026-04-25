@@ -62,6 +62,10 @@ class HostingRequest:
     batch_hour: int = 0
     batch_minute: int = 0
     batch_timezone: str = "UTC"
+    create_github_pr: bool = False
+    github_token: str = ""
+    github_repo: str = ""
+    github_branch: str = ""
 
 
 @dataclass(slots=True)

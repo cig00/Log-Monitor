@@ -110,6 +110,7 @@ class LogProcessorApp:
             self.mlops_service,
             self.azure_platform_service,
             self.observability_service,
+            self.github_service,
         )
         self.current_data_prep_job_id = ""
         self.current_training_job_id = ""
@@ -155,6 +156,8 @@ class LogProcessorApp:
         self.azure_mlops_url_var = tk.StringVar(value="")
         self.azure_llmops_url_var = tk.StringVar(value="")
         self.azure_hosted_endpoint_name_var = tk.StringVar(value="")
+        self.create_pr_var = tk.BooleanVar(value=False)
+        self.github_pr_url_var = tk.StringVar(value="")
         self.azure_host_sub_var.trace_add("write", lambda *_: self.refresh_azure_dashboard_links())
         self.azure_serverless_endpoint_name_var.trace_add("write", self.on_azure_serverless_endpoint_name_changed)
         self.prompt_test_window = None
@@ -471,6 +474,12 @@ class LogProcessorApp:
 
         self.load_repos_btn = ttk.Button(hosting_frame, text="Load Repos", command=self.start_repo_thread)
         self.load_repos_btn.grid(row=0, column=2, padx=5, pady=5)
+        self.create_pr_check = ttk.Checkbutton(
+            hosting_frame,
+            text="Create PR",
+            variable=self.create_pr_var,
+        )
+        self.create_pr_check.grid(row=0, column=3, sticky="w", padx=5, pady=5)
 
         ttk.Label(hosting_frame, text="Repository:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.repo_combo = ttk.Combobox(hosting_frame, state="readonly", width=28)
@@ -671,47 +680,62 @@ class LogProcessorApp:
         )
         self.open_hosting_api_btn.grid(row=12, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Hosting Status:").grid(row=13, column=0, sticky="nw", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="GitHub PR Task:").grid(row=13, column=0, sticky="w", padx=5, pady=5)
+        self.github_pr_url_entry = ttk.Entry(
+            hosting_frame,
+            textvariable=self.github_pr_url_var,
+            width=30,
+            state="readonly",
+        )
+        self.github_pr_url_entry.grid(row=13, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.open_github_pr_btn = ttk.Button(
+            hosting_frame,
+            text="Open PR Task",
+            command=lambda: self.open_url_value(self.github_pr_url_var.get(), "GitHub PR task"),
+        )
+        self.open_github_pr_btn.grid(row=13, column=3, padx=5, pady=5)
+
+        ttk.Label(hosting_frame, text="Hosting Status:").grid(row=14, column=0, sticky="nw", padx=5, pady=5)
         self.hosting_status_label = ttk.Label(
             hosting_frame,
             textvariable=self.hosting_mode_summary_var,
             wraplength=460,
             justify="left",
         )
-        self.hosting_status_label.grid(row=13, column=1, columnspan=3, sticky="w", padx=5, pady=5)
+        self.hosting_status_label.grid(row=14, column=1, columnspan=3, sticky="w", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Azure MLOps URL:").grid(row=14, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Azure MLOps URL:").grid(row=15, column=0, sticky="w", padx=5, pady=5)
         self.azure_mlops_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.azure_mlops_url_var,
             width=30,
             state="readonly",
         )
-        self.azure_mlops_url_entry.grid(row=14, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_mlops_url_entry.grid(row=15, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_azure_mlops_btn = ttk.Button(
             hosting_frame,
             text="Open MLOps",
             command=lambda: self.open_url_value(self.azure_mlops_url_var.get(), "Azure MLOps dashboard"),
         )
-        self.open_azure_mlops_btn.grid(row=14, column=3, padx=5, pady=5)
+        self.open_azure_mlops_btn.grid(row=15, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Azure LLMOps URL:").grid(row=15, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Azure LLMOps URL:").grid(row=16, column=0, sticky="w", padx=5, pady=5)
         self.azure_llmops_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.azure_llmops_url_var,
             width=30,
             state="readonly",
         )
-        self.azure_llmops_url_entry.grid(row=15, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_llmops_url_entry.grid(row=16, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_azure_llmops_btn = ttk.Button(
             hosting_frame,
             text="Open LLMOps",
             command=lambda: self.open_url_value(self.azure_llmops_url_var.get(), "Azure LLMOps dashboard"),
         )
-        self.open_azure_llmops_btn.grid(row=15, column=3, padx=5, pady=5)
+        self.open_azure_llmops_btn.grid(row=16, column=3, padx=5, pady=5)
 
         ttk.Separator(hosting_frame, orient="horizontal").grid(
-            row=16,
+            row=17,
             column=0,
             columnspan=4,
             sticky="ew",
@@ -719,16 +743,16 @@ class LogProcessorApp:
             pady=(4, 8),
         )
 
-        ttk.Label(hosting_frame, text="MLflow Enabled:").grid(row=17, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="MLflow Enabled:").grid(row=18, column=0, sticky="w", padx=5, pady=5)
         self.mlflow_enabled_var = tk.BooleanVar(value=True)
         self.mlflow_enabled_check = ttk.Checkbutton(
             hosting_frame,
             variable=self.mlflow_enabled_var,
             command=self.on_mlflow_enabled_change,
         )
-        self.mlflow_enabled_check.grid(row=17, column=1, sticky="w", padx=5, pady=5)
+        self.mlflow_enabled_check.grid(row=18, column=1, sticky="w", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="MLflow Backend:").grid(row=17, column=2, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="MLflow Backend:").grid(row=18, column=2, sticky="w", padx=5, pady=5)
         self.mlflow_backend_var = tk.StringVar(value="local")
         self.mlflow_backend_combo = ttk.Combobox(
             hosting_frame,
@@ -737,10 +761,10 @@ class LogProcessorApp:
             values=["local", "azure", "custom_uri"],
             width=15,
         )
-        self.mlflow_backend_combo.grid(row=17, column=3, sticky="ew", padx=5, pady=5)
+        self.mlflow_backend_combo.grid(row=18, column=3, sticky="ew", padx=5, pady=5)
         self.mlflow_backend_combo.bind("<<ComboboxSelected>>", self.on_mlflow_backend_change)
 
-        ttk.Label(hosting_frame, text="Tracking URI:").grid(row=18, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Tracking URI:").grid(row=19, column=0, sticky="w", padx=5, pady=5)
         self.mlflow_tracking_uri_var = tk.StringVar(value=self.local_mlflow_tracking_uri)
         self.mlflow_tracking_uri_entry = ttk.Entry(
             hosting_frame,
@@ -748,39 +772,39 @@ class LogProcessorApp:
             width=30,
             state="readonly",
         )
-        self.mlflow_tracking_uri_entry.grid(row=18, column=1, columnspan=3, sticky="ew", padx=5, pady=5)
+        self.mlflow_tracking_uri_entry.grid(row=19, column=1, columnspan=3, sticky="ew", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Experiment Name:").grid(row=19, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Experiment Name:").grid(row=20, column=0, sticky="w", padx=5, pady=5)
         self.mlflow_experiment_var = tk.StringVar(value="")
         self.mlflow_experiment_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.mlflow_experiment_var,
             width=24,
         )
-        self.mlflow_experiment_entry.grid(row=19, column=1, sticky="ew", padx=5, pady=5)
+        self.mlflow_experiment_entry.grid(row=20, column=1, sticky="ew", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Registered Model:").grid(row=19, column=2, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Registered Model:").grid(row=20, column=2, sticky="w", padx=5, pady=5)
         self.mlflow_registered_model_var = tk.StringVar(value="")
         self.mlflow_registered_model_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.mlflow_registered_model_var,
             width=24,
         )
-        self.mlflow_registered_model_entry.grid(row=19, column=3, sticky="ew", padx=5, pady=5)
+        self.mlflow_registered_model_entry.grid(row=20, column=3, sticky="ew", padx=5, pady=5)
 
         self.open_mlflow_btn = ttk.Button(
             hosting_frame,
             text="Open Dashboard",
             command=self.open_mlflow_console,
         )
-        self.open_mlflow_btn.grid(row=20, column=0, columnspan=2, sticky="ew", padx=5, pady=8)
+        self.open_mlflow_btn.grid(row=21, column=0, columnspan=2, sticky="ew", padx=5, pady=8)
 
         self.register_model_btn = ttk.Button(
             hosting_frame,
             text="Register Last Model",
             command=self.register_last_model_version,
         )
-        self.register_model_btn.grid(row=20, column=2, columnspan=2, sticky="ew", padx=5, pady=8)
+        self.register_model_btn.grid(row=21, column=2, columnspan=2, sticky="ew", padx=5, pady=8)
 
         # Status Bar
         self.status_var = tk.StringVar()
@@ -907,6 +931,7 @@ class LogProcessorApp:
             self.azure_mlops_url_var.set(clean_optional_string(event.payload.get("mlops_url")))
             self.azure_llmops_url_var.set(clean_optional_string(event.payload.get("llmops_url")))
             self.azure_hosted_endpoint_name_var.set(clean_optional_string(event.payload.get("endpoint_name")))
+            self.github_pr_url_var.set(clean_optional_string(event.payload.get("github_pr_url")))
             self.finish_hosting_action()
             self.status_var.set(clean_optional_string(event.payload.get("message")) or "Hosting is ready.")
             messagebox.showinfo("Hosting Ready", event.payload.get("message", "Hosting is ready."))
@@ -1422,6 +1447,7 @@ class LogProcessorApp:
             self.refresh_hosted_model_inventory(preferred_path=resolved_model_dir)
         self.hosting_api_url_var.set("")
         self.hosting_mode_summary_var.set("")
+        self.github_pr_url_var.set("")
 
         if not self.begin_hosting_action():
             messagebox.showwarning("Hosting In Progress", "A hosting workflow is already running.")
@@ -1431,6 +1457,27 @@ class LogProcessorApp:
             "model_dir": resolved_model_dir,
             "mode": hosting_mode,
         }
+        create_github_pr = bool(self.create_pr_var.get())
+        github_token = clean_optional_string(self.github_key_entry.get())
+        github_repo = clean_optional_string(self.repo_combo.get())
+        github_branch = clean_optional_string(self.branch_combo.get())
+        if create_github_pr:
+            if hosting_mode != "azure":
+                self.finish_hosting_action()
+                messagebox.showwarning("Hosting", "Create PR needs an Azure-hosted endpoint that the GitHub app can reach.")
+                return
+            if not github_token:
+                self.finish_hosting_action()
+                messagebox.showwarning("Hosting", "Please enter a GitHub PAT before creating a PR task.")
+                return
+            if not github_repo:
+                self.finish_hosting_action()
+                messagebox.showwarning("Hosting", "Please select a GitHub repository before creating a PR task.")
+                return
+            if not github_branch:
+                self.finish_hosting_action()
+                messagebox.showwarning("Hosting", "Please select a GitHub branch before creating a PR task.")
+                return
         if hosting_mode == "azure":
             if not AZURE_AVAILABLE:
                 self.finish_hosting_action()
@@ -1518,6 +1565,10 @@ class LogProcessorApp:
                     "batch_hour": batch_hour,
                     "batch_minute": batch_minute,
                     "batch_timezone": batch_timezone,
+                    "create_github_pr": create_github_pr,
+                    "github_token": github_token,
+                    "github_repo": github_repo,
+                    "github_branch": github_branch,
                 }
             )
             job = self.hosting_service.submit_hosting(HostingRequest(**request_kwargs))
@@ -1569,6 +1620,10 @@ class LogProcessorApp:
             auto_install_missing_tools = True
 
         request_kwargs["auto_install_missing_tools"] = auto_install_missing_tools
+        request_kwargs["create_github_pr"] = create_github_pr
+        request_kwargs["github_token"] = github_token
+        request_kwargs["github_repo"] = github_repo
+        request_kwargs["github_branch"] = github_branch
         job = self.hosting_service.submit_hosting(HostingRequest(**request_kwargs))
         self.current_hosting_job_id = job.job_id
 

@@ -410,6 +410,7 @@ Local runtime policy:
 - `GitHub PAT`
 - `Repository`
 - `Branch`
+- `Create PR`: after hosting succeeds, create a GitHub Copilot coding-agent task in the selected repo/branch to add async log forwarding to the created endpoint
 - `Generated Model`
 - `Host Target`
 - Azure-host-only fields:
@@ -421,14 +422,17 @@ Local runtime policy:
   - `Endpoint Name`
 - outputs:
   - `Endpoint URL`
+  - `GitHub PR Task`
   - `Hosting Status`
   - `Azure MLOps URL`
   - `Azure LLMOps URL`
 
-Important note about GitHub fields:
+Important note about GitHub PR automation:
 
-- the GitHub PAT, repository, and branch controls currently load repo and branch lists from GitHub
-- they do not currently drive training or hosting behavior
+- the app creates a GitHub issue assigned to `copilot-swe-agent[bot]` using GitHub's Copilot coding-agent API
+- Copilot opens or updates the implementation PR in the background when the repository/account supports Copilot coding agent
+- the Copilot task prompt focuses on non-blocking log forwarding so the target app does not wait for endpoint calls in the user-facing path
+- the generated Copilot task prompt is versioned under `./outputs/copilot_pr_prompts` for LLMOps traceability
 
 ### MLflow Controls
 
@@ -972,7 +976,7 @@ If local device is `cuda` and host training fails the preflight check:
 
 ## Known Limitations
 
-- The GitHub repo/branch UI controls currently browse GitHub metadata only; they are not wired into deployment automation.
+- Create PR requires GitHub Issues and Copilot coding agent to be enabled for the selected repository/account, and the PAT must have enough repository, issue, and pull request permissions.
 - Azure training cleanup deletes temporary compute clusters, but Azure hosting does not yet fully clean up partially created endpoint assets on failure.
 - Azure region is currently hardcoded to `eastus`.
 - Local container training assumes the Docker training image already exists.

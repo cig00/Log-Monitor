@@ -16,6 +16,7 @@ from mlops_utils import (
 
 from .azure_platform_service import AZURE_AVAILABLE, AzurePlatformService
 from .contracts import HostingRequest
+from .github_service import GitHubService
 from .mlops_service import MlopsService
 from .model_catalog_service import ModelCatalogService
 from .observability_service import ObservabilityService
@@ -31,6 +32,7 @@ class HostingService:
         mlops_service: MlopsService,
         azure_platform_service: AzurePlatformService,
         observability_service: ObservabilityService,
+        github_service: GitHubService | None = None,
     ):
         self.project_dir = Path(project_dir).expanduser().resolve()
         self.job_manager = job_manager
@@ -38,6 +40,7 @@ class HostingService:
         self.mlops_service = mlops_service
         self.azure_platform_service = azure_platform_service
         self.observability_service = observability_service
+        self.github_service = github_service or GitHubService()
 
     def submit_hosting(self, request: HostingRequest):
         return self.job_manager.submit(
@@ -54,8 +57,108 @@ class HostingService:
 
     def _run(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
         if request.mode == "azure":
-            return self._run_azure_hosting(ctx, request)
-        return self._run_local_hosting(ctx, request)
+            result = self._run_azure_hosting(ctx, request)
+        else:
+            result = self._run_local_hosting(ctx, request)
+        if request.create_github_pr:
+            self._attach_github_copilot_pr_task(ctx, request, result)
+        return result
+
+    def _attach_github_copilot_pr_task(self, ctx: JobContext, request: HostingRequest, result: dict[str, Any]) -> None:
+        def persist_pr_metadata(extra: dict[str, Any]) -> None:
+            try:
+                hosting_meta = self.model_catalog_service.read_last_hosting_metadata() or {}
+                hosting_meta.update(extra)
+                result["metadata_path"] = self.model_catalog_service.save_last_hosting_metadata(hosting_meta)
+            except Exception:
+                pass
+
+        endpoint_url = clean_optional_string(result.get("api_url"))
+        if not endpoint_url:
+            result["github_pr_error"] = "Could not create the Copilot PR task because no endpoint URL was returned."
+            result["summary"] = clean_optional_string(result.get("summary")) + f"\nCopilot PR task: {result['github_pr_error']}"
+            persist_pr_metadata({"github_pr_error": result["github_pr_error"]})
+            return
+        ctx.emit("progress", "Creating GitHub Copilot PR task...")
+        prompt_info: dict[str, Any] = {}
+        try:
+            prompt_text = self.github_service.build_log_forwarding_copilot_prompt(
+                repo_name=request.github_repo,
+                base_branch=request.github_branch,
+                endpoint_url=endpoint_url,
+                endpoint_name=clean_optional_string(result.get("endpoint_name")),
+                endpoint_auth_mode=clean_optional_string(result.get("endpoint_auth_mode")),
+                service_kind=clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
+                hosting_mode=request.mode,
+            )
+            prompt_info = self.mlops_service.archive_copilot_pr_prompt(
+                prompt_text,
+                {
+                    "repo_name": request.github_repo,
+                    "base_branch": request.github_branch,
+                    "endpoint_url": endpoint_url,
+                    "endpoint_name": clean_optional_string(result.get("endpoint_name")),
+                    "service_kind": clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
+                    "hosting_mode": request.mode,
+                    "copilot_model": "github-default-best-available",
+                    "copilot_assignee": "copilot-swe-agent[bot]",
+                },
+            )
+            pr_task = self.github_service.create_copilot_log_forwarding_pr_task(
+                token=request.github_token,
+                repo_name=request.github_repo,
+                base_branch=request.github_branch,
+                endpoint_url=endpoint_url,
+                endpoint_name=clean_optional_string(result.get("endpoint_name")),
+                endpoint_auth_mode=clean_optional_string(result.get("endpoint_auth_mode")),
+                service_kind=clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
+                hosting_mode=request.mode,
+                copilot_model="",
+                prompt_text=prompt_text,
+            )
+            prompt_info.update(
+                self.mlops_service.archive_copilot_pr_prompt(
+                    prompt_text,
+                    {
+                        "repo_name": request.github_repo,
+                        "base_branch": request.github_branch,
+                        "endpoint_url": endpoint_url,
+                        "endpoint_name": clean_optional_string(result.get("endpoint_name")),
+                        "service_kind": clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
+                        "hosting_mode": request.mode,
+                        "github_issue_number": pr_task.get("issue_number"),
+                        "github_issue_url": clean_optional_string(pr_task.get("html_url")),
+                        "copilot_model": clean_optional_string(pr_task.get("copilot_model")),
+                        "copilot_assignee": clean_optional_string(pr_task.get("copilot_assignee")),
+                    },
+                )
+            )
+            safe_pr_task = {key: value for key, value in pr_task.items() if key != "prompt_text"}
+            safe_pr_task.update(prompt_info)
+            result["github_pr_task"] = safe_pr_task
+            result["github_pr_url"] = clean_optional_string(pr_task.get("html_url"))
+            result["github_pr_error"] = ""
+            result["message"] = f"{clean_optional_string(result.get('message')) or 'Hosting is ready.'} Copilot PR task created."
+            result["summary"] = (
+                clean_optional_string(result.get("summary"))
+                + f"\nCopilot PR task: {clean_optional_string(pr_task.get('html_url'))}"
+                + f"\nCopilot prompt version: {clean_optional_string(prompt_info.get('copilot_prompt_version_label'))}"
+            )
+            persist_pr_metadata(
+                {
+                    "github_pr_task": safe_pr_task,
+                    "github_pr_url": result["github_pr_url"],
+                    "github_pr_error": "",
+                }
+            )
+        except Exception as exc:
+            result["github_pr_error"] = clean_optional_string(exc)
+            result["summary"] = (
+                clean_optional_string(result.get("summary"))
+                + "\nCopilot PR task failed: "
+                + result["github_pr_error"]
+            )
+            persist_pr_metadata({"github_pr_error": result["github_pr_error"], "github_pr_prompt": prompt_info})
 
     def _run_local_hosting(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
         serve_script = os.path.join(self.project_dir, "serve_model.py")

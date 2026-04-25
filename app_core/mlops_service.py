@@ -232,6 +232,80 @@ class MlopsService:
         write_json(str(metadata_path), payload)
         return payload
 
+    def get_copilot_pr_prompts_root(self) -> Path:
+        root = self.project_dir / "outputs" / "copilot_pr_prompts"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def list_copilot_pr_prompt_versions(self) -> list[dict]:
+        root = self.get_copilot_pr_prompts_root()
+        versions: list[dict] = []
+        for metadata_path in root.glob("*/metadata.json"):
+            payload = read_json(str(metadata_path)) or {}
+            if payload:
+                payload.setdefault("copilot_prompt_metadata_path", str(metadata_path.resolve()))
+                versions.append(payload)
+        return sorted(
+            versions,
+            key=lambda item: (
+                clean_optional_string(item.get("created_at")),
+                clean_optional_string(item.get("copilot_prompt_version_id")),
+            ),
+        )
+
+    def archive_copilot_pr_prompt(self, prompt_text: str, metadata: dict | None = None) -> dict:
+        prompt_hash = prompt_sha256(prompt_text)
+        root = self.get_copilot_pr_prompts_root()
+        version_dir = root / prompt_hash
+        version_dir.mkdir(parents=True, exist_ok=True)
+        prompt_path = version_dir / "copilot_prompt.txt"
+        metadata_path = version_dir / "metadata.json"
+        comparison_path = version_dir / "comparison_from_previous.diff"
+
+        existing_metadata = read_json(str(metadata_path)) or {}
+        previous_versions = [
+            version
+            for version in self.list_copilot_pr_prompt_versions()
+            if clean_optional_string(version.get("copilot_prompt_version_id")) != prompt_hash
+        ]
+        previous_version = previous_versions[-1] if previous_versions else {}
+        previous_version_id = clean_optional_string(previous_version.get("copilot_prompt_version_id"))
+
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+        payload = {
+            "copilot_prompt_version_id": prompt_hash,
+            "copilot_prompt_hash": prompt_hash,
+            "copilot_prompt_version_label": prompt_hash[:12],
+            "copilot_prompt_version_dir": str(version_dir.resolve()),
+            "copilot_prompt_path": str(prompt_path.resolve()),
+            "copilot_prompt_metadata_path": str(metadata_path.resolve()),
+            "copilot_prompt_comparison_path": str(comparison_path.resolve()) if previous_version_id else "",
+            "previous_copilot_prompt_version_id": previous_version_id,
+            "created_at": clean_optional_string(existing_metadata.get("created_at")) or now_utc_iso(),
+            "char_count": len(prompt_text),
+            "line_count": len(prompt_text.splitlines()),
+        }
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                if value is None or clean_optional_string(key) == "prompt_text":
+                    continue
+                payload[clean_optional_string(key)] = value
+
+        if previous_version_id:
+            previous_prompt_path = clean_optional_string(previous_version.get("copilot_prompt_path"))
+            previous_prompt = Path(previous_prompt_path).read_text(encoding="utf-8") if previous_prompt_path else ""
+            diff_text = self.build_prompt_diff(
+                previous_prompt,
+                prompt_text,
+                f"copilot-pr:{previous_version_id[:12]}",
+                f"copilot-pr:{prompt_hash[:12]}",
+            )
+            comparison_path.write_text(diff_text or "No textual Copilot prompt changes.\n", encoding="utf-8")
+            (root / "latest_comparison.diff").write_text(diff_text or "No textual Copilot prompt changes.\n", encoding="utf-8")
+
+        write_json(str(metadata_path), payload)
+        return payload
+
     def resolve_azure_mlflow_tracking_uri(self, ml_client: Any | None) -> str:
         if self.azure_tracking_uri:
             return self.azure_tracking_uri

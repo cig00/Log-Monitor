@@ -70,7 +70,6 @@ class LogProcessorApp:
         self.root.minsize(650, 620)
         self.root.resizable(True, True)
         self.project_dir = os.path.dirname(os.path.abspath(__file__))
-        self.azure_mlflow_tracking_uri = ""
         self.local_mlflow_tracking_uri = local_mlflow_tracking_uri()
         self.artifact_store = ArtifactStore(self.project_dir)
         self.state_store = StateStore(self.artifact_store.state_db_path)
@@ -118,7 +117,6 @@ class LogProcessorApp:
         self.current_repo_job_id = ""
         self.current_branch_job_id = ""
         self.current_prompt_test_job_id = ""
-        self.mlflow_ui_process = None
         self.training_state_lock = threading.Lock()
         self.training_active = False
         self.training_config_visible = False
@@ -158,6 +156,11 @@ class LogProcessorApp:
         self.azure_hosted_endpoint_name_var = tk.StringVar(value="")
         self.create_pr_var = tk.BooleanVar(value=False)
         self.github_pr_url_var = tk.StringVar(value="")
+        self.mlflow_enabled_var = tk.BooleanVar(value=False)
+        self.mlflow_backend_var = tk.StringVar(value="local")
+        self.mlflow_tracking_uri_var = tk.StringVar(value=self.local_mlflow_tracking_uri)
+        self.mlflow_experiment_var = tk.StringVar(value="")
+        self.mlflow_registered_model_var = tk.StringVar(value="")
         self.azure_host_sub_var.trace_add("write", lambda *_: self.refresh_azure_dashboard_links())
         self.azure_serverless_endpoint_name_var.trace_add("write", self.on_azure_serverless_endpoint_name_changed)
         self.prompt_test_window = None
@@ -734,86 +737,12 @@ class LogProcessorApp:
         )
         self.open_azure_llmops_btn.grid(row=16, column=3, padx=5, pady=5)
 
-        ttk.Separator(hosting_frame, orient="horizontal").grid(
-            row=17,
-            column=0,
-            columnspan=4,
-            sticky="ew",
-            padx=5,
-            pady=(4, 8),
-        )
-
-        ttk.Label(hosting_frame, text="MLflow Enabled:").grid(row=18, column=0, sticky="w", padx=5, pady=5)
-        self.mlflow_enabled_var = tk.BooleanVar(value=True)
-        self.mlflow_enabled_check = ttk.Checkbutton(
-            hosting_frame,
-            variable=self.mlflow_enabled_var,
-            command=self.on_mlflow_enabled_change,
-        )
-        self.mlflow_enabled_check.grid(row=18, column=1, sticky="w", padx=5, pady=5)
-
-        ttk.Label(hosting_frame, text="MLflow Backend:").grid(row=18, column=2, sticky="w", padx=5, pady=5)
-        self.mlflow_backend_var = tk.StringVar(value="local")
-        self.mlflow_backend_combo = ttk.Combobox(
-            hosting_frame,
-            textvariable=self.mlflow_backend_var,
-            state="readonly",
-            values=["local", "azure", "custom_uri"],
-            width=15,
-        )
-        self.mlflow_backend_combo.grid(row=18, column=3, sticky="ew", padx=5, pady=5)
-        self.mlflow_backend_combo.bind("<<ComboboxSelected>>", self.on_mlflow_backend_change)
-
-        ttk.Label(hosting_frame, text="Tracking URI:").grid(row=19, column=0, sticky="w", padx=5, pady=5)
-        self.mlflow_tracking_uri_var = tk.StringVar(value=self.local_mlflow_tracking_uri)
-        self.mlflow_tracking_uri_entry = ttk.Entry(
-            hosting_frame,
-            textvariable=self.mlflow_tracking_uri_var,
-            width=30,
-            state="readonly",
-        )
-        self.mlflow_tracking_uri_entry.grid(row=19, column=1, columnspan=3, sticky="ew", padx=5, pady=5)
-
-        ttk.Label(hosting_frame, text="Experiment Name:").grid(row=20, column=0, sticky="w", padx=5, pady=5)
-        self.mlflow_experiment_var = tk.StringVar(value="")
-        self.mlflow_experiment_entry = ttk.Entry(
-            hosting_frame,
-            textvariable=self.mlflow_experiment_var,
-            width=24,
-        )
-        self.mlflow_experiment_entry.grid(row=20, column=1, sticky="ew", padx=5, pady=5)
-
-        ttk.Label(hosting_frame, text="Registered Model:").grid(row=20, column=2, sticky="w", padx=5, pady=5)
-        self.mlflow_registered_model_var = tk.StringVar(value="")
-        self.mlflow_registered_model_entry = ttk.Entry(
-            hosting_frame,
-            textvariable=self.mlflow_registered_model_var,
-            width=24,
-        )
-        self.mlflow_registered_model_entry.grid(row=20, column=3, sticky="ew", padx=5, pady=5)
-
-        self.open_mlflow_btn = ttk.Button(
-            hosting_frame,
-            text="Open Dashboard",
-            command=self.open_mlflow_console,
-        )
-        self.open_mlflow_btn.grid(row=21, column=0, columnspan=2, sticky="ew", padx=5, pady=8)
-
-        self.register_model_btn = ttk.Button(
-            hosting_frame,
-            text="Register Last Model",
-            command=self.register_last_model_version,
-        )
-        self.register_model_btn.grid(row=21, column=2, columnspan=2, sticky="ew", padx=5, pady=8)
-
         # Status Bar
         self.status_var = tk.StringVar()
         self.status_var.set("Ready")
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w")
         status_bar.pack(side="bottom", fill="x")
         self._last_local_device = self.local_device_var.get()
-        self.on_mlflow_backend_change()
-        self.on_mlflow_enabled_change()
         self.on_training_strategy_change()
         self.on_train_mode_change()
         self.on_hosting_mode_change()
@@ -1117,10 +1046,6 @@ class LogProcessorApp:
             self.set_azure_serverless_endpoint_name(generated_endpoint_name, auto=True)
 
 
-
-
-
-
     def discover_available_hosted_models(self) -> list[dict]:
         return [asdict(entry) for entry in self.model_catalog_service.discover_available_hosted_models(self.hosted_model_path_var.get())]
 
@@ -1269,78 +1194,6 @@ class LogProcessorApp:
         self.stop_hosting_btn.config(state="normal" if local_running else "disabled")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     def get_azure_batch_timezone_options(self) -> list[str]:
         return self.azure_platform_service.get_azure_batch_timezone_options()
 
@@ -1413,14 +1266,6 @@ class LogProcessorApp:
                 ),
             )
         return False
-
-
-
-
-
-
-
-
 
 
     def start_hosting_thread(self):
@@ -1655,10 +1500,6 @@ class LogProcessorApp:
             self.status_var.set("Local hosted stack stopped.")
 
 
-
-
-
-
     def on_app_close(self):
         self.hosting_service.stop_local_stack()
         self.mlops_service.stop_local_mlflow_ui()
@@ -1682,101 +1523,6 @@ class LogProcessorApp:
         if filepath:
             self.training_filepath_entry.delete(0, tk.END)
             self.training_filepath_entry.insert(0, filepath)
-
-
-    def on_mlflow_enabled_change(self):
-        enabled = bool(self.mlflow_enabled_var.get())
-        self.mlflow_backend_combo.config(state="readonly" if enabled else "disabled")
-        self.mlflow_experiment_entry.config(state="normal" if enabled else "disabled")
-        self.mlflow_registered_model_entry.config(state="normal" if enabled else "disabled")
-        self.open_mlflow_btn.config(state="normal")
-        self.register_model_btn.config(state="normal" if enabled else "disabled")
-
-        if enabled:
-            self.on_mlflow_backend_change()
-        else:
-            self.mlflow_tracking_uri_entry.config(state="disabled")
-
-    def on_mlflow_backend_change(self, event=None):
-        if not bool(self.mlflow_enabled_var.get()):
-            self.mlflow_tracking_uri_entry.config(state="disabled")
-            return
-
-        backend = self.mlflow_backend_var.get().strip() or "local"
-        current_uri = clean_optional_string(self.mlflow_tracking_uri_var.get())
-        unresolved_azure_placeholder = "(resolved during Azure run)"
-
-        if backend == "local":
-            self.mlflow_tracking_uri_var.set(self.local_mlflow_tracking_uri)
-            self.mlflow_tracking_uri_entry.config(state="readonly")
-            return
-
-        if backend == "azure":
-            if self.azure_mlflow_tracking_uri:
-                self.mlflow_tracking_uri_var.set(self.azure_mlflow_tracking_uri)
-            else:
-                self.mlflow_tracking_uri_var.set(unresolved_azure_placeholder)
-            self.mlflow_tracking_uri_entry.config(state="readonly")
-            return
-
-        if current_uri == unresolved_azure_placeholder:
-            self.mlflow_tracking_uri_var.set("")
-        self.mlflow_tracking_uri_entry.config(state="normal")
-
-
-
-
-
-
-
-
-
-
-
-    def open_mlflow_console(self):
-        backend = self.mlflow_backend_var.get().strip() or "local"
-        tracking_uri = clean_optional_string(self.mlflow_tracking_uri_var.get())
-
-        if backend == "local":
-            try:
-                self.mlops_service.start_local_mlflow_ui(self.local_mlflow_tracking_uri)
-                self.open_local_dashboard_page(launch_live_console=True)
-            except Exception as exc:
-                messagebox.showerror("Dashboard", f"Failed to open the local dashboard.\n\n{exc}")
-            return
-
-        if backend == "custom_uri":
-            if tracking_uri.startswith("http://") or tracking_uri.startswith("https://"):
-                webbrowser.open(tracking_uri)
-            else:
-                messagebox.showinfo(
-                    "MLflow",
-                    "Custom tracking URI is not an HTTP URL. Use your own MLflow UI endpoint or switch backend.",
-                )
-            return
-
-        sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
-        if not sub_id:
-            messagebox.showwarning("MLflow", "Azure Subscription ID is required to open Azure ML Studio.")
-            return
-        tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
-        studio_url = self.build_azure_studio_url(sub_id, tenant_id)
-        webbrowser.open(studio_url)
-
-    def register_last_model_version(self):
-        config, error = self.build_mlflow_config_from_ui(require_tracking_uri=True)
-        if error:
-            messagebox.showerror("MLflow", error)
-            return
-        ok, message = self.mlops_service.register_last_model_version(
-            registered_model_name=self.mlflow_registered_model_var.get(),
-            fallback_tracking_uri=config.tracking_uri,
-            hosted_model_path=self.hosted_model_path_var.get(),
-        )
-        if ok:
-            messagebox.showinfo("MLflow", message)
-        else:
-            messagebox.showerror("MLflow", message)
 
     def on_train_mode_change(self):
         is_azure = self.train_mode.get() == "azure"
@@ -1871,9 +1617,6 @@ class LogProcessorApp:
         self._refresh_scroll_region()
 
 
-
-
-
     def start_training_session(self) -> bool:
         with self.training_state_lock:
             if self.training_active:
@@ -1891,8 +1634,6 @@ class LogProcessorApp:
         self.get_model_btn.config(state="normal")
         self.stop_training_btn.config(state="disabled")
         self.status_var.set("Ready")
-
-
 
 
     def stop_training(self):
@@ -2393,8 +2134,6 @@ class LogProcessorApp:
             )
         )
         self.current_training_job_id = job.job_id
-
-
 
 
     def show_error(self, message):

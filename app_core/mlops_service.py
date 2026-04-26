@@ -814,35 +814,6 @@ class MlopsService:
             return azure_studio_url, ""
         return "", "Azure dashboard URL is unavailable because the Azure subscription ID is empty."
 
-    def register_last_model_version(
-        self,
-        *,
-        registered_model_name: str,
-        fallback_tracking_uri: str,
-        hosted_model_path: str = "",
-    ) -> tuple[bool, str]:
-        if mlflow is None:
-            return False, "Model registration requires `mlflow` package availability."
-        metadata = self.find_latest_training_mlflow_metadata(hosted_model_path)
-        if not metadata:
-            return False, "No training MLflow metadata file found."
-        run_id = clean_optional_string(metadata.get("run_id"))
-        if not run_id:
-            return False, "Training metadata is missing run_id; cannot register model."
-        tracking_uri = clean_optional_string(metadata.get("tracking_uri")) or clean_optional_string(fallback_tracking_uri)
-        if not tracking_uri:
-            return False, "Tracking URI is empty."
-        model_name = clean_optional_string(registered_model_name)
-        if not model_name:
-            return False, "`Registered Model` is empty. Set a model name before registering."
-        model_uri = clean_optional_string(metadata.get("model_uri")) or f"runs:/{run_id}/final_model"
-        try:
-            mlflow.set_tracking_uri(tracking_uri)
-            version = mlflow.register_model(model_uri=model_uri, name=model_name)
-            return True, f"Registered model version successfully.\n\nModel: {model_name}\nVersion: {version.version}\nRun ID: {run_id}"
-        except Exception as exc:
-            return False, f"Failed to register model version.\n\n{exc}"
-
     def _dashboard_value_html(self, value: Any) -> str:
         text = clean_optional_string(value)
         return html.escape(text) if text else "<span class='muted'>Not available</span>"

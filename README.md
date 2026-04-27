@@ -236,6 +236,15 @@ Mode behavior:
   - uses stratified K-fold CV on the dev subset
   - selects by average weighted F1
 
+CSV parsing behavior:
+
+- `train.py` first tries strict `pandas.read_csv` parsing.
+- if strict parsing fails, it retries with malformed-row skipping and logs the skipped-row count.
+- accepted training-column aliases are:
+  - label: `class`, `label`
+  - message: `LogMessage`, `log_message`, `message`, `msg`, `text`, `log`
+- class labels are normalized case-insensitively before mapping to model IDs.
+
 After selection:
 
 - the best configuration is retrained on the full dev split

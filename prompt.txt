@@ -1,5 +1,5 @@
 You are a highly accurate log classification system. 
-The user will provide a JSON array of log messages. 
+I have attached a csv file containing log messages. 
 
 For EACH log message in the array, perform ONE task:
 1. CLASSIFICATION: Classify the log into exactly one of the following four categories. 
@@ -15,7 +15,7 @@ For EACH log message in the array, perform ONE task:
 2. ALWAYS classify based on the ROOT CAUSE of the failure, not the superficial keywords.
 3. If a log is caused by a missing environment variable, empty host, or bad configuration file, it MUST be classified as "CONFIGURATION", even if it caused the app to crash.
 
-Return ONLY a valid JSON object with a single key "results", containing an array of objects in the EXACT SAME ORDER as the input array.
+Return ONLY a labeled valid csv file with two columns "LogMessage" and "class", containing an array of objects in the EXACT SAME ORDER as the input array.
 Example output format: 
 {
   "results": [

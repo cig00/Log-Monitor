@@ -5,7 +5,7 @@ import random
 import shutil
 import tempfile
 from contextlib import nullcontext
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 os.environ.setdefault("USE_TF", "0")
 
@@ -42,6 +42,7 @@ except Exception:
 
 LABEL_MAPPING = {"Error": 0, "CONFIGURATION": 1, "SYSTEM": 2, "Noise": 3}
 LABEL_NAMES = [name for name, _ in sorted(LABEL_MAPPING.items(), key=lambda item: item[1])]
+LABEL_ALIASES = {label.casefold(): label for label in LABEL_MAPPING}
 MODEL_NAME = "microsoft/deberta-v3-xsmall"
 
 
@@ -132,6 +133,56 @@ def parse_numeric_csv(raw: str, parser, field_name: str):
         except Exception as exc:
             raise ValueError(f"Invalid token '{token}' in {field_name}: {exc}") from exc
     return parsed
+
+
+def resolve_training_column(columns, candidates: Tuple[str, ...], description: str) -> str:
+    normalized_lookup = {
+        clean_optional_string(column_name).casefold(): column_name for column_name in columns if clean_optional_string(column_name)
+    }
+    for candidate in candidates:
+        resolved = normalized_lookup.get(candidate.casefold())
+        if resolved:
+            return resolved
+    available_columns = ", ".join(str(name) for name in columns) or "<none>"
+    expected_columns = ", ".join(candidates)
+    raise ValueError(
+        f"Training CSV is missing the {description} column. "
+        f"Expected one of [{expected_columns}] but found [{available_columns}]."
+    )
+
+
+def normalize_label_value(raw_label: Any) -> str:
+    cleaned = clean_optional_string(raw_label)
+    if not cleaned:
+        return ""
+    return LABEL_ALIASES.get(cleaned.casefold(), cleaned)
+
+
+def load_training_dataframe(csv_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    try:
+        return pd.read_csv(csv_path), {"csv_parse_mode": "strict", "csv_bad_rows_skipped": 0}
+    except pd.errors.ParserError as exc:
+        print(f"[WARN] Strict CSV parsing failed ({exc}). Retrying with malformed-row skipping.")
+
+    bad_row_count = 0
+
+    def skip_bad_line(row):
+        nonlocal bad_row_count
+        bad_row_count += 1
+        return None
+
+    try:
+        tolerant_df = pd.read_csv(csv_path, engine="python", on_bad_lines=skip_bad_line)
+    except Exception as exc:
+        raise ValueError(
+            "Unable to parse the training CSV. "
+            "Please fix malformed rows (for example, unescaped commas or uneven column counts)."
+        ) from exc
+
+    if bad_row_count > 0:
+        print(f"[WARN] Skipped {bad_row_count} malformed CSV row(s) while loading training data.")
+
+    return tolerant_df, {"csv_parse_mode": "skip_bad_lines", "csv_bad_rows_skipped": int(bad_row_count)}
 
 
 def unique_preserve_order(items):
@@ -474,8 +525,17 @@ def main():
     run_id = ""
 
     # 1) Load + validate dataset
-    df = pd.read_csv(args.data)
+    df, csv_parse_meta = load_training_dataframe(args.data)
     input_data_hash = compute_file_sha256(args.data)
+    class_column = resolve_training_column(df.columns, ("class", "label"), "label/class")
+    message_column = resolve_training_column(
+        df.columns,
+        ("logmessage", "log_message", "message", "msg", "text", "log"),
+        "log message",
+    )
+    if class_column != "class" or message_column != "LogMessage":
+        df = df.rename(columns={class_column: "class", message_column: "LogMessage"})
+    df["class"] = df["class"].apply(normalize_label_value)
     df["label"] = df["class"].map(LABEL_MAPPING)
     df = df.dropna(subset=["LogMessage", "label"]).copy()
     if df.empty:
@@ -504,6 +564,8 @@ def main():
         "train_mode": args.train_mode,
         "cv_folds": int(args.cv_folds),
         "max_trials": int(args.max_trials),
+        "csv_parse_mode": csv_parse_meta["csv_parse_mode"],
+        "csv_bad_rows_skipped": int(csv_parse_meta["csv_bad_rows_skipped"]),
     }
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -539,6 +601,12 @@ def main():
 
     safe_mlflow_call(mlflow_enabled, lambda: mlflow.log_param("model_name", MODEL_NAME), "log model_name")
     safe_mlflow_call(mlflow_enabled, lambda: mlflow.log_param("train_mode", args.train_mode), "log train_mode")
+    safe_mlflow_call(mlflow_enabled, lambda: mlflow.log_param("csv_parse_mode", csv_parse_meta["csv_parse_mode"]), "log csv_parse_mode")
+    safe_mlflow_call(
+        mlflow_enabled,
+        lambda: mlflow.log_param("csv_bad_rows_skipped", int(csv_parse_meta["csv_bad_rows_skipped"])),
+        "log csv_bad_rows_skipped",
+    )
     safe_mlflow_call(mlflow_enabled, lambda: mlflow.log_param("cv_folds", int(args.cv_folds)), "log cv_folds")
     safe_mlflow_call(mlflow_enabled, lambda: mlflow.log_param("max_trials", int(args.max_trials)), "log max_trials")
     safe_mlflow_call(mlflow_enabled, lambda: mlflow.log_param("resolved_device", resolved_device), "log resolved_device")

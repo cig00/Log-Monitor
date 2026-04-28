@@ -3,15 +3,19 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from app_core.contracts import HostingRequest
 from app_core.azure_platform_service import AzurePlatformService
 from app_core.data_prep_service import DataPrepService
 from app_core.github_service import GitHubService
+from app_core.hosting_service import HostingService
 from app_core.mlops_service import MlopsService
 from app_core.model_catalog_service import ModelCatalogService
+from app_core.observability_service import ObservabilityService
 from app_core.runtime import ArtifactStore, JobManager, StateStore
 
 
@@ -34,6 +38,16 @@ class ServiceTests(unittest.TestCase):
             local_tracking_uri=str(self.project_dir / "mlruns"),
         )
         self.data_prep = DataPrepService(self.job_manager, self.mlops, self.model_catalog)
+        self.azure_platform = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        self.observability = ObservabilityService(str(self.project_dir), self.artifact_store, self.state_store)
+        self.hosting = HostingService(
+            str(self.project_dir),
+            self.job_manager,
+            self.model_catalog,
+            self.mlops,
+            self.azure_platform,
+            self.observability,
+        )
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -157,6 +171,94 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(fake_client.data.created.type, "uri_file")
         self.assertEqual(fake_client.data.created.tags, {"pipeline_id": "abc"})
         self.assertEqual(len(service.sanitize_azure_asset_version("a" * 64)), 30)
+
+    def test_function_bridge_package_includes_feedback_retraining_code(self):
+        bridge_root = self.project_dir / "azure_function_bridge"
+        bridge_root.mkdir(parents=True, exist_ok=True)
+        (bridge_root / "function_app.py").write_text("# function app\n", encoding="utf-8")
+        (bridge_root / "requirements.txt").write_text("azure-functions\n", encoding="utf-8")
+        (self.project_dir / "train.py").write_text("# train\n", encoding="utf-8")
+        (self.project_dir / "mlops_utils.py").write_text("# utils\n", encoding="utf-8")
+        (self.project_dir / "requirements.train.txt").write_text("pandas\n", encoding="utf-8")
+
+        package_path = self.azure_platform.build_function_bridge_package("unit-feedback-bridge")
+
+        with zipfile.ZipFile(package_path) as archive:
+            names = set(archive.namelist())
+        self.assertIn("function_app.py", names)
+        self.assertIn("requirements.txt", names)
+        self.assertIn("train.py", names)
+        self.assertIn("mlops_utils.py", names)
+        self.assertIn("requirements.train.txt", names)
+
+    def test_hosting_feedback_bridge_configures_mode_agnostic_feedback_endpoint(self):
+        dataset_path = self.project_dir / "base.csv"
+        dataset_path.write_text("LogMessage,class\nhello,Noise\n", encoding="utf-8")
+        captured = {"settings": {}, "uploaded_blob": ""}
+
+        self.azure_platform.deploy_azure_function_bridge_infrastructure = lambda **kwargs: {
+            "storageConnectionString": "UseDevelopmentStorage=true",
+            "storageAccountKey": "key",
+            "serviceBusConnectionString": "Endpoint=sb://example/",
+            "functionAppHostName": "func.azurewebsites.net",
+        }
+        self.azure_platform.ensure_azure_blob_datastore = lambda **kwargs: None
+        self.azure_platform.upload_blob_file = lambda **kwargs: captured.update({"uploaded_blob": kwargs["blob_name"]}) or kwargs["blob_name"]
+        self.azure_platform.set_function_app_settings = lambda **kwargs: captured.update({"settings": kwargs["settings"]})
+        self.azure_platform.build_function_bridge_package = lambda package_name: str(dataset_path)
+        self.azure_platform.upload_function_bridge_package = lambda **kwargs: "https://blob/package.zip"
+        self.azure_platform.trigger_function_app_onedeploy = lambda **kwargs: None
+        self.azure_platform.wait_for_function_bridge_endpoint = (
+            lambda **kwargs: (f"https://func.azurewebsites.net/api/{kwargs.get('route_path', 'logs')}?code=key", "key")
+        )
+
+        request = HostingRequest(
+            model_dir=str(self.project_dir),
+            mode="azure",
+            azure_sub_id="sub",
+            azure_tenant_id="tenant",
+            azure_compute="cpu",
+            azure_instance_type="Standard_D2as_v4",
+            azure_service="serverless",
+        )
+        result = self.hosting._deploy_azure_feedback_bridge(
+            ctx=SimpleNamespace(emit=lambda *args, **kwargs: None),
+            credential=object(),
+            ml_client=object(),
+            request=request,
+            service_kind="serverless",
+            timestamp=123,
+            training_metadata={"data_version_path": str(dataset_path)},
+            source_endpoint_name="serverless-endpoint",
+            source_api_url="https://endpoint",
+            batch_enabled=False,
+        )
+
+        self.assertEqual(result["feedback_api_url"], "https://func.azurewebsites.net/api/feedback?code=key")
+        self.assertEqual(captured["settings"]["LOGMONITOR_BATCH_ENABLED"], "0")
+        self.assertEqual(captured["settings"]["LOGMONITOR_HOSTING_SERVICE_KIND"], "serverless")
+        self.assertEqual(captured["settings"]["LOGMONITOR_RETRAIN_ENABLED"], "1")
+        self.assertEqual(captured["settings"]["LOGMONITOR_BASE_DATASET_BLOB"], "feedback/base/123/dataset.csv")
+        self.assertEqual(captured["uploaded_blob"], "feedback/base/123/dataset.csv")
+
+        self.hosting._deploy_azure_feedback_bridge(
+            ctx=SimpleNamespace(emit=lambda *args, **kwargs: None),
+            credential=object(),
+            ml_client=object(),
+            request=request,
+            service_kind="queued_batch",
+            timestamp=124,
+            training_metadata={"data_version_path": str(dataset_path)},
+            source_endpoint_name="batch-endpoint",
+            source_api_url="https://batch",
+            batch_enabled=True,
+            batch_endpoint_name="batch-endpoint",
+            batch_deployment_name="default",
+            retrain_compute_name="log-monitor-batch-cpu",
+        )
+        self.assertEqual(captured["settings"]["LOGMONITOR_BATCH_ENABLED"], "1")
+        self.assertEqual(captured["settings"]["LOGMONITOR_BATCH_ENDPOINT_NAME"], "batch-endpoint")
+        self.assertEqual(captured["settings"]["LOGMONITOR_RETRAIN_COMPUTE_NAME"], "log-monitor-batch-cpu")
 
     def test_azure_platform_deploys_serverless_endpoint_from_catalog_model_id(self):
         service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")

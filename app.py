@@ -131,6 +131,8 @@ class LogProcessorApp:
         self.hosted_model_inventory = []
         self.available_model_choice_var = tk.StringVar(value="")
         self.hosting_api_url_var = tk.StringVar(value="")
+        self.feedback_api_url_var = tk.StringVar(value="")
+        self.feedback_status_url_var = tk.StringVar(value="")
         self.hosting_mode_summary_var = tk.StringVar(value="")
         self.azure_host_sub_var = tk.StringVar(value="")
         self.azure_host_tenant_var = tk.StringVar(value="")
@@ -683,59 +685,89 @@ class LogProcessorApp:
         )
         self.open_hosting_api_btn.grid(row=12, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="GitHub PR Task:").grid(row=13, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Feedback API:").grid(row=13, column=0, sticky="w", padx=5, pady=5)
+        self.feedback_api_url_entry = ttk.Entry(
+            hosting_frame,
+            textvariable=self.feedback_api_url_var,
+            width=30,
+            state="readonly",
+        )
+        self.feedback_api_url_entry.grid(row=13, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.open_feedback_api_btn = ttk.Button(
+            hosting_frame,
+            text="Copy API",
+            command=lambda: self.copy_url_value(self.feedback_api_url_var.get(), "Feedback API"),
+        )
+        self.open_feedback_api_btn.grid(row=13, column=3, padx=5, pady=5)
+
+        ttk.Label(hosting_frame, text="Feedback Status:").grid(row=14, column=0, sticky="w", padx=5, pady=5)
+        self.feedback_status_url_entry = ttk.Entry(
+            hosting_frame,
+            textvariable=self.feedback_status_url_var,
+            width=30,
+            state="readonly",
+        )
+        self.feedback_status_url_entry.grid(row=14, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.open_feedback_status_btn = ttk.Button(
+            hosting_frame,
+            text="Open Status",
+            command=lambda: self.open_url_value(self.feedback_status_url_var.get(), "Feedback status"),
+        )
+        self.open_feedback_status_btn.grid(row=14, column=3, padx=5, pady=5)
+
+        ttk.Label(hosting_frame, text="GitHub PR Task:").grid(row=15, column=0, sticky="w", padx=5, pady=5)
         self.github_pr_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.github_pr_url_var,
             width=30,
             state="readonly",
         )
-        self.github_pr_url_entry.grid(row=13, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.github_pr_url_entry.grid(row=15, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_github_pr_btn = ttk.Button(
             hosting_frame,
             text="Open PR Task",
             command=lambda: self.open_url_value(self.github_pr_url_var.get(), "GitHub PR task"),
         )
-        self.open_github_pr_btn.grid(row=13, column=3, padx=5, pady=5)
+        self.open_github_pr_btn.grid(row=15, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Hosting Status:").grid(row=14, column=0, sticky="nw", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Hosting Status:").grid(row=16, column=0, sticky="nw", padx=5, pady=5)
         self.hosting_status_label = ttk.Label(
             hosting_frame,
             textvariable=self.hosting_mode_summary_var,
             wraplength=460,
             justify="left",
         )
-        self.hosting_status_label.grid(row=14, column=1, columnspan=3, sticky="w", padx=5, pady=5)
+        self.hosting_status_label.grid(row=16, column=1, columnspan=3, sticky="w", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Azure MLOps URL:").grid(row=15, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Azure MLOps URL:").grid(row=17, column=0, sticky="w", padx=5, pady=5)
         self.azure_mlops_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.azure_mlops_url_var,
             width=30,
             state="readonly",
         )
-        self.azure_mlops_url_entry.grid(row=15, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_mlops_url_entry.grid(row=17, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_azure_mlops_btn = ttk.Button(
             hosting_frame,
             text="Open MLOps",
             command=lambda: self.open_url_value(self.azure_mlops_url_var.get(), "Azure MLOps dashboard"),
         )
-        self.open_azure_mlops_btn.grid(row=15, column=3, padx=5, pady=5)
+        self.open_azure_mlops_btn.grid(row=17, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Azure LLMOps URL:").grid(row=16, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Azure LLMOps URL:").grid(row=18, column=0, sticky="w", padx=5, pady=5)
         self.azure_llmops_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.azure_llmops_url_var,
             width=30,
             state="readonly",
         )
-        self.azure_llmops_url_entry.grid(row=16, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_llmops_url_entry.grid(row=18, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_azure_llmops_btn = ttk.Button(
             hosting_frame,
             text="Open LLMOps",
             command=lambda: self.open_url_value(self.azure_llmops_url_var.get(), "Azure LLMOps dashboard"),
         )
-        self.open_azure_llmops_btn.grid(row=16, column=3, padx=5, pady=5)
+        self.open_azure_llmops_btn.grid(row=18, column=3, padx=5, pady=5)
 
         # Status Bar
         self.status_var = tk.StringVar()
@@ -856,6 +888,8 @@ class LogProcessorApp:
         self.grafana_process = self.observability_service.grafana_process
         if event.status == "succeeded":
             self.hosting_api_url_var.set(clean_optional_string(event.payload.get("api_url")))
+            self.feedback_api_url_var.set(clean_optional_string(event.payload.get("feedback_api_url")))
+            self.feedback_status_url_var.set(clean_optional_string(event.payload.get("feedback_status_url")))
             self.hosting_mode_summary_var.set(clean_optional_string(event.payload.get("summary")))
             self.azure_mlops_url_var.set(clean_optional_string(event.payload.get("mlops_url")))
             self.azure_llmops_url_var.set(clean_optional_string(event.payload.get("llmops_url")))
@@ -1172,6 +1206,15 @@ class LogProcessorApp:
             return
         webbrowser.open(clean_url)
 
+    def copy_url_value(self, url: str, label: str):
+        clean_url = clean_optional_string(url)
+        if not clean_url:
+            messagebox.showwarning("Copy URL", f"No {label} URL is available yet.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(clean_url)
+        self.status_var.set(f"{label} URL copied to clipboard.")
+
     def begin_hosting_action(self) -> bool:
         with self.hosting_state_lock:
             if self.hosting_active:
@@ -1291,6 +1334,8 @@ class LogProcessorApp:
             self.hosted_model_path_var.set(resolved_model_dir)
             self.refresh_hosted_model_inventory(preferred_path=resolved_model_dir)
         self.hosting_api_url_var.set("")
+        self.feedback_api_url_var.set("")
+        self.feedback_status_url_var.set("")
         self.hosting_mode_summary_var.set("")
         self.github_pr_url_var.set("")
 
@@ -1495,6 +1540,8 @@ class LogProcessorApp:
             self.prometheus_process = None
             self.grafana_process = None
             self.hosting_api_url_var.set("")
+            self.feedback_api_url_var.set("")
+            self.feedback_status_url_var.set("")
             self.hosting_mode_summary_var.set("Local Grafana hosting stack stopped.")
             self.stop_hosting_btn.config(state="disabled")
             self.status_var.set("Local hosted stack stopped.")

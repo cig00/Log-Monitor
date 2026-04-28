@@ -733,11 +733,37 @@ class AzurePlatformService:
         package_path = Path(tempfile.gettempdir()) / f"{package_name}.zip"
         if package_path.exists():
             package_path.unlink()
+        extra_root_files = [
+            self.project_dir / "train.py",
+            self.project_dir / "mlops_utils.py",
+            self.project_dir / "requirements.train.txt",
+        ]
         with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for file_path in bridge_root.rglob("*"):
                 if file_path.is_file() and "__pycache__" not in file_path.parts:
                     archive.write(file_path, arcname=str(file_path.relative_to(bridge_root)))
+            for file_path in extra_root_files:
+                if file_path.exists() and file_path.is_file():
+                    archive.write(file_path, arcname=file_path.name)
         return str(package_path)
+
+    def upload_blob_file(
+        self,
+        storage_connection_string: str,
+        container_name: str,
+        source_path: str,
+        blob_name: str,
+    ) -> str:
+        from azure.storage.blob import BlobServiceClient
+
+        resolved_source = Path(source_path).expanduser().resolve()
+        if not resolved_source.exists():
+            raise FileNotFoundError(f"Feedback base dataset does not exist: {resolved_source}")
+        blob_service = BlobServiceClient.from_connection_string(storage_connection_string)
+        container_client = blob_service.get_container_client(container_name)
+        with open(resolved_source, "rb") as handle:
+            container_client.upload_blob(name=blob_name, data=handle, overwrite=True)
+        return blob_name
 
     def upload_function_bridge_package(
         self,
@@ -792,6 +818,7 @@ class AzurePlatformService:
         function_app_name: str,
         function_host_name: str,
         function_name: str = "ingest_log",
+        route_path: str = "logs",
     ) -> tuple[str, str]:
         host_keys_url = (
             f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.resource_group}"
@@ -811,7 +838,7 @@ class AzurePlatformService:
                 if not function_key and function_keys:
                     function_key = clean_optional_string(next(iter(function_keys.values()), ""))
                 if function_key:
-                    return f"https://{function_host_name}/api/logs?code={function_key}", function_key
+                    return f"https://{function_host_name}/api/{route_path.strip('/')}?code={function_key}", function_key
             except Exception as exc:
                 last_error = str(exc)
             try:
@@ -821,7 +848,7 @@ class AzurePlatformService:
                 if trigger_url:
                     return trigger_url, function_key
                 if function_key:
-                    return f"https://{function_host_name}/api/logs?code={function_key}", function_key
+                    return f"https://{function_host_name}/api/{route_path.strip('/')}?code={function_key}", function_key
             except Exception as exc:
                 last_error = str(exc)
             time.sleep(10)

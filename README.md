@@ -349,9 +349,7 @@ Response:
 }
 ```
 
-Azure hosting is asynchronous batch inference rather than a direct `POST /predict` call.
-
-The Serverless endpoint option is the exception: it creates an Azure ML Serverless endpoint from a catalog model ID and returns that endpoint target URI.
+Azure batch and queued-batch hosting are asynchronous batch inference flows rather than direct `POST /predict` calls. Azure real-time hosting returns a managed online scoring URI, and the Serverless endpoint option creates an Azure ML Serverless endpoint from a catalog model ID and returns that endpoint target URI.
 
 Typical Azure batch input file example:
 
@@ -366,7 +364,49 @@ Azure batch output:
 - one prediction row is written per processed input row
 - results are written to Azure Storage when the batch job finishes
 
-### 6. Inspect Dashboards
+### 6. Correct Labels And Retrain
+
+Every Azure hosting mode also deploys a companion Azure Function feedback API. This is separate from the inference endpoint so it works consistently for:
+
+- Azure ML serverless catalog endpoints
+- Azure ML managed online endpoints
+- Azure ML batch endpoints
+- queued-batch Function API deployments
+
+Feedback request:
+
+```json
+{
+  "errorMessage": "Error: application startup failed because MAIL_HOST environment variable is missing",
+  "correctLabel": "CONFIGURATION",
+  "predictedLabel": "Error",
+  "source": "production"
+}
+```
+
+Accepted label values are:
+
+- `Error`
+- `CONFIGURATION`
+- `SYSTEM`
+- `Noise`
+
+When feedback is accepted, the Function:
+
+1. stores the feedback event in Azure Blob Storage
+2. updates or appends the row in a corrected labeled CSV
+3. writes the corrected CSV as an immutable blob
+4. registers the corrected CSV as a new Azure ML Data asset version named `log-monitor-feedback-labeled-data`
+5. submits an Azure ML retraining command job against that new data asset version
+
+The hosting summary includes:
+
+- `Feedback API`: `POST` corrected labels here
+- `Feedback status`: stored in hosting metadata as `feedback_status_url`
+
+For model-based Azure hosting, the app uploads the current local labeled data version as the feedback base dataset when it can find it from training metadata. If no base dataset is available, the feedback pipeline still creates data versions from submitted corrections, but retraining may need enough feedback rows to satisfy the training split and label distribution requirements.
+
+### 7. Inspect Dashboards
 
 Depending on backend and environment:
 
@@ -429,8 +469,10 @@ Local runtime policy:
   - `Endpoint Name`
 - outputs:
   - `Endpoint URL`
-  - `GitHub PR Task`
+  - `Feedback API`, with a copy button for the POST endpoint created by Azure hosting
+  - `Feedback Status`
   - `Hosting Status`
+  - `GitHub PR Task`
   - `Azure MLOps URL`
   - `Azure LLMOps URL`
 
@@ -662,6 +704,8 @@ Azure hosting supports three service choices:
 - `Real-time endpoint` deploys the selected model to a managed online endpoint backed by Azure compute.
 - `Serverless endpoint` creates an Azure ML Serverless endpoint from a model catalog or Foundry model ID. This path does not upload the local generated model directory.
 
+All Azure hosting choices also deploy the same Azure Function feedback bridge. The bridge exposes `POST /api/feedback`, creates corrected Azure ML Data asset versions, and starts retraining jobs from those versions. In queued-batch mode, the same Function App also exposes `POST /api/logs` for production log ingestion.
+
 Azure hosting flow:
 
 1. authenticate and ensure workspace existence
@@ -671,7 +715,8 @@ Azure hosting flow:
 5. create a batch endpoint
 6. deploy `azure_batch_score.py`
 7. set the deployment as the endpoint default
-8. return the endpoint scoring URI
+8. deploy the feedback bridge Function App
+9. return the endpoint scoring URI and feedback API URL
 
 Serverless endpoint flow:
 
@@ -682,7 +727,8 @@ Serverless endpoint flow:
 5. create the endpoint through the documented ARM `Microsoft.MachineLearningServices/workspaces/serverlessEndpoints` resource using API version `2024-04-01-preview`, which is the API version used in the Foundry serverless deployment docs
 6. fall back to `ml_client.serverless_endpoints` only if ARM creation fails
 7. verify the endpoint appears in both the ARM resource list and the workspace serverless endpoint list returned by the Azure SDK
-8. return the serverless target URI, the Azure ML Studio endpoints URL, and a direct Azure Portal hidden-resource URL
+8. deploy the feedback bridge Function App
+9. return the serverless target URI, feedback API URL, the Azure ML Studio endpoints URL, and a direct Azure Portal hidden-resource URL
 
 Azure scoring notes:
 

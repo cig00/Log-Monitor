@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -282,6 +283,223 @@ class HostingService:
             ),
         }
 
+    def _resolve_feedback_base_dataset_path(self, training_metadata: dict[str, Any]) -> str:
+        candidates: list[Path] = []
+        for key in ("data_version_path", "archived_dataset_path", "source_dataset_path"):
+            value = clean_optional_string(training_metadata.get(key))
+            if value:
+                candidates.append(Path(value).expanduser())
+        data_version_dir = clean_optional_string(training_metadata.get("data_version_dir"))
+        if data_version_dir:
+            candidates.append(Path(data_version_dir).expanduser() / "dataset.csv")
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+            if resolved.exists() and resolved.is_file():
+                return str(resolved)
+        return ""
+
+    def _build_feedback_retrain_args(self, training_metadata: dict[str, Any]) -> str:
+        default_config = {
+            "train_mode": "default",
+            "epochs": 3,
+            "batch_size": 8,
+            "learning_rate": 5e-5,
+            "weight_decay": 0.01,
+            "max_length": 128,
+            "val_ratio": 0.15,
+            "test_ratio": 0.15,
+            "cv_folds": 3,
+            "max_trials": 1,
+        }
+        selection_summary = training_metadata.get("selection_summary")
+        best_config = selection_summary.get("best_config") if isinstance(selection_summary, dict) else {}
+        if isinstance(best_config, dict):
+            for key in ("epochs", "batch_size", "learning_rate", "weight_decay", "max_length"):
+                if best_config.get(key) not in (None, ""):
+                    default_config[key] = best_config[key]
+        args = [
+            "--train-mode",
+            str(default_config["train_mode"]),
+            "--epochs",
+            str(default_config["epochs"]),
+            "--batch-size",
+            str(default_config["batch_size"]),
+            "--learning-rate",
+            str(default_config["learning_rate"]),
+            "--weight-decay",
+            str(default_config["weight_decay"]),
+            "--max-length",
+            str(default_config["max_length"]),
+            "--val-ratio",
+            str(default_config["val_ratio"]),
+            "--test-ratio",
+            str(default_config["test_ratio"]),
+            "--cv-folds",
+            str(default_config["cv_folds"]),
+            "--max-trials",
+            str(default_config["max_trials"]),
+        ]
+        return " ".join(shlex.quote(arg) for arg in args)
+
+    def _deploy_azure_feedback_bridge(
+        self,
+        *,
+        ctx: JobContext,
+        credential: Any,
+        ml_client: Any,
+        request: HostingRequest,
+        service_kind: str,
+        timestamp: int,
+        training_metadata: dict[str, Any],
+        source_endpoint_name: str,
+        source_api_url: str,
+        batch_enabled: bool = False,
+        batch_endpoint_name: str = "",
+        batch_deployment_name: str = "",
+        retrain_compute_name: str = "",
+    ) -> dict[str, Any]:
+        clean_service_kind = clean_optional_string(service_kind) or "azure"
+        function_app_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-func-{clean_service_kind}-{timestamp}", max_length=60)
+        function_plan_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-flex-{clean_service_kind}-{timestamp}", max_length=40)
+        storage_account_name = self.azure_platform_service.sanitize_azure_storage_name(f"logmonitor{timestamp}")
+        service_bus_namespace_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-sb-{clean_service_kind}-{timestamp}", max_length=50)
+        service_bus_queue_name = "logs"
+        datastore_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-feedback-{timestamp}", max_length=30).replace("-", "")
+        blob_container_name = "log-batches"
+
+        ctx.emit("progress", "Creating Azure Function feedback bridge infrastructure...")
+        infra_outputs = self.azure_platform_service.deploy_azure_function_bridge_infrastructure(
+            credential=credential,
+            sub_id=request.azure_sub_id,
+            function_app_name=function_app_name,
+            function_plan_name=function_plan_name,
+            storage_account_name=storage_account_name,
+            service_bus_namespace_name=service_bus_namespace_name,
+            service_bus_queue_name=service_bus_queue_name,
+        )
+        storage_connection_string = clean_optional_string(infra_outputs.get("storageConnectionString"))
+        storage_account_key = clean_optional_string(infra_outputs.get("storageAccountKey"))
+        service_bus_connection_string = clean_optional_string(infra_outputs.get("serviceBusConnectionString"))
+        function_host_name = clean_optional_string(infra_outputs.get("functionAppHostName"))
+        if not storage_connection_string or not storage_account_key or not service_bus_connection_string or not function_host_name:
+            raise RuntimeError("Azure feedback bridge deployment did not return the required connection details.")
+
+        ctx.emit("progress", "Registering Azure Blob datastore for feedback datasets...")
+        self.azure_platform_service.ensure_azure_blob_datastore(
+            ml_client=ml_client,
+            datastore_name=datastore_name,
+            storage_account_name=storage_account_name,
+            container_name=blob_container_name,
+            storage_account_key=storage_account_key,
+        )
+
+        base_dataset_path = self._resolve_feedback_base_dataset_path(training_metadata)
+        base_dataset_blob = ""
+        if base_dataset_path:
+            base_dataset_blob = f"feedback/base/{timestamp}/dataset.csv"
+            ctx.emit("progress", "Uploading the current labeled dataset for feedback correction...")
+            self.azure_platform_service.upload_blob_file(
+                storage_connection_string=storage_connection_string,
+                container_name=blob_container_name,
+                source_path=base_dataset_path,
+                blob_name=base_dataset_blob,
+            )
+
+        retrain_instance_type = clean_optional_string(request.azure_instance_type) or "Standard_D2as_v4"
+        retrain_compute = clean_optional_string(retrain_compute_name) or "log-monitor-feedback-cpu"
+        batch_timezone_iana = self.azure_platform_service.get_azure_batch_timezone_iana(request.batch_timezone)
+        settings = {
+            "AzureWebJobsStorage__accountName": storage_account_name,
+            "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
+            "LOGMONITOR_BLOB_CONTAINER": blob_container_name,
+            "LOGMONITOR_SERVICEBUS_CONNECTION": service_bus_connection_string,
+            "LOGMONITOR_QUEUE_NAME": service_bus_queue_name,
+            "LOGMONITOR_BATCH_ENABLED": "1" if batch_enabled else "0",
+            "LOGMONITOR_BATCH_TIME": f"{request.batch_hour:02d}:{request.batch_minute:02d}",
+            "LOGMONITOR_BATCH_TIME_ZONE": batch_timezone_iana,
+            "LOGMONITOR_BATCH_ENDPOINT_NAME": clean_optional_string(batch_endpoint_name),
+            "LOGMONITOR_BATCH_DEPLOYMENT_NAME": clean_optional_string(batch_deployment_name),
+            "LOGMONITOR_AML_SUBSCRIPTION_ID": request.azure_sub_id,
+            "LOGMONITOR_AML_RESOURCE_GROUP": self.azure_platform_service.resource_group,
+            "LOGMONITOR_AML_WORKSPACE_NAME": self.azure_platform_service.workspace_name,
+            "LOGMONITOR_DATASTORE_NAME": datastore_name,
+            "LOGMONITOR_INPUT_PREFIX": "queue-batches",
+            "LOGMONITOR_STATE_BLOB": "queue-state/scheduler-state.json",
+            "LOGMONITOR_FEEDBACK_STATE_BLOB": "feedback/state.json",
+            "LOGMONITOR_FEEDBACK_DATASET_PREFIX": "feedback/datasets",
+            "LOGMONITOR_FEEDBACK_EVENTS_PREFIX": "feedback/events",
+            "LOGMONITOR_FEEDBACK_DATA_ASSET_NAME": "log-monitor-feedback-labeled-data",
+            "LOGMONITOR_BASE_DATASET_BLOB": base_dataset_blob,
+            "LOGMONITOR_RETRAIN_ENABLED": "1",
+            "LOGMONITOR_RETRAIN_COMPUTE_NAME": retrain_compute,
+            "LOGMONITOR_RETRAIN_INSTANCE_TYPE": retrain_instance_type,
+            "LOGMONITOR_RETRAIN_TRAIN_ARGS": self._build_feedback_retrain_args(training_metadata),
+            "LOGMONITOR_RETRAIN_EXPERIMENT_NAME": "log-monitor-feedback-retraining",
+            "LOGMONITOR_HOSTING_SERVICE_KIND": clean_service_kind,
+            "LOGMONITOR_SOURCE_ENDPOINT_NAME": clean_optional_string(source_endpoint_name),
+            "LOGMONITOR_SOURCE_ENDPOINT_URL": clean_optional_string(source_api_url),
+        }
+        ctx.emit("progress", "Updating Azure Function feedback settings...")
+        self.azure_platform_service.set_function_app_settings(
+            credential=credential,
+            sub_id=request.azure_sub_id,
+            function_app_name=function_app_name,
+            settings=settings,
+        )
+        ctx.emit("progress", "Packaging the Azure Function feedback bridge...")
+        package_path = self.azure_platform_service.build_function_bridge_package(f"log-monitor-function-{clean_service_kind}-{timestamp}")
+        package_uri = self.azure_platform_service.upload_function_bridge_package(
+            storage_connection_string=storage_connection_string,
+            storage_account_name=storage_account_name,
+            storage_account_key=storage_account_key,
+            package_path=package_path,
+            package_container_name="functionpkgs",
+        )
+        ctx.emit("progress", "Deploying the Azure Function feedback bridge...")
+        self.azure_platform_service.trigger_function_app_onedeploy(
+            credential=credential,
+            sub_id=request.azure_sub_id,
+            function_app_name=function_app_name,
+            package_uri=package_uri,
+        )
+        log_api_url, function_key = self.azure_platform_service.wait_for_function_bridge_endpoint(
+            credential=credential,
+            sub_id=request.azure_sub_id,
+            function_app_name=function_app_name,
+            function_host_name=function_host_name,
+            function_name="ingest_log",
+            route_path="logs",
+        )
+        feedback_api_url, _ = self.azure_platform_service.wait_for_function_bridge_endpoint(
+            credential=credential,
+            sub_id=request.azure_sub_id,
+            function_app_name=function_app_name,
+            function_host_name=function_host_name,
+            function_name="submit_feedback",
+            route_path="feedback",
+        )
+        feedback_status_url = f"https://{function_host_name}/api/feedback/status?code={function_key}" if function_key else ""
+        return {
+            "function_app_name": function_app_name,
+            "function_host_name": function_host_name,
+            "function_key": function_key,
+            "log_api_url": log_api_url,
+            "feedback_api_url": feedback_api_url,
+            "feedback_status_url": feedback_status_url,
+            "service_bus_namespace": service_bus_namespace_name,
+            "service_bus_queue": service_bus_queue_name,
+            "storage_account_name": storage_account_name,
+            "log_container_name": blob_container_name,
+            "datastore_name": datastore_name,
+            "base_dataset_path": base_dataset_path,
+            "base_dataset_blob": base_dataset_blob,
+            "retrain_compute_name": retrain_compute,
+            "retrain_instance_type": retrain_instance_type,
+        }
+
     def _run_azure_hosting(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
         service_kind = clean_optional_string(request.azure_service) or "queued_batch"
         if service_kind == "serverless":
@@ -350,6 +568,22 @@ class HostingService:
             visibility_note = "Azure ARM created the endpoint, but the Azure ML SDK list did not return it yet. Refresh Studio or use the Portal link below."
         elif not visible_in_workspace_list:
             visibility_note = "Azure created the endpoint, but the workspace list did not return it yet. Use the resource link below or refresh Studio."
+        training_metadata = {}
+        if clean_optional_string(request.model_dir):
+            training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
+        ctx.emit("progress", "Deploying feedback API for corrected labels and retraining...")
+        feedback_meta = self._deploy_azure_feedback_bridge(
+            ctx=ctx,
+            credential=credential,
+            ml_client=ml_client,
+            request=request,
+            service_kind="serverless",
+            timestamp=timestamp,
+            training_metadata=training_metadata,
+            source_endpoint_name=clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+            source_api_url=scoring_uri,
+            batch_enabled=False,
+        )
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
                 "mode": "azure_serverless",
@@ -374,6 +608,9 @@ class HostingService:
                 "serverless_endpoint_portal_url": endpoint_portal_url,
                 "serverless_endpoints_studio_url": endpoints_studio_url,
                 "api_url": scoring_uri,
+                "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
+                "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
+                "feedback_bridge": feedback_meta,
                 "azure_subscription_id": request.azure_sub_id,
                 "azure_tenant_id": request.azure_tenant_id,
                 "mlops_url": mlops_url,
@@ -386,16 +623,19 @@ class HostingService:
             "message": "Azure serverless endpoint is ready.",
             "api_url": scoring_uri,
             "endpoint_name": clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+            "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
+            "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": endpoints_studio_url or mlops_url,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure serverless endpoint is ready.\nTarget URI: {scoring_uri}\n"
+                f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
                 f"Model ID: {model_id}\nEndpoint Name: {clean_optional_string(deployment_meta.get('endpoint_name')) or endpoint_name}\n"
                 f"Creation: {creation_method}\n"
                 f"{visibility_note}\n"
                 f"Studio: {endpoints_studio_url}\nPortal Resource: {endpoint_portal_url}\n"
-                "Authentication: endpoint keys from Azure ML Studio."
+                "Authentication: endpoint keys from Azure ML Studio; feedback API uses its Azure Function key."
             ),
         }
 
@@ -403,10 +643,12 @@ class HostingService:
         if not AZURE_AVAILABLE:
             raise RuntimeError("Azure dependencies are not installed in this Python environment.")
         ctx.emit("progress", "Preparing Azure hosting...")
+        credential = self.azure_platform_service.create_interactive_credential(request.azure_tenant_id)
         ml_client = self.azure_platform_service.ensure_azure_workspace(
             request.azure_sub_id,
             request.azure_tenant_id,
             emit=lambda msg: ctx.emit("progress", msg),
+            credential=credential,
         )
         timestamp = int(time.time())
         model_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-model-{Path(request.model_dir).name}-{timestamp}")
@@ -429,6 +671,19 @@ class HostingService:
         selected_instance_type = clean_optional_string(deployment_meta.get("instance_type"))
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
         training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
+        ctx.emit("progress", "Deploying feedback API for corrected labels and retraining...")
+        feedback_meta = self._deploy_azure_feedback_bridge(
+            ctx=ctx,
+            credential=credential,
+            ml_client=ml_client,
+            request=request,
+            service_kind="online",
+            timestamp=timestamp,
+            training_metadata=training_metadata,
+            source_endpoint_name=endpoint_name,
+            source_api_url=scoring_uri,
+            batch_enabled=False,
+        )
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
                 "mode": "azure",
@@ -442,6 +697,9 @@ class HostingService:
                 "instance_type": selected_instance_type,
                 "endpoint_auth_mode": "key",
                 "api_url": scoring_uri,
+                "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
+                "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
+                "feedback_bridge": feedback_meta,
                 "azure_subscription_id": request.azure_sub_id,
                 "azure_tenant_id": request.azure_tenant_id,
                 "azure_compute": request.azure_compute,
@@ -455,11 +713,14 @@ class HostingService:
             "message": "Azure real-time endpoint is ready.",
             "api_url": scoring_uri,
             "endpoint_name": endpoint_name,
+            "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
+            "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure real-time endpoint is ready.\nPOST {scoring_uri}\nInstance Type: {selected_instance_type}\n"
+                f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
                 "Body: {\"errorMessage\": \"...\"}\nResponse: {\"prediction\": \"...\"}\nAuthentication: endpoint keys."
             ),
         }
@@ -468,10 +729,12 @@ class HostingService:
         if not AZURE_AVAILABLE:
             raise RuntimeError("Azure dependencies are not installed in this Python environment.")
         ctx.emit("progress", "Preparing Azure hosting...")
+        credential = self.azure_platform_service.create_interactive_credential(request.azure_tenant_id)
         ml_client = self.azure_platform_service.ensure_azure_workspace(
             request.azure_sub_id,
             request.azure_tenant_id,
             emit=lambda msg: ctx.emit("progress", msg),
+            credential=credential,
         )
         timestamp = int(time.time())
         endpoint_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batch-endpoint-{timestamp}")
@@ -503,6 +766,20 @@ class HostingService:
         )
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
         training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
+        ctx.emit("progress", "Deploying feedback API for corrected labels and retraining...")
+        feedback_meta = self._deploy_azure_feedback_bridge(
+            ctx=ctx,
+            credential=credential,
+            ml_client=ml_client,
+            request=request,
+            service_kind="batch",
+            timestamp=timestamp,
+            training_metadata=training_metadata,
+            source_endpoint_name=endpoint_name,
+            source_api_url=clean_optional_string(deployment_meta.get("api_url")),
+            batch_enabled=False,
+            retrain_compute_name=clean_optional_string(deployment_meta.get("compute_name")),
+        )
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
                 "mode": "azure_batch",
@@ -522,6 +799,9 @@ class HostingService:
                 "compute_name": clean_optional_string(deployment_meta.get("compute_name")),
                 "endpoint_auth_mode": "aad_token",
                 "api_url": clean_optional_string(deployment_meta.get("api_url")),
+                "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
+                "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
+                "feedback_bridge": feedback_meta,
                 "azure_subscription_id": request.azure_sub_id,
                 "azure_tenant_id": request.azure_tenant_id,
                 "azure_compute": request.azure_compute,
@@ -535,11 +815,14 @@ class HostingService:
             "message": "Azure batch endpoint and daily schedule are ready.",
             "api_url": clean_optional_string(deployment_meta.get("api_url")),
             "endpoint_name": endpoint_name,
+            "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
+            "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure batch endpoint is ready.\nInvoke: {clean_optional_string(deployment_meta.get('api_url'))}\n"
+                f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
                 f"Cluster: {clean_optional_string(deployment_meta.get('compute_name'))} ({clean_optional_string(deployment_meta.get('instance_type'))}, min nodes 0)\n"
                 f"Schedule: every day at {request.batch_hour:02d}:{request.batch_minute:02d} {request.batch_timezone or 'UTC'}\n"
                 f"Input: {request.batch_input_uri}\nOutput: prediction rows are written to Azure Storage when each batch job finishes.\nAuthentication: Microsoft Entra ID."
@@ -558,42 +841,9 @@ class HostingService:
             credential=credential,
         )
         timestamp = int(time.time())
-        function_app_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-func-{timestamp}", max_length=60)
-        function_plan_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-flex-{timestamp}", max_length=40)
-        storage_account_name = self.azure_platform_service.sanitize_azure_storage_name(f"logmonitor{timestamp}")
-        service_bus_namespace_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-sb-{timestamp}", max_length=50)
-        service_bus_queue_name = "logs"
-        datastore_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batches-{timestamp}", max_length=30).replace("-", "")
         batch_endpoint_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batch-endpoint-{timestamp}")
         batch_env_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batch-env-{timestamp}")
         model_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-model-{Path(request.model_dir).name}-{timestamp}")
-        batch_timezone_iana = self.azure_platform_service.get_azure_batch_timezone_iana(request.batch_timezone)
-
-        ctx.emit("progress", "Creating Azure queue, storage, and Function App...")
-        infra_outputs = self.azure_platform_service.deploy_azure_function_bridge_infrastructure(
-            credential=credential,
-            sub_id=request.azure_sub_id,
-            function_app_name=function_app_name,
-            function_plan_name=function_plan_name,
-            storage_account_name=storage_account_name,
-            service_bus_namespace_name=service_bus_namespace_name,
-            service_bus_queue_name=service_bus_queue_name,
-        )
-        storage_connection_string = clean_optional_string(infra_outputs.get("storageConnectionString"))
-        storage_account_key = clean_optional_string(infra_outputs.get("storageAccountKey"))
-        service_bus_connection_string = clean_optional_string(infra_outputs.get("serviceBusConnectionString"))
-        function_host_name = clean_optional_string(infra_outputs.get("functionAppHostName"))
-        if not storage_connection_string or not storage_account_key or not service_bus_connection_string or not function_host_name:
-            raise RuntimeError("Azure infrastructure deployment did not return the required connection details.")
-
-        ctx.emit("progress", "Registering Azure Blob datastore for queued batches...")
-        self.azure_platform_service.ensure_azure_blob_datastore(
-            ml_client=ml_client,
-            datastore_name=datastore_name,
-            storage_account_name=storage_account_name,
-            container_name="log-batches",
-            storage_account_key=storage_account_key,
-        )
         deployment_meta = self.azure_platform_service.deploy_azure_batch_endpoint(
             ml_client=ml_client,
             model_dir=request.model_dir,
@@ -606,54 +856,26 @@ class HostingService:
             emit=lambda msg: ctx.emit("progress", msg),
         )
         deployment_name = clean_optional_string(deployment_meta.get("deployment_name")) or "default"
-        ctx.emit("progress", "Updating Azure Function settings...")
-        self.azure_platform_service.set_function_app_settings(
-            credential=credential,
-            sub_id=request.azure_sub_id,
-            function_app_name=function_app_name,
-            settings={
-                "AzureWebJobsStorage__accountName": storage_account_name,
-                "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
-                "LOGMONITOR_BLOB_CONTAINER": "log-batches",
-                "LOGMONITOR_SERVICEBUS_CONNECTION": service_bus_connection_string,
-                "LOGMONITOR_QUEUE_NAME": service_bus_queue_name,
-                "LOGMONITOR_BATCH_TIME": f"{request.batch_hour:02d}:{request.batch_minute:02d}",
-                "LOGMONITOR_BATCH_TIME_ZONE": batch_timezone_iana,
-                "LOGMONITOR_BATCH_ENDPOINT_NAME": batch_endpoint_name,
-                "LOGMONITOR_BATCH_DEPLOYMENT_NAME": deployment_name,
-                "LOGMONITOR_AML_SUBSCRIPTION_ID": request.azure_sub_id,
-                "LOGMONITOR_AML_RESOURCE_GROUP": self.azure_platform_service.resource_group,
-                "LOGMONITOR_AML_WORKSPACE_NAME": self.azure_platform_service.workspace_name,
-                "LOGMONITOR_DATASTORE_NAME": datastore_name,
-                "LOGMONITOR_INPUT_PREFIX": "queue-batches",
-                "LOGMONITOR_STATE_BLOB": "queue-state/scheduler-state.json",
-            },
-        )
-        ctx.emit("progress", "Packaging the Azure Function bridge...")
-        package_path = self.azure_platform_service.build_function_bridge_package(f"log-monitor-function-{timestamp}")
-        package_uri = self.azure_platform_service.upload_function_bridge_package(
-            storage_connection_string=storage_connection_string,
-            storage_account_name=storage_account_name,
-            storage_account_key=storage_account_key,
-            package_path=package_path,
-            package_container_name="functionpkgs",
-        )
-        ctx.emit("progress", "Deploying the Azure Function bridge...")
-        self.azure_platform_service.trigger_function_app_onedeploy(
-            credential=credential,
-            sub_id=request.azure_sub_id,
-            function_app_name=function_app_name,
-            package_uri=package_uri,
-        )
-        ctx.emit("progress", "Waiting for the Azure log API to become ready...")
-        log_api_url, function_key = self.azure_platform_service.wait_for_function_bridge_endpoint(
-            credential=credential,
-            sub_id=request.azure_sub_id,
-            function_app_name=function_app_name,
-            function_host_name=function_host_name,
-        )
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
         training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
+        ctx.emit("progress", "Deploying queued log API and feedback retraining API...")
+        feedback_meta = self._deploy_azure_feedback_bridge(
+            ctx=ctx,
+            credential=credential,
+            ml_client=ml_client,
+            request=request,
+            service_kind="queued_batch",
+            timestamp=timestamp,
+            training_metadata=training_metadata,
+            source_endpoint_name=batch_endpoint_name,
+            source_api_url=clean_optional_string(deployment_meta.get("api_url")),
+            batch_enabled=True,
+            batch_endpoint_name=batch_endpoint_name,
+            batch_deployment_name=deployment_name,
+            retrain_compute_name=clean_optional_string(deployment_meta.get("compute_name")),
+        )
+        log_api_url = clean_optional_string(feedback_meta.get("log_api_url"))
+        function_key = clean_optional_string(feedback_meta.get("function_key"))
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
                 "mode": "azure_queue_batch",
@@ -664,19 +886,22 @@ class HostingService:
                 "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
                 "api_url": log_api_url,
                 "function_key": function_key,
-                "function_app_name": function_app_name,
-                "function_host_name": function_host_name,
-                "service_bus_namespace": service_bus_namespace_name,
-                "service_bus_queue": service_bus_queue_name,
-                "storage_account_name": storage_account_name,
-                "log_container_name": "log-batches",
-                "datastore_name": datastore_name,
+                "function_app_name": clean_optional_string(feedback_meta.get("function_app_name")),
+                "function_host_name": clean_optional_string(feedback_meta.get("function_host_name")),
+                "service_bus_namespace": clean_optional_string(feedback_meta.get("service_bus_namespace")),
+                "service_bus_queue": clean_optional_string(feedback_meta.get("service_bus_queue")),
+                "storage_account_name": clean_optional_string(feedback_meta.get("storage_account_name")),
+                "log_container_name": clean_optional_string(feedback_meta.get("log_container_name")),
+                "datastore_name": clean_optional_string(feedback_meta.get("datastore_name")),
+                "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
+                "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
+                "feedback_bridge": feedback_meta,
                 "endpoint_name": batch_endpoint_name,
                 "deployment_name": deployment_name,
                 "batch_endpoint_url": clean_optional_string(deployment_meta.get("api_url")),
                 "schedule_time": f"{request.batch_hour:02d}:{request.batch_minute:02d}",
                 "schedule_time_zone": request.batch_timezone,
-                "schedule_time_zone_iana": batch_timezone_iana,
+                "schedule_time_zone_iana": self.azure_platform_service.get_azure_batch_timezone_iana(request.batch_timezone),
                 "instance_type": clean_optional_string(deployment_meta.get("instance_type")),
                 "compute_name": clean_optional_string(deployment_meta.get("compute_name")),
                 "endpoint_auth_mode": "aad_token",
@@ -693,13 +918,16 @@ class HostingService:
             "message": "Azure queued batch pipeline is ready.",
             "api_url": log_api_url,
             "endpoint_name": batch_endpoint_name,
+            "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
+            "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
-                f"Azure queued batch pipeline is ready.\nLog API: {log_api_url}\nQueue: {service_bus_namespace_name}/{service_bus_queue_name}\n"
+                f"Azure queued batch pipeline is ready.\nLog API: {log_api_url}\nFeedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
+                f"Queue: {clean_optional_string(feedback_meta.get('service_bus_namespace'))}/{clean_optional_string(feedback_meta.get('service_bus_queue'))}\n"
                 f"Batch Endpoint: {batch_endpoint_name}\nSchedule: every day at {request.batch_hour:02d}:{request.batch_minute:02d} {request.batch_timezone}\n"
                 f"Cluster: {clean_optional_string(deployment_meta.get('compute_name'))} ({clean_optional_string(deployment_meta.get('instance_type'))}, min nodes 0)\n"
-                "Flow: POST logs to the Function API, queue them, and process the accumulated logs once per day in the background."
+                "Flow: POST logs to the Function API for daily batch scoring, or POST corrected labels to the feedback API for data-versioning and retraining."
             ),
         }

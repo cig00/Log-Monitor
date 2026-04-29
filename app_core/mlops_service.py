@@ -465,7 +465,9 @@ class MlopsService:
         env["MLFLOW_RUN_SOURCE"] = str(run_source)
         env["MLFLOW_TAGS_JSON"] = json.dumps(tags)
 
-        enabled = bool(mlflow_config.enabled and mlflow is not None and clean_optional_string(mlflow_config.tracking_uri))
+        # The training script can still log remotely even if the local app environment
+        # does not have mlflow installed, as long as tracking config is provided.
+        enabled = bool(mlflow_config.enabled and clean_optional_string(mlflow_config.tracking_uri))
         env["MLOPS_ENABLED"] = "1" if enabled else "0"
         if enabled:
             env["MLFLOW_TRACKING_URI"] = mlflow_config.tracking_uri

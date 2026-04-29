@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from mlops_utils import (
-    bool_from_env,
     clean_optional_string,
     compute_file_sha256,
     discover_model_dir,
@@ -267,18 +266,19 @@ class TrainingService:
                 lambda client=ml_client, get_job=lambda: returned_job_name: self.azure_platform_service.cancel_job(client, get_job()) if get_job() else None
             )
 
-            resolved_mlflow_config = request.mlflow_config
             run_source = "azure_gpu" if compute_mode == "gpu" else "azure_cpu"
-            if resolved_mlflow_config.enabled and resolved_mlflow_config.backend == "azure":
-                resolved_mlflow_config = MlflowConfig(
-                    enabled=True,
-                    backend=resolved_mlflow_config.backend,
-                    tracking_uri=self.mlops_service.resolve_azure_mlflow_tracking_uri(ml_client),
-                    experiment_name=resolved_mlflow_config.experiment_name,
-                    registered_model_name=resolved_mlflow_config.registered_model_name,
-                )
-            if resolved_mlflow_config.enabled and not clean_optional_string(resolved_mlflow_config.tracking_uri):
-                raise ValueError("MLflow is enabled for Azure training but tracking URI is unresolved.")
+            azure_tracking_uri = clean_optional_string(self.mlops_service.resolve_azure_mlflow_tracking_uri(ml_client))
+            if not azure_tracking_uri:
+                raise ValueError("Azure MLflow tracking URI is unresolved for this workspace.")
+            azure_experiment_name = clean_optional_string(request.mlflow_config.experiment_name) or "deberta-log-classification"
+            resolved_mlflow_config = MlflowConfig(
+                enabled=True,
+                backend="azure",
+                tracking_uri=azure_tracking_uri,
+                experiment_name=azure_experiment_name,
+                registered_model_name=clean_optional_string(request.mlflow_config.registered_model_name),
+            )
+            ctx.emit("progress", f"Azure MLflow tracking enabled for experiment: {azure_experiment_name}")
 
             pipeline_context_local = self.mlops_service.prepare_training_pipeline_context(request.csv_path, resolved_mlflow_config, run_source)
             if resolved_mlflow_config.enabled and not clean_optional_string(pipeline_context_local.get("parent_run_id")):
@@ -327,7 +327,7 @@ class TrainingService:
                 environment_mode=request.environment_mode,
             )
             export_segment = self.mlops_service.build_shell_export_segment(mlflow_env)
-            mlflow_install_fragment = "mlflow==2.9.2 " if bool_from_env(mlflow_env.get("MLOPS_ENABLED", "0")) else ""
+            mlflow_install_fragment = "mlflow==2.9.2 azureml-mlflow "
             train_cli_segment = self.build_train_cli_segment(request.training_options)
             train_cli_segment = f" {train_cli_segment}" if train_cli_segment else ""
 
@@ -364,6 +364,7 @@ class TrainingService:
                 export_segment=export_segment,
                 train_cli_segment=train_cli_segment,
                 data_input_path=clean_optional_string(azure_data_asset_info.get("azure_data_asset_uri")),
+                experiment_name=azure_experiment_name,
             )
             while True:
                 ctx.check_cancelled()

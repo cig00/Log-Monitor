@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from app_core.contracts import HostingRequest
+from app_core.contracts import HostingRequest, MlflowConfig
 from app_core.azure_platform_service import AzurePlatformService
 from app_core.data_prep_service import DataPrepService
 from app_core.github_service import GitHubService
@@ -91,6 +91,25 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertFalse(config.enabled)
         self.assertEqual(self.mlops.load_prompt(), "prompt body")
+
+    def test_mlops_training_env_keeps_remote_tracking_enabled_without_local_mlflow(self):
+        config = MlflowConfig(
+            enabled=True,
+            backend="azure",
+            tracking_uri="azureml://mlflow/v1.0/subscriptions/sub/resourceGroups/rg/providers/Microsoft.MachineLearningServices/workspaces/ws",
+            experiment_name="deberta-log-classification",
+        )
+        pipeline_context = {"pipeline_id": "pipe-1", "parent_run_id": "parent-1"}
+        with mock.patch("app_core.mlops_service.mlflow", None):
+            env = self.mlops.build_training_mlflow_env(
+                config,
+                pipeline_context,
+                run_source="azure_cpu",
+                environment_mode="azure",
+            )
+        self.assertEqual(env["MLOPS_ENABLED"], "1")
+        self.assertEqual(env["MLFLOW_TRACKING_URI"], config.tracking_uri)
+        self.assertEqual(env["MLFLOW_EXPERIMENT_NAME"], "deberta-log-classification")
 
     def test_mlops_service_versions_and_compares_prompts(self):
         first = self.mlops.archive_prompt_version("classify logs\nreturn json", {"llm_model": "gpt-test"})

@@ -5,7 +5,7 @@ Log-Monitor is a Tkinter desktop application for the full log-classification lif
 1. ingest raw log CSVs
 2. label them with an OpenAI model
 3. train a DeBERTa classifier locally or on Azure ML
-4. track lineage and metrics with MLflow-style MLOps/LLMOps metadata
+4. track lineage and metrics with MLflow-style MLOps/LLMOps metadata (Azure training always logs metrics to Azure ML)
 5. host the trained model locally or on Azure
 6. expose either a local prediction API or an Azure batch inference endpoint
 
@@ -30,7 +30,8 @@ At a high level, the application turns unlabeled operational logs into a hosted 
    - saves the final model and evaluation metadata
 
 3. `Tracking`
-   - records data-prep lineage and training lineage when MLflow is enabled
+   - records data-prep lineage when MLflow is enabled
+   - always logs Azure training metrics to the Azure workspace MLflow backend
    - writes sidecar metadata next to labeled CSV files
    - writes training metadata JSON next to saved models
 
@@ -620,7 +621,7 @@ Azure job notes:
 - Azure data asset versions are derived from the local dataset SHA-256 hash and truncated to Azure's 30-character version limit, so identical labeled CSV content reuses the same version.
 - The registered data asset URI is written into the CSV sidecar and training metadata as `azure_data_asset_uri`.
 - The job uses the curated environment `AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest`.
-- MLflow env vars are injected into the Azure job when tracking is enabled.
+- MLflow env vars are always injected into Azure training jobs so metrics are logged to Azure ML even when MLflow is disabled in the UI.
 
 Interruption behavior:
 
@@ -761,7 +762,7 @@ Important limitation:
 
 ## MLOps And LLMOps
 
-When MLflow is enabled, the app tracks both data preparation and training.
+Data-prep tracking still depends on MLflow being enabled in the UI, but Azure training metrics are always logged to Azure MLflow.
 
 ### Data-Prep Tracking
 

@@ -52,6 +52,8 @@ class HostingRequest:
     mode: str
     deployment_gate_golden_path: str = ""
     deployment_gate_policy_path: str = ""
+    drift_golden_path: str = ""
+    drift_policy_path: str = ""
     auto_install_missing_tools: bool = False
     azure_sub_id: str = ""
     azure_tenant_id: str = ""

@@ -406,6 +406,150 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.hosting._enforce_deployment_gate(ctx, request)
 
+    def test_observability_evaluate_drift_for_model_writes_report(self):
+        model_dir = self.project_dir / "outputs" / "final_model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        (model_dir / "pytorch_model.bin").write_bytes(b"1")
+        gates_dir = self.project_dir / "gates"
+        gates_dir.mkdir(parents=True, exist_ok=True)
+        golden_path = gates_dir / "drift_golden.csv"
+        policy_path = gates_dir / "drift_policy.json"
+        golden_path.write_text("LogMessage,class\nprocessed Canceled,Noise\n", encoding="utf-8")
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "warning": {
+                        "min_accuracy": 0.9,
+                        "min_weighted_f1": 0.9,
+                        "min_macro_f1": 0.9,
+                        "min_recall_per_class": {"Noise": 0.9},
+                    },
+                    "critical": {
+                        "min_accuracy": 0.7,
+                        "min_weighted_f1": 0.7,
+                        "min_macro_f1": 0.7,
+                        "min_recall_per_class": {"Noise": 0.7},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch("app_core.observability_service.load_model_bundle", return_value=object()), mock.patch(
+            "app_core.observability_service.predict_error_message",
+            return_value="Noise",
+        ), mock.patch.object(
+            self.observability,
+            "compute_drift_metrics",
+            return_value={
+                "accuracy": 1.0,
+                "weighted_precision": 1.0,
+                "weighted_recall": 1.0,
+                "weighted_f1": 1.0,
+                "macro_precision": 1.0,
+                "macro_recall": 1.0,
+                "macro_f1": 1.0,
+                "per_class": {"Noise": {"precision": 1.0, "recall": 1.0, "f1": 1.0, "support": 1}},
+                "confusion_matrix": {"labels": ["Noise"], "matrix": [[1]]},
+            },
+        ):
+            payload = self.observability.evaluate_drift_for_model(
+                model_dir=str(model_dir),
+                golden_path=str(golden_path),
+                policy_path=str(policy_path),
+                deployment_id="unit-deploy",
+                mode="local",
+                service_kind="local",
+                source="unit-test",
+            )
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(Path(payload["report_path"]).exists())
+        self.assertTrue(Path(payload["predictions_path"]).exists())
+        latest_path = Path(payload["report_path"]).parent / "latest_drift_eval.json"
+        self.assertTrue(latest_path.exists())
+
+    def test_hosting_run_attaches_drift_monitoring_result(self):
+        request = HostingRequest(
+            model_dir=str(self.project_dir),
+            mode="local",
+            drift_golden_path=str(self.project_dir / "gates" / "drift_golden.csv"),
+            drift_policy_path=str(self.project_dir / "gates" / "drift_policy.json"),
+        )
+        ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
+        gate_payload = {
+            "gate_pass": True,
+            "cached": False,
+            "report_path": str(self.project_dir / "outputs" / "gates" / "gate_eval_1.json"),
+            "predictions_path": str(self.project_dir / "outputs" / "gates" / "gate_eval_1_predictions.csv"),
+            "model_hash": "m",
+            "golden_set_hash": "g",
+            "policy_hash": "p",
+            "sample_count": 4,
+            "metrics": {"accuracy": 0.9, "weighted_f1": 0.89},
+            "golden_set_path": str(self.project_dir / "gates" / "deployment_golden.csv"),
+            "policy_path": str(self.project_dir / "gates" / "deployment_policy.json"),
+        }
+        drift_payload = {
+            "status": "warning",
+            "created_at": "2026-04-30T00:00:00Z",
+            "report_path": str(self.project_dir / "outputs" / "drift_monitoring" / "report.json"),
+            "predictions_path": str(self.project_dir / "outputs" / "drift_monitoring" / "predictions.csv"),
+            "golden_set_path": str(self.project_dir / "gates" / "drift_golden.csv"),
+            "golden_set_hash": "dg",
+            "policy_path": str(self.project_dir / "gates" / "drift_policy.json"),
+            "policy_hash": "dp",
+            "sample_count": 8,
+            "metrics": {"accuracy": 0.84, "weighted_f1": 0.83},
+            "warning_failures": ["warning.accuracy 0.8400 < warning.min_accuracy 0.8800"],
+            "critical_failures": [],
+        }
+        with mock.patch.object(self.hosting, "_enforce_deployment_gate", return_value=gate_payload), mock.patch.object(
+            self.hosting,
+            "_run_local_hosting",
+            return_value={"operation": "hosting", "message": "Local stack is ready.", "summary": "Local stack is ready."},
+        ), mock.patch.object(self.observability, "evaluate_drift_for_model", return_value=drift_payload):
+            result = self.hosting._run(ctx, request)
+
+        self.assertEqual(result["drift_monitoring"]["status"], "warning")
+        self.assertIn("Drift monitoring baseline: WARNING", result["summary"])
+        metadata = self.model_catalog.read_last_hosting_metadata()
+        self.assertEqual(metadata.get("drift_monitoring", {}).get("status"), "warning")
+
+    def test_hosting_run_keeps_success_when_drift_monitoring_errors(self):
+        request = HostingRequest(
+            model_dir=str(self.project_dir),
+            mode="local",
+            drift_golden_path=str(self.project_dir / "gates" / "drift_golden.csv"),
+            drift_policy_path=str(self.project_dir / "gates" / "drift_policy.json"),
+        )
+        ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
+        gate_payload = {
+            "gate_pass": True,
+            "cached": False,
+            "report_path": str(self.project_dir / "outputs" / "gates" / "gate_eval_1.json"),
+            "predictions_path": str(self.project_dir / "outputs" / "gates" / "gate_eval_1_predictions.csv"),
+            "model_hash": "m",
+            "golden_set_hash": "g",
+            "policy_hash": "p",
+            "sample_count": 4,
+            "metrics": {"accuracy": 0.9, "weighted_f1": 0.89},
+            "golden_set_path": str(self.project_dir / "gates" / "deployment_golden.csv"),
+            "policy_path": str(self.project_dir / "gates" / "deployment_policy.json"),
+        }
+        with mock.patch.object(self.hosting, "_enforce_deployment_gate", return_value=gate_payload), mock.patch.object(
+            self.hosting,
+            "_run_local_hosting",
+            return_value={"operation": "hosting", "message": "Local stack is ready.", "summary": "Local stack is ready."},
+        ), mock.patch.object(
+            self.observability,
+            "evaluate_drift_for_model",
+            side_effect=RuntimeError("drift failed"),
+        ):
+            result = self.hosting._run(ctx, request)
+
+        self.assertEqual(result["operation"], "hosting")
+        self.assertIn("drift failed", result.get("drift_monitoring_error", ""))
+
     def test_azure_platform_deploys_serverless_endpoint_from_catalog_model_id(self):
         service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
         service.ensure_azure_dependencies = lambda: None

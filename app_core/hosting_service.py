@@ -482,6 +482,91 @@ class HostingService:
         except Exception:
             pass
 
+    def _attach_drift_monitoring_to_result(self, ctx: JobContext, request: HostingRequest, result: dict[str, Any]) -> None:
+        drift_golden = clean_optional_string(request.drift_golden_path) or "gates/drift_golden.csv"
+        drift_policy = clean_optional_string(request.drift_policy_path) or "gates/drift_policy.json"
+        deployment_id = clean_optional_string(result.get("endpoint_name")) or clean_optional_string(result.get("api_url"))
+        service_kind = clean_optional_string(request.azure_service) if request.mode == "azure" else "local"
+        summary_prefix = "Drift monitoring baseline:"
+        drift_binding = {
+            "golden_set_path": str(self.observability_service.resolve_drift_input_path(drift_golden, "gates/drift_golden.csv")),
+            "policy_path": str(self.observability_service.resolve_drift_input_path(drift_policy, "gates/drift_policy.json")),
+        }
+
+        try:
+            ctx.emit("progress", "Running drift monitoring baseline against drift golden set...")
+            drift_payload = self.observability_service.evaluate_drift_for_model(
+                model_dir=request.model_dir,
+                golden_path=drift_golden,
+                policy_path=drift_policy,
+                deployment_id=deployment_id,
+                endpoint_name=clean_optional_string(result.get("endpoint_name")),
+                mode=request.mode,
+                service_kind=service_kind,
+                source="deploy_baseline",
+                emit=lambda msg: ctx.emit("progress", msg),
+            )
+            status = clean_optional_string(drift_payload.get("status")) or "unknown"
+            metrics = drift_payload.get("metrics", {}) if isinstance(drift_payload.get("metrics"), dict) else {}
+            drift_summary = (
+                f"{summary_prefix} {status.upper()} "
+                f"| accuracy={float(metrics.get('accuracy', 0.0)):.4f} "
+                f"| weighted_f1={float(metrics.get('weighted_f1', 0.0)):.4f}"
+            )
+            result["drift_monitoring"] = {
+                "status": status,
+                "report_path": clean_optional_string(drift_payload.get("report_path")),
+                "predictions_path": clean_optional_string(drift_payload.get("predictions_path")),
+                "golden_set_path": clean_optional_string(drift_payload.get("golden_set_path")),
+                "golden_set_hash": clean_optional_string(drift_payload.get("golden_set_hash")),
+                "policy_path": clean_optional_string(drift_payload.get("policy_path")),
+                "policy_hash": clean_optional_string(drift_payload.get("policy_hash")),
+                "sample_count": int(drift_payload.get("sample_count") or 0),
+                "metrics": metrics,
+                "warning_failures": drift_payload.get("warning_failures", []),
+                "critical_failures": drift_payload.get("critical_failures", []),
+            }
+            result["summary"] = (
+                clean_optional_string(result.get("summary")) + "\n" + drift_summary
+                if clean_optional_string(result.get("summary"))
+                else drift_summary
+            )
+            result["message"] = (
+                clean_optional_string(result.get("message")) + "\n" + drift_summary
+                if clean_optional_string(result.get("message"))
+                else drift_summary
+            )
+            drift_binding.update(
+                {
+                    "status": status,
+                    "report_path": clean_optional_string(drift_payload.get("report_path")),
+                    "predictions_path": clean_optional_string(drift_payload.get("predictions_path")),
+                    "metrics": metrics,
+                    "sample_count": int(drift_payload.get("sample_count") or 0),
+                    "last_checked_at": clean_optional_string(drift_payload.get("created_at")),
+                    "warning_failures": drift_payload.get("warning_failures", []),
+                    "critical_failures": drift_payload.get("critical_failures", []),
+                }
+            )
+        except Exception as exc:
+            drift_error = clean_optional_string(exc) or "Drift monitoring baseline failed."
+            result["drift_monitoring_error"] = drift_error
+            result["summary"] = (
+                clean_optional_string(result.get("summary"))
+                + "\n"
+                + summary_prefix
+                + " ERROR: "
+                + drift_error
+            )
+            drift_binding.update({"status": "error", "error": drift_error})
+
+        try:
+            hosting_meta = self.model_catalog_service.read_last_hosting_metadata() or {}
+            hosting_meta["drift_monitoring"] = drift_binding
+            result["metadata_path"] = self.model_catalog_service.save_last_hosting_metadata(hosting_meta)
+        except Exception:
+            pass
+
     def _run(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
         gate_payload = self._enforce_deployment_gate(ctx, request)
         if request.mode == "azure":
@@ -489,6 +574,7 @@ class HostingService:
         else:
             result = self._run_local_hosting(ctx, request)
         self._attach_deployment_gate_to_result(result, gate_payload)
+        self._attach_drift_monitoring_to_result(ctx, request, result)
         if request.create_github_pr:
             self._attach_github_copilot_pr_task(ctx, request, result)
         return result

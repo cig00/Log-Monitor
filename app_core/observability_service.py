@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
 import os
 import platform
@@ -13,14 +15,22 @@ import threading
 import time
 import zipfile
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import requests
 
-from mlops_utils import clean_optional_string
+from inference_utils import LABEL_NAMES, load_model_bundle, predict_error_message
+from mlops_utils import clean_optional_string, compute_file_sha256, discover_model_dir, now_utc_iso, read_json, write_json
 
 from .runtime import ArtifactStore, StateStore
+
+try:
+    from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
+except Exception:
+    accuracy_score = None
+    confusion_matrix = None
+    precision_recall_fscore_support = None
 
 
 Reporter = Callable[[str], None]
@@ -95,6 +105,350 @@ class ObservabilityService:
         for process in processes:
             self.terminate_process(process)
         self.state_store.set_value("active_local_hosting", {})
+
+    def get_drift_monitoring_root(self) -> Path:
+        root = self.project_dir / "outputs" / "drift_monitoring"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def resolve_drift_input_path(self, raw_path: str, default_relative_path: str) -> Path:
+        candidate = clean_optional_string(raw_path) or default_relative_path
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = (self.project_dir / path).resolve()
+        else:
+            path = path.resolve()
+        return path
+
+    def _normalize_drift_threshold_group(self, payload: dict[str, Any], label: str) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError(f"Drift policy `{label}` section must be a JSON object.")
+        required_keys = ("min_accuracy", "min_weighted_f1", "min_macro_f1")
+        normalized: dict[str, Any] = {}
+        for key in required_keys:
+            if key not in payload:
+                raise ValueError(f"Drift policy `{label}` section is missing required key `{key}`.")
+            try:
+                value = float(payload[key])
+            except Exception as exc:
+                raise ValueError(f"Drift policy `{label}` key `{key}` must be numeric: {exc}") from exc
+            if value < 0 or value > 1:
+                raise ValueError(f"Drift policy `{label}` key `{key}` must be within [0, 1].")
+            normalized[key] = value
+
+        recalls = payload.get("min_recall_per_class")
+        if not isinstance(recalls, dict):
+            raise ValueError(f"Drift policy `{label}` key `min_recall_per_class` must be an object.")
+        normalized_recalls: dict[str, float] = {}
+        for raw_label, raw_value in recalls.items():
+            class_label = clean_optional_string(raw_label)
+            if not class_label:
+                continue
+            try:
+                value = float(raw_value)
+            except Exception as exc:
+                raise ValueError(
+                    f"Drift policy `{label}` recall threshold for `{class_label}` must be numeric: {exc}"
+                ) from exc
+            if value < 0 or value > 1:
+                raise ValueError(f"Drift policy `{label}` recall threshold for `{class_label}` must be within [0, 1].")
+            normalized_recalls[class_label] = value
+        normalized["min_recall_per_class"] = normalized_recalls
+        return normalized
+
+    def load_drift_policy(self, policy_path: Path) -> dict[str, Any]:
+        payload = read_json(str(policy_path))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Drift policy must be a JSON object: {policy_path}")
+
+        warning_payload = payload.get("warning")
+        critical_payload = payload.get("critical")
+        if warning_payload is None and critical_payload is None:
+            # Backward compatibility with single-threshold schema.
+            normalized_critical = self._normalize_drift_threshold_group(payload, "critical")
+            return {"warning": {}, "critical": normalized_critical}
+
+        normalized_warning = {}
+        normalized_critical = {}
+        if warning_payload is not None:
+            normalized_warning = self._normalize_drift_threshold_group(warning_payload, "warning")
+        if critical_payload is not None:
+            normalized_critical = self._normalize_drift_threshold_group(critical_payload, "critical")
+        if not normalized_critical:
+            raise ValueError("Drift policy must define a `critical` threshold section.")
+        return {"warning": normalized_warning, "critical": normalized_critical}
+
+    def _resolve_drift_dataset_columns(self, fieldnames: list[str]) -> tuple[str, str]:
+        normalized_map: dict[str, str] = {clean_optional_string(name).lower(): name for name in fieldnames}
+        message_candidates = ("logmessage", "log_message", "message", "errormessage", "error_message", "log")
+        label_candidates = ("class", "label", "classification", "target", "y")
+
+        message_column = ""
+        for candidate in message_candidates:
+            if candidate in normalized_map:
+                message_column = normalized_map[candidate]
+                break
+        if not message_column:
+            raise ValueError("Drift golden set is missing a message column (expected LogMessage/message/errorMessage).")
+
+        label_column = ""
+        for candidate in label_candidates:
+            if candidate in normalized_map:
+                label_column = normalized_map[candidate]
+                break
+        if not label_column:
+            raise ValueError("Drift golden set is missing a label column (expected class/label).")
+        return message_column, label_column
+
+    def load_drift_dataset_rows(self, golden_path: Path) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        with open(golden_path, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                raise ValueError(f"Drift golden set has no header columns: {golden_path}")
+            message_column, label_column = self._resolve_drift_dataset_columns(list(reader.fieldnames))
+            for line_number, row in enumerate(reader, start=2):
+                message = clean_optional_string((row or {}).get(message_column, ""))
+                label = clean_optional_string((row or {}).get(label_column, ""))
+                if not message:
+                    raise ValueError(f"Drift golden set row {line_number} has empty message text.")
+                if not label:
+                    raise ValueError(f"Drift golden set row {line_number} has empty label.")
+                rows.append(
+                    {
+                        "line_number": line_number,
+                        "message": message,
+                        "label": label,
+                    }
+                )
+        if not rows:
+            raise ValueError(f"Drift golden set has no data rows: {golden_path}")
+        return rows
+
+    def compute_model_dir_hash(self, model_dir: Path) -> str:
+        digest = hashlib.sha256()
+        files = sorted([path for path in model_dir.rglob("*") if path.is_file()])
+        if not files:
+            raise ValueError(f"No files found under model directory: {model_dir}")
+        for file_path in files:
+            relative_path = file_path.relative_to(model_dir).as_posix()
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(compute_file_sha256(str(file_path)).encode("utf-8"))
+        return digest.hexdigest()
+
+    def compute_drift_metrics(self, y_true: list[str], y_pred: list[str]) -> dict[str, Any]:
+        if accuracy_score is None or precision_recall_fscore_support is None or confusion_matrix is None:
+            raise RuntimeError("scikit-learn is required for drift monitoring metrics, but it is not available.")
+        if len(y_true) != len(y_pred):
+            raise ValueError("Drift metric computation received mismatched true/predicted label lengths.")
+        if not y_true:
+            raise ValueError("Drift metric computation received an empty dataset.")
+
+        labels = list(LABEL_NAMES)
+        for label in y_true:
+            clean_label = clean_optional_string(label)
+            if clean_label and clean_label not in labels:
+                labels.append(clean_label)
+        for label in y_pred:
+            clean_label = clean_optional_string(label)
+            if clean_label and clean_label not in labels:
+                labels.append(clean_label)
+
+        accuracy = float(accuracy_score(y_true, y_pred))
+        weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            average="weighted",
+            zero_division=0,
+        )
+        macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0,
+        )
+        per_precision, per_recall, per_f1, per_support = precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            labels=labels,
+            average=None,
+            zero_division=0,
+        )
+        per_class: dict[str, dict[str, Any]] = {}
+        for index, label in enumerate(labels):
+            per_class[label] = {
+                "precision": float(per_precision[index]),
+                "recall": float(per_recall[index]),
+                "f1": float(per_f1[index]),
+                "support": int(per_support[index]),
+            }
+        confusion = confusion_matrix(y_true, y_pred, labels=labels).tolist()
+        return {
+            "accuracy": accuracy,
+            "weighted_precision": float(weighted_precision),
+            "weighted_recall": float(weighted_recall),
+            "weighted_f1": float(weighted_f1),
+            "macro_precision": float(macro_precision),
+            "macro_recall": float(macro_recall),
+            "macro_f1": float(macro_f1),
+            "per_class": per_class,
+            "confusion_matrix": {"labels": labels, "matrix": confusion},
+        }
+
+    def _evaluate_drift_threshold_group(self, metrics: dict[str, Any], thresholds: dict[str, Any], label: str) -> list[str]:
+        if not thresholds:
+            return []
+        failures: list[str] = []
+        if float(metrics.get("accuracy", 0.0)) < float(thresholds["min_accuracy"]):
+            failures.append(
+                f"{label}.accuracy {float(metrics.get('accuracy', 0.0)):.4f} < {label}.min_accuracy {float(thresholds['min_accuracy']):.4f}"
+            )
+        if float(metrics.get("weighted_f1", 0.0)) < float(thresholds["min_weighted_f1"]):
+            failures.append(
+                f"{label}.weighted_f1 {float(metrics.get('weighted_f1', 0.0)):.4f} < {label}.min_weighted_f1 {float(thresholds['min_weighted_f1']):.4f}"
+            )
+        if float(metrics.get("macro_f1", 0.0)) < float(thresholds["min_macro_f1"]):
+            failures.append(
+                f"{label}.macro_f1 {float(metrics.get('macro_f1', 0.0)):.4f} < {label}.min_macro_f1 {float(thresholds['min_macro_f1']):.4f}"
+            )
+        per_class = metrics.get("per_class") if isinstance(metrics.get("per_class"), dict) else {}
+        recall_thresholds = (
+            thresholds.get("min_recall_per_class")
+            if isinstance(thresholds.get("min_recall_per_class"), dict)
+            else {}
+        )
+        for raw_label, raw_threshold in recall_thresholds.items():
+            class_label = clean_optional_string(raw_label)
+            if not class_label:
+                continue
+            threshold = float(raw_threshold)
+            class_recall = 0.0
+            class_payload = per_class.get(class_label) if isinstance(per_class, dict) else None
+            if isinstance(class_payload, dict):
+                class_recall = float(class_payload.get("recall", 0.0))
+            if class_recall < threshold:
+                failures.append(
+                    f"{label}.recall[{class_label}] {class_recall:.4f} < {label}.min_recall_per_class[{class_label}] {threshold:.4f}"
+                )
+        return failures
+
+    def evaluate_drift_for_model(
+        self,
+        *,
+        model_dir: str,
+        golden_path: str,
+        policy_path: str,
+        deployment_id: str = "",
+        endpoint_name: str = "",
+        mode: str = "",
+        service_kind: str = "",
+        source: str = "manual",
+        emit: Reporter | None = None,
+    ) -> dict[str, Any]:
+        reporter = emit or (lambda message: None)
+        resolved_model_dir = Path(discover_model_dir(model_dir)).resolve()
+        resolved_golden_path = self.resolve_drift_input_path(golden_path, "gates/drift_golden.csv")
+        resolved_policy_path = self.resolve_drift_input_path(policy_path, "gates/drift_policy.json")
+        if not resolved_golden_path.exists() or not resolved_golden_path.is_file():
+            raise FileNotFoundError(f"Drift golden set file not found: {resolved_golden_path}")
+        if not resolved_policy_path.exists() or not resolved_policy_path.is_file():
+            raise FileNotFoundError(f"Drift policy file not found: {resolved_policy_path}")
+
+        reporter("Loading drift golden set and policy...")
+        policy = self.load_drift_policy(resolved_policy_path)
+        golden_rows = self.load_drift_dataset_rows(resolved_golden_path)
+
+        reporter("Running drift golden-set inference...")
+        bundle = load_model_bundle(str(resolved_model_dir))
+        y_true: list[str] = []
+        y_pred: list[str] = []
+        predictions: list[dict[str, Any]] = []
+        for row in golden_rows:
+            true_label = clean_optional_string(row.get("label"))
+            predicted_label = clean_optional_string(
+                predict_error_message(bundle, clean_optional_string(row.get("message")))
+            )
+            y_true.append(true_label)
+            y_pred.append(predicted_label)
+            predictions.append(
+                {
+                    "line_number": int(row.get("line_number", 0)),
+                    "message": clean_optional_string(row.get("message")),
+                    "true_label": true_label,
+                    "predicted_label": predicted_label,
+                    "match": predicted_label == true_label,
+                }
+            )
+
+        metrics = self.compute_drift_metrics(y_true, y_pred)
+        warning_failures = self._evaluate_drift_threshold_group(metrics, policy.get("warning", {}), "warning")
+        critical_failures = self._evaluate_drift_threshold_group(metrics, policy.get("critical", {}), "critical")
+        if critical_failures:
+            status = "critical"
+        elif warning_failures:
+            status = "warning"
+        else:
+            status = "ok"
+
+        deployment_key = clean_optional_string(deployment_id) or clean_optional_string(endpoint_name) or resolved_model_dir.name
+        deployment_key = re.sub(r"[^A-Za-z0-9._-]+", "-", deployment_key).strip("-_.") or "default"
+        drift_root = self.get_drift_monitoring_root() / deployment_key
+        drift_root.mkdir(parents=True, exist_ok=True)
+        stamp = str(int(time.time() * 1000))
+        report_path = drift_root / f"drift_eval_{stamp}.json"
+        predictions_path = drift_root / f"drift_eval_{stamp}_predictions.csv"
+
+        with open(predictions_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["line_number", "message", "true_label", "predicted_label", "match"],
+            )
+            writer.writeheader()
+            for row in predictions:
+                writer.writerow(
+                    {
+                        "line_number": row.get("line_number", ""),
+                        "message": clean_optional_string(row.get("message")),
+                        "true_label": clean_optional_string(row.get("true_label")),
+                        "predicted_label": clean_optional_string(row.get("predicted_label")),
+                        "match": bool(row.get("match")),
+                    }
+                )
+
+        payload: dict[str, Any] = {
+            "created_at": now_utc_iso(),
+            "status": status,
+            "deployment_id": clean_optional_string(deployment_id),
+            "deployment_key": deployment_key,
+            "endpoint_name": clean_optional_string(endpoint_name),
+            "mode": clean_optional_string(mode),
+            "service_kind": clean_optional_string(service_kind),
+            "source": clean_optional_string(source),
+            "model_dir": str(resolved_model_dir),
+            "model_hash": self.compute_model_dir_hash(resolved_model_dir),
+            "golden_set_path": str(resolved_golden_path),
+            "golden_set_hash": compute_file_sha256(str(resolved_golden_path)),
+            "policy_path": str(resolved_policy_path),
+            "policy_hash": compute_file_sha256(str(resolved_policy_path)),
+            "sample_count": len(golden_rows),
+            "metrics": metrics,
+            "warning_failures": warning_failures,
+            "critical_failures": critical_failures,
+            "policy": policy,
+            "predictions_path": str(predictions_path.resolve()),
+            "report_path": str(report_path.resolve()),
+        }
+        write_json(str(report_path), payload)
+        latest_path = drift_root / "latest_drift_eval.json"
+        write_json(str(latest_path), payload)
+        self.state_store.set_value(f"drift_latest:{deployment_key}", payload)
+
+        reporter(
+            "Drift monitoring baseline completed: "
+            + f"status={status}, accuracy={float(metrics.get('accuracy', 0.0)):.4f}, "
+            + f"weighted_f1={float(metrics.get('weighted_f1', 0.0)):.4f}"
+        )
+        return payload
 
     def get_local_observability_root(self) -> Path:
         return Path(self.artifact_store.local_observability_root)

@@ -78,6 +78,7 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 - `inference_utils.py`: shared inference loader and prediction helper.
 - `serve_model.py`: local HTTP prediction service.
 - `gates/deployment_policy.json`: default deployment-gate threshold policy.
+- `gates/drift_policy.json`: default drift-monitoring threshold policy.
 - `azure_score.py`: legacy Azure ML online endpoint scoring entrypoint.
 - `azure_batch_score.py`: Azure ML batch endpoint scoring entrypoint.
 - `prompt.txt`: system prompt used during OpenAI labeling.
@@ -310,6 +311,8 @@ Use the `Hosting` section:
 - `Generated Model`: select the trained model directory
 - `Gate Golden Set`: labeled CSV used as the deployment acceptance gate (`LogMessage` + `class`, with common aliases accepted)
 - `Gate Policy`: JSON thresholds (`gates/deployment_policy.json` by default)
+- `Drift Golden Set`: labeled CSV used for drift monitoring baseline checks
+- `Drift Policy`: JSON warning/critical drift thresholds (`gates/drift_policy.json` by default)
 - `Available Models`: review and select discovered local versioned models, latest local output, downloaded models, or the current manual selection
 - `Host Target`:
   - `Local`
@@ -343,6 +346,12 @@ Deployment gate outputs are written to:
 - `outputs/gates/latest_gate_eval.json`
 
 Gate PASS evaluations are cached by `model_hash + golden_set_hash + policy_hash` and reused automatically.
+
+After deployment succeeds, observability runs a drift-monitoring baseline against the configured drift golden set and stores results in:
+
+- `outputs/drift_monitoring/<deployment>/drift_eval_<timestamp>.json`
+- `outputs/drift_monitoring/<deployment>/drift_eval_<timestamp>_predictions.csv`
+- `outputs/drift_monitoring/<deployment>/latest_drift_eval.json`
 
 ### 5. Query The Prediction API
 
@@ -476,6 +485,8 @@ Local runtime policy:
 - `Generated Model`
 - `Gate Golden Set`
 - `Gate Policy`
+- `Drift Golden Set`
+- `Drift Policy`
 - `Host Target`
 - Azure-host-only fields:
   - `Azure Service`

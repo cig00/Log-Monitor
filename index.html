@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Log Finder</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h1>Log Finder</h1>
+            <p>Search logs, find when a message first appeared, then inspect commits from the prior week.</p>
+          </div>
+          <label class="folder-picker">
+            <input id="folderInput" type="file" webkitdirectory directory multiple />
+            <span>Choose Log Folder</span>
+          </label>
+        </header>
+
+        <section class="controls" aria-label="Search controls">
+          <label class="field">
+            <span>Log message</span>
+            <textarea
+              id="messageInput"
+              rows="4"
+              placeholder="Paste the log message or a unique part of it"
+            ></textarea>
+          </label>
+
+          <div class="options">
+            <label>
+              <input id="exactInput" type="checkbox" />
+              <span>Exact line match</span>
+            </label>
+            <label>
+              <input id="caseInput" type="checkbox" />
+              <span>Case sensitive</span>
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="searchButton" type="button">Task 1: Find First Appearance</button>
+            <button id="commitsButton" type="button" disabled>Task 2: Find Commits In Prior Week</button>
+          </div>
+        </section>
+
+        <section class="controls" aria-label="Task 3 report controls">
+          <div class="task-title">
+            <h2>Task 3: JIRA Report</h2>
+            <span id="reportStatus">Run Task 2 first</span>
+          </div>
+
+          <label class="field">
+            <span>JIRA issue key</span>
+            <input id="jiraKeyInput" type="text" placeholder="KAN-123" />
+          </label>
+
+          <label class="field">
+            <span>Investigation notes</span>
+            <textarea
+              id="notesInput"
+              rows="3"
+              placeholder="Add why the selected commit is related, or leave blank"
+            ></textarea>
+          </label>
+
+          <div class="actions">
+            <button id="reportButton" type="button" disabled>Task 3: Generate JIRA Report</button>
+            <button id="publishButton" type="button" disabled>Publish Comment To JIRA</button>
+            <button id="copilotButton" type="button" disabled>Copy Copilot Review Prompt</button>
+          </div>
+        </section>
+
+        <section class="status-grid" aria-label="Folder status">
+          <div>
+            <span class="metric-label">Files</span>
+            <strong id="fileCount">0</strong>
+          </div>
+          <div>
+            <span class="metric-label">Matches</span>
+            <strong id="matchCount">0</strong>
+          </div>
+          <div>
+            <span class="metric-label">Earliest date</span>
+            <strong id="firstDate">-</strong>
+          </div>
+          <div>
+            <span class="metric-label">Commits</span>
+            <strong id="commitCount">0</strong>
+          </div>
+        </section>
+
+        <section class="results" aria-label="Search results">
+          <div class="results-header">
+            <h2>Result</h2>
+            <span id="scanStatus">No folder selected</span>
+          </div>
+          <div id="resultPanel" class="result-panel empty">
+            Choose a folder of logs, enter a message, then run the search.
+          </div>
+        </section>
+
+        <section class="results" aria-label="Commit results">
+          <div class="results-header">
+            <h2>Task 2 Commits</h2>
+            <span id="commitStatus">Run Task 1 first</span>
+          </div>
+          <div id="commitPanel" class="result-panel empty">
+            After Task 1 finds a date, run Task 2 to list commits from that date back seven days.
+          </div>
+        </section>
+
+        <section class="results" aria-label="JIRA report">
+          <div class="results-header">
+            <h2>Task 3 Report</h2>
+            <span id="jiraStatus">No report generated</span>
+          </div>
+          <div id="reportPanel" class="result-panel empty">
+            Mark related commits from Task 2, then generate the JIRA-ready report.
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

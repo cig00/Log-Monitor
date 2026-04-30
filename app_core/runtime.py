@@ -120,6 +120,37 @@ class StateStore:
             metadata=json.loads(row["metadata_json"] or "{}"),
         )
 
+    def list_jobs(self, limit: int = 50, job_type: str = "") -> list[JobRecord]:
+        safe_limit = max(1, min(int(limit or 50), 500))
+        clean_job_type = clean_optional_string(job_type)
+        with self._lock, closing(self._connect()) as conn:
+            if clean_job_type:
+                rows = conn.execute(
+                    "SELECT * FROM jobs WHERE job_type = ? ORDER BY submitted_at DESC LIMIT ?",
+                    (clean_job_type, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM jobs ORDER BY submitted_at DESC LIMIT ?",
+                    (safe_limit,),
+                ).fetchall()
+        jobs: list[JobRecord] = []
+        for row in rows:
+            jobs.append(
+                JobRecord(
+                    job_id=row["job_id"],
+                    job_type=row["job_type"],
+                    status=row["status"],
+                    submitted_at=row["submitted_at"],
+                    started_at=row["started_at"],
+                    finished_at=row["finished_at"],
+                    error=row["error"],
+                    result=json.loads(row["result_json"] or "{}"),
+                    metadata=json.loads(row["metadata_json"] or "{}"),
+                )
+            )
+        return jobs
+
     def set_value(self, key: str, value: Any) -> None:
         with self._lock, closing(self._connect()) as conn:
             conn.execute(

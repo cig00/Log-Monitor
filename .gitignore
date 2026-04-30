@@ -2,6 +2,9 @@ agents.md
 outputs/
 outputs/prompt_versions/
 downloaded_model/
+uploads/
 __pycache__/
 mlruns/
 *.mlmeta.json
+.env
+.DS_Store

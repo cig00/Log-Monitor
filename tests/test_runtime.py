@@ -33,6 +33,30 @@ class RuntimeTests(unittest.TestCase):
         self.state_store.set_value("active", {"mode": "local"})
         self.assertEqual(self.state_store.get_value("active"), {"mode": "local"})
 
+    def test_state_store_lists_jobs_for_reconnect(self):
+        first = self.job_manager.submit("first", lambda ctx: {"message": "first"})
+        second = self.job_manager.submit("second", lambda ctx: {"message": "second"})
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            first_job = self.state_store.get_job(first.job_id)
+            second_job = self.state_store.get_job(second.job_id)
+            if (
+                first_job is not None
+                and second_job is not None
+                and first_job.status == JOB_STATUS_SUCCEEDED
+                and second_job.status == JOB_STATUS_SUCCEEDED
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("Timed out waiting for persisted jobs.")
+
+        jobs = self.state_store.list_jobs(limit=10)
+        job_ids = [job.job_id for job in jobs]
+        self.assertIn(first.job_id, job_ids)
+        self.assertIn(second.job_id, job_ids)
+        self.assertEqual([job.job_type for job in self.state_store.list_jobs(job_type="second")], ["second"])
+
     def test_job_manager_success_path(self):
         record = self.job_manager.submit("unit_test", lambda ctx: {"message": "done", "answer": 42})
         event = self.wait_for_terminal_event(record.job_id)

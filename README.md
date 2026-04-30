@@ -1,6 +1,11 @@
 # Log-Monitor
 
-Log-Monitor is a Tkinter desktop application for the full log-classification lifecycle:
+Log-Monitor is a log-classification lifecycle application with two front ends:
+
+- a Tkinter desktop app in `app.py`
+- a Docker-native browser control plane in `web_app.py`
+
+Both front ends use the same service layer under `app_core/` for:
 
 1. ingest raw log CSVs
 2. label them with an OpenAI model
@@ -9,9 +14,9 @@ Log-Monitor is a Tkinter desktop application for the full log-classification lif
 5. host the trained model locally or on Azure
 6. expose either a local prediction API or an Azure batch inference endpoint
 
-The desktop app now uses a modular-monolith architecture: `app.py` remains the Tkinter UI and workflow orchestrator, while the business logic lives in internal service and runtime modules under `app_core/`.
+The app uses a modular-monolith architecture: `app.py` and `web_app.py` are UI/orchestration layers, while the business logic lives in internal service and runtime modules under `app_core/`.
 
-The project also includes Docker, Apptainer, and Slurm helpers for reproducible training outside the desktop UI.
+The Docker Compose deployment runs the browser UI, inference API, MLflow, Prometheus, and Grafana as one portable stack for local machines, VMs, and Azure-hosted machines.
 
 ## What The Project Does
 
@@ -62,6 +67,7 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 ## Repository Layout
 
 - `app.py`: Tkinter UI and workflow orchestrator.
+- `web_app.py`: FastAPI browser control plane for Docker Compose deployments.
 - `app_core/`: internal modular-monolith package used by `app.py`.
   - `contracts.py`: typed request, status, artifact, and job dataclasses.
   - `runtime.py`: shared `JobManager`, `StateStore` (SQLite), and `ArtifactStore`.
@@ -83,8 +89,14 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 - `azure_batch_score.py`: Azure ML batch endpoint scoring entrypoint.
 - `prompt.txt`: system prompt used during OpenAI labeling.
 - `requirements.txt`: desktop app/runtime dependencies.
+- `requirements.web.txt`: Docker web control-plane dependencies.
+- `requirements.inference.txt`: Docker inference API dependencies.
 - `requirements.train.txt`: training/container dependencies.
 - `Dockerfile`: training image definition.
+- `Dockerfile.web`: Docker image for the browser control plane.
+- `Dockerfile.inference`: Docker image for the prediction API.
+- `docker-compose.yml`: portable stack for web UI, inference, MLflow, Prometheus, and Grafana.
+- `docker/`: Prometheus and Grafana provisioning for Compose.
 - `azure_inference_conda.yml`: legacy Azure online inference environment definition.
 - `azure_batch_inference_conda.yml`: Azure batch inference environment definition.
 - `scripts/train_docker.sh`: run training inside Docker.
@@ -117,6 +129,12 @@ Minimum practical requirements:
 - Python 3.10 or newer
 - `pip`
 - internet access for OpenAI labeling, Hugging Face model download, and Azure workflows
+
+For Docker Compose deployment:
+
+- Docker Engine / Docker Desktop with Compose v2
+- enough disk space for PyTorch, Transformers, and model artifacts
+- optional Azure service-principal environment variables for non-interactive Azure workflows
 
 Optional, depending on workflow:
 
@@ -155,10 +173,93 @@ Run the desktop app:
 python app.py
 ```
 
+Run the Docker browser app:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Then open:
+
+```bash
+docker compose port web 8080
+```
+
+Open the returned host and port in your browser. Example output `0.0.0.0:49154` means open `http://127.0.0.1:49154` locally, or `http://<vm-ip>:49154` on a VM if the firewall allows it.
+
+By default, Docker chooses host ports automatically to avoid conflicts. On a VM or Azure instance, set the optional `LOG_MONITOR_PUBLIC_*` URLs in `.env` only when you intentionally use fixed ports or a reverse proxy.
+
 Important:
 
 - `requirements.txt` includes `mlflow==2.9.2`. If the local dashboard says MLflow is unavailable, the Python environment running the app is missing that dependency.
 - Local container training assumes the Docker image already exists. The UI does not build the image for you.
+
+## Docker Compose Deployment
+
+The portable deployment path is browser-first:
+
+```bash
+git clone <repo-url>
+cd Log-Monitor
+cp .env.example .env
+docker compose up --build
+```
+
+Compose starts these internal service ports and asks Docker to choose available host ports:
+
+- `web`: FastAPI browser control plane, container port `8080`
+- `inference`: prediction API, container port `8000`
+- `mlflow`: tracking server, container port `5000`
+- `prometheus`: metrics backend, container port `9090`
+- `grafana`: dashboard UI, container port `3000`
+
+Discover assigned host ports:
+
+```bash
+docker compose port web 8080
+docker compose port inference 8000
+docker compose port mlflow 5000
+docker compose port prometheus 9090
+docker compose port grafana 3000
+```
+
+Persistent host-mounted directories:
+
+- `outputs/`: trained models, runtime state, gate reports, drift reports
+- `gates/`: deployment and drift policies plus user-provided golden sets
+- `downloaded_model/`: imported external model bundles
+- `uploads/`: raw and labeled CSV files uploaded through the browser UI
+- `mlruns/`: local MLflow artifact storage when applicable
+
+The browser control plane stores job status in `outputs/runtime_state.sqlite3`, so reconnecting to the browser after a network drop still shows completed, failed, and running job records.
+
+The Docker browser UI mirrors the desktop workflow rather than exposing only a reduced path. It includes the Prompt Lab version selector, prompt reload/refresh/test/compare actions, direct raw/labeled CSV upload, local/Azure training toggles, the expandable model-parameter panel, GitHub repo/branch loading for PR tasking, Azure hosting service toggles, model-directory upload, deployment/drift gate upload fields, and the same hosting output fields. Experiment-tracking configuration is kept internal to the Docker control plane so metrics remain recorded without a visible tracking setup panel.
+
+Docker hosting uses a shared model pointer:
+
+```text
+outputs/active_model_dir.txt
+```
+
+When a model passes the deployment gate, the web service writes the selected container path to that file and calls the inference container's `/reload` endpoint. The inference container can start before a model exists and reports model-loaded state through `/health`.
+
+For Azure workflows from Docker, prefer non-interactive credentials in `.env` or your deployment platform:
+
+```text
+AZURE_CLIENT_ID=
+AZURE_TENANT_ID=
+AZURE_CLIENT_SECRET=
+AZURE_SUBSCRIPTION_ID=
+```
+
+If those are not set, the Azure adapter falls back to Docker-safe default Azure credentials. Set `AZURE_USE_DEVICE_CODE=true` to use device-code login where appropriate.
+
+Build note:
+
+- Dockerfiles split dependency installation into cacheable layers and use a BuildKit pip cache.
+- If a package download times out, rerun `docker compose build` without `--no-cache` so completed layers and cached wheels are reused.
+- Use `--no-cache` only when intentionally discarding all downloaded dependency progress.
 
 ## Full Lifecycle
 
@@ -177,13 +278,13 @@ How data preparation works:
 - detects a likely log text column by checking names like `log`, `message`, `msg`, or `text`
 - falls back to the first CSV column if no obvious log column is found
 - sends logs in batches of 10
-- requests JSON output from OpenAI
+- requests structured JSON output from OpenAI using a strict `results[].class` schema
 - retries API rate-limit failures with exponential backoff
 - writes a labeled CSV even if the run partially fails
 
 Output:
 
-- a labeled CSV chosen by the user via Save As
+- a labeled CSV written to the user-selected output path
 - a sidecar file next to that CSV:
 
 ```text
@@ -195,6 +296,8 @@ Output:
 Use the `Model Training (DeBERTa)` section:
 
 - `Labeled Data (CSV)`: training input
+- `Browse / Upload Labeled CSV`: upload an already labeled CSV directly into the browser workflow
+- `Use Prepared Output`: point training at the latest data-prep output path
 - `Environment`:
   - `Azure Cloud`
   - `Local Device (CPU/GPU)`
@@ -438,7 +541,7 @@ Depending on backend and environment:
 - local MLflow UI can be opened if `mlflow` is installed
 - Azure dashboards open in Azure ML Studio
 
-The desktop UI provides:
+The desktop and Docker browser UIs provide:
 
 - `Open MLOps`
 - `Open LLMOps`
@@ -789,7 +892,7 @@ Important limitation:
 
 ## MLOps And LLMOps
 
-Data-prep tracking still depends on MLflow being enabled in the UI, but Azure training metrics are always logged to Azure MLflow.
+Data-prep tracking follows the active MLflow configuration. In Docker browser mode, the control plane keeps the MLflow defaults internally instead of exposing an experiment-tracking setup panel. Azure training metrics are always logged to Azure MLflow.
 
 ### Data-Prep Tracking
 
@@ -902,6 +1005,8 @@ The local dashboard is generated by the app as `local_dashboard.html` and summar
 ## Container And HPC Workflows
 
 ### Docker
+
+This section covers the standalone training image. For the full browser app stack, use the Docker Compose deployment above.
 
 Build:
 
@@ -1035,3 +1140,5 @@ For a clean demo of the full lifecycle:
 7. open the local dashboard
 8. send a `POST /predict` request
 9. if needed, repeat with Azure training or Azure hosting once Azure quota is available, then submit a batch scoring job
+
+For the Docker browser workflow, launch `docker compose up --build`, upload either raw logs for data preparation or an already labeled CSV for training, then continue through training, gate evaluation, and hosting from the browser. The Docker UI keeps tracking defaults internal rather than requiring a visible MLflow setup step.

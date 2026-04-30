@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -149,6 +150,43 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["usage"]["total_tokens"], 12)
         self.assertTrue(all(case["match"] for case in result["cases"]))
         self.assertEqual(result["cases"][0]["got"], "CONFIGURATION")
+
+    def test_data_prep_service_uses_structured_json_schema_payload(self):
+        response = mock.Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps({"results": [{"class": "Noise"}]})}}],
+            "usage": {},
+        }
+        cases = [{"name": "Noise", "message": "ok", "expected": "Noise"}]
+        with mock.patch("app_core.data_prep_service.requests.post", return_value=response) as post:
+            self.data_prep.evaluate_prompt_test_cases(
+                api_key="key",
+                model_name="gpt-test",
+                prompt_text="classify logs",
+                cases=cases,
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+        self.assertIn("JSON only", payload["messages"][1]["content"])
+
+    def test_data_prep_service_surfaces_openai_error_body(self):
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = '{"error":{"message":"messages must contain the word json"}}'
+        response.json.return_value = {"error": {"message": "messages must contain the word json"}}
+        cases = [{"name": "Noise", "message": "ok", "expected": "Noise"}]
+
+        with mock.patch("app_core.data_prep_service.requests.post", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "messages must contain the word json"):
+                self.data_prep.evaluate_prompt_test_cases(
+                    api_key="key",
+                    model_name="gpt-test",
+                    prompt_text="classify logs",
+                    cases=cases,
+                )
 
     def test_azure_platform_registers_versioned_data_asset(self):
         dataset_path = self.project_dir / "labeled.csv"
@@ -549,6 +587,85 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(result["operation"], "hosting")
         self.assertIn("drift failed", result.get("drift_monitoring_error", ""))
+
+    def test_observability_resolves_docker_urls(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOG_MONITOR_RUNTIME": "docker",
+                "LOG_MONITOR_PUBLIC_INFERENCE_URL": "http://localhost:18000",
+                "LOG_MONITOR_INTERNAL_INFERENCE_URL": "http://inference:8000",
+                "LOG_MONITOR_PUBLIC_PROMETHEUS_URL": "http://localhost:19090",
+                "LOG_MONITOR_PUBLIC_GRAFANA_URL": "http://localhost:13000",
+                "LOG_MONITOR_PUBLIC_MLFLOW_URL": "http://localhost:15000",
+            },
+            clear=False,
+        ):
+            urls = self.observability.get_docker_observability_urls()
+            self.assertTrue(self.observability.is_docker_runtime())
+        self.assertEqual(urls["api_url"], "http://localhost:18000/predict")
+        self.assertEqual(urls["reload_url"], "http://inference:8000/reload")
+        self.assertEqual(urls["mlflow_url"], "http://localhost:15000")
+        self.assertIn("/d/log-monitor-local/", urls["dashboard_url"])
+
+    def test_observability_allows_daemon_assigned_public_ports(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOG_MONITOR_RUNTIME": "docker",
+                "LOG_MONITOR_INTERNAL_INFERENCE_URL": "http://inference:8000",
+                "LOG_MONITOR_PUBLIC_INFERENCE_URL": "",
+                "LOG_MONITOR_PUBLIC_PROMETHEUS_URL": "",
+                "LOG_MONITOR_PUBLIC_GRAFANA_URL": "",
+                "LOG_MONITOR_PUBLIC_MLFLOW_URL": "",
+            },
+            clear=False,
+        ):
+            urls = self.observability.get_docker_observability_urls()
+        self.assertEqual(urls["api_url"], "")
+        self.assertEqual(urls["reload_url"], "http://inference:8000/reload")
+        self.assertEqual(urls["mlflow_url"], "")
+        self.assertEqual(urls["dashboard_url"], "")
+
+    def test_docker_local_hosting_reloads_selected_model(self):
+        model_dir = self.project_dir / "outputs" / "final_model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        request = HostingRequest(model_dir=str(model_dir), mode="local")
+        ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
+        fake_response = SimpleNamespace(status_code=200, text="")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOG_MONITOR_RUNTIME": "docker",
+                "LOG_MONITOR_INTERNAL_INFERENCE_URL": "http://inference:8000",
+                "LOG_MONITOR_PUBLIC_INFERENCE_URL": "http://127.0.0.1:8000",
+            },
+            clear=False,
+        ), mock.patch(
+            "app_core.hosting_service.requests.post",
+            return_value=fake_response,
+        ) as post_mock, mock.patch.object(
+            self.observability,
+            "wait_for_http_endpoint",
+            return_value=True,
+        ):
+            result = self.hosting._run_docker_local_hosting(ctx, request)
+
+        self.assertEqual(result["message"], "Docker Compose hosting stack is ready.")
+        self.assertEqual((self.project_dir / "outputs" / "active_model_dir.txt").read_text(encoding="utf-8").strip(), "/workspace/outputs/final_model")
+        post_mock.assert_called_once_with("http://inference:8000/reload", timeout=120)
+        metadata = self.model_catalog.read_last_hosting_metadata()
+        self.assertEqual(metadata.get("service_kind"), "docker_compose")
+        self.assertEqual(metadata.get("container_model_dir"), "/workspace/outputs/final_model")
+
+    def test_docker_local_hosting_rejects_unmounted_model(self):
+        model_dir = self.project_dir / "external_model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        request = HostingRequest(model_dir=str(model_dir), mode="local")
+        ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
+        with self.assertRaisesRegex(RuntimeError, "mounted into the Compose stack"):
+            self.hosting._run_docker_local_hosting(ctx, request)
 
     def test_azure_platform_deploys_serverless_endpoint_from_catalog_model_id(self):
         service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")

@@ -19,11 +19,89 @@ from .model_catalog_service import ModelCatalogService
 from .runtime import JobContext, JobManager
 
 
+CLASS_LABELS = ["CONFIGURATION", "SYSTEM", "Error", "Noise"]
+CLASSIFICATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "log_classification_batch",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "class": {
+                                "type": "string",
+                                "enum": CLASS_LABELS,
+                            }
+                        },
+                        "required": ["class"],
+                    },
+                }
+            },
+            "required": ["results"],
+        },
+    },
+}
+
+
 class DataPrepService:
     def __init__(self, job_manager: JobManager, mlops_service: MlopsService, model_catalog_service: ModelCatalogService):
         self.job_manager = job_manager
         self.mlops_service = mlops_service
         self.model_catalog_service = model_catalog_service
+
+    def _build_openai_classification_payload(self, *, model_name: str, system_prompt: str, logs: list[str]) -> dict[str, Any]:
+        return {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "instruction": (
+                                "Classify each log message and return JSON only. "
+                                "The response must be a JSON object with a `results` array in the same order as `logs`. "
+                                "Each result must contain only one key, `class`, whose value is one of: "
+                                + ", ".join(CLASS_LABELS)
+                                + ". Do not return CSV, Markdown, or explanatory text."
+                            ),
+                            "logs": logs,
+                        }
+                    ),
+                },
+            ],
+            "response_format": CLASSIFICATION_RESPONSE_FORMAT,
+        }
+
+    def _raise_for_openai_error(self, response: requests.Response) -> None:
+        try:
+            status_code = int(getattr(response, "status_code", 200) or 200)
+        except Exception:
+            status_code = 200
+        if status_code < 400:
+            return
+        detail = response.text.strip()
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                error_payload = payload.get("error")
+                if isinstance(error_payload, dict):
+                    detail = clean_optional_string(error_payload.get("message")) or detail
+                elif clean_optional_string(payload.get("message")):
+                    detail = clean_optional_string(payload.get("message"))
+        except Exception:
+            pass
+        raise RuntimeError(
+            "OpenAI API rejected the classification request "
+            f"({status_code}). {detail[:2000] or getattr(response, 'reason', '')}"
+        )
 
     def submit_data_prep(self, request: DataPrepRequest):
         return self.job_manager.submit(
@@ -44,14 +122,14 @@ class DataPrepService:
         if not clean_prompt:
             raise ValueError("Prompt text is empty.")
         logs = [clean_optional_string(case.get("message")) for case in cases]
-        payload = {
-            "model": model_name,
-            "messages": [{"role": "system", "content": clean_prompt}, {"role": "user", "content": json.dumps(logs)}],
-            "response_format": {"type": "json_object"},
-        }
+        payload = self._build_openai_classification_payload(
+            model_name=model_name,
+            system_prompt=clean_prompt,
+            logs=logs,
+        )
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         response = requests.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=120)
-        response.raise_for_status()
+        self._raise_for_openai_error(response)
         result_json = response.json()
         llm_content = result_json["choices"][0]["message"]["content"]
         parsed = json.loads(llm_content)
@@ -112,11 +190,11 @@ class DataPrepService:
             batch_df = df.iloc[i : i + batch_size]
             ctx.emit("progress", f"Processing rows {i + 1} to {min(i + batch_size, total_rows)} of {total_rows}...", percent=((i / max(total_rows, 1)) * 100.0))
             logs_batch = batch_df[log_col].astype(str).tolist()
-            payload = {
-                "model": request.model_name,
-                "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(logs_batch)}],
-                "response_format": {"type": "json_object"},
-            }
+            payload = self._build_openai_classification_payload(
+                model_name=request.model_name,
+                system_prompt=system_prompt,
+                logs=logs_batch,
+            )
             success = False
             for attempt in range(5):
                 ctx.check_cancelled()
@@ -126,7 +204,7 @@ class DataPrepService:
                     ctx.emit("rate_limit", f"Rate limit hit (429). Pausing for {wait_time} seconds...")
                     time.sleep(wait_time)
                     continue
-                response.raise_for_status()
+                self._raise_for_openai_error(response)
                 success = True
                 break
             if not success:

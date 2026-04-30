@@ -1,8 +1,10 @@
 import argparse
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
 from inference_utils import load_model_bundle, predict_error_message
@@ -107,6 +109,51 @@ METRICS = MetricsStore()
 
 class PredictionHandler(BaseHTTPRequestHandler):
     bundle = None
+    bundle_error = ""
+    model_dir = ""
+    active_model_dir_file = ""
+    bundle_lock = threading.Lock()
+
+    @classmethod
+    def resolve_model_dir(cls) -> str:
+        active_file = str(cls.active_model_dir_file or "").strip()
+        if active_file:
+            try:
+                candidate = Path(active_file)
+                if candidate.exists():
+                    value = candidate.read_text(encoding="utf-8").strip()
+                    if value:
+                        return value
+            except Exception:
+                pass
+        return str(cls.model_dir or "").strip()
+
+    @classmethod
+    def reload_bundle(cls) -> tuple[bool, str]:
+        model_dir = cls.resolve_model_dir()
+        if not model_dir:
+            with cls.bundle_lock:
+                cls.bundle = None
+                cls.bundle_error = "No model directory is configured."
+            return False, cls.bundle_error
+        try:
+            bundle = load_model_bundle(model_dir)
+            with cls.bundle_lock:
+                cls.bundle = bundle
+                cls.bundle_error = ""
+                cls.model_dir = model_dir
+            return True, ""
+        except Exception as exc:
+            with cls.bundle_lock:
+                cls.bundle = None
+                cls.bundle_error = str(exc)
+            return False, str(exc)
+
+    @classmethod
+    def unload_bundle(cls) -> None:
+        with cls.bundle_lock:
+            cls.bundle = None
+            cls.bundle_error = "Model unloaded."
 
     def _normalized_path(self) -> str:
         parsed = urlparse(self.path or "/")
@@ -225,7 +272,15 @@ class PredictionHandler(BaseHTTPRequestHandler):
             self._record_request(started_at, 200)
             return
         if path == "/health":
-            self._write_json(200, {"status": "ok"})
+            self._write_json(
+                200,
+                {
+                    "status": "ok",
+                    "model_loaded": self.bundle is not None,
+                    "model_dir": self.resolve_model_dir(),
+                    "message": self.bundle_error,
+                },
+            )
             self._record_request(started_at, 200)
             return
         if path == "/metrics":
@@ -242,9 +297,46 @@ class PredictionHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         started_at = time.time()
         path = self._normalized_path()
+        if path == "/reload":
+            ok, error = self.reload_bundle()
+            status = 200 if ok else 500
+            self._write_json(
+                status,
+                {
+                    "status": "loaded" if ok else "failed",
+                    "model_loaded": ok,
+                    "model_dir": self.resolve_model_dir(),
+                    "message": error,
+                },
+            )
+            self._record_request(started_at, status)
+            return
+        if path == "/unload":
+            self.unload_bundle()
+            self._write_json(200, {"status": "unloaded", "model_loaded": False})
+            self._record_request(started_at, 200)
+            return
+
+        self._handle_predict_post(started_at, path)
+
+    def _handle_predict_post(self, started_at: float, path: str) -> None:
         if path != "/predict":
             self._write_json(404, {"prediction": ""})
             self._record_request(started_at, 404)
+            return
+
+        with self.bundle_lock:
+            bundle = self.bundle
+            bundle_error = self.bundle_error
+        if bundle is None:
+            self._write_json(
+                503,
+                {
+                    "prediction": "",
+                    "message": bundle_error or "Model is not loaded yet. Train or select a model, then host it.",
+                },
+            )
+            self._record_request(started_at, 503)
             return
 
         content_length = int(self.headers.get("Content-Length", "0") or 0)
@@ -264,7 +356,7 @@ class PredictionHandler(BaseHTTPRequestHandler):
 
         try:
             error_message = str(payload.get("errorMessage", ""))
-            prediction = predict_error_message(self.bundle, error_message)
+            prediction = predict_error_message(bundle, error_message)
             self._write_json(200, {"prediction": prediction})
             self._record_request(started_at, 200, prediction=prediction)
         except Exception:
@@ -274,12 +366,19 @@ class PredictionHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--model-dir", default=os.environ.get("MODEL_DIR", "/workspace/outputs/final_model"))
+    parser.add_argument("--active-model-dir-file", default=os.environ.get("ACTIVE_MODEL_DIR_FILE", ""))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    PredictionHandler.bundle = load_model_bundle(args.model_dir)
+    PredictionHandler.model_dir = args.model_dir
+    PredictionHandler.active_model_dir_file = args.active_model_dir_file
+    ok, error = PredictionHandler.reload_bundle()
+    if ok:
+        print(f"Loaded model from {PredictionHandler.resolve_model_dir()}", flush=True)
+    else:
+        print(f"Prediction API starting without a loaded model: {error}", flush=True)
     server = ThreadingHTTPServer((args.host, args.port), PredictionHandler)
     print(f"Prediction API ready at http://{args.host}:{args.port}/predict", flush=True)
     server.serve_forever()

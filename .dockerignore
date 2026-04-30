@@ -1,5 +1,9 @@
 .git
+.github
 .gitignore
+.env
+.env.*
+!.env.example
 __pycache__
 *.pyc
 *.pyo
@@ -7,8 +11,17 @@ __pycache__
 .Python
 .pytest_cache
 .mypy_cache
+.ruff_cache
 .DS_Store
 outputs
 downloaded_model
+uploads
+mlruns
+.cache
+.playwright-browsers
+.playwright-cli
 venv
 .venv
+agents.md
+AGENTS.md
+*.log

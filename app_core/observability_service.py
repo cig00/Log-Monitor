@@ -51,6 +51,33 @@ class ObservabilityService:
         self.prometheus_process = None
         self.grafana_process = None
 
+    def is_docker_runtime(self) -> bool:
+        return clean_optional_string(os.environ.get("LOG_MONITOR_RUNTIME")).lower() in {"docker", "compose"}
+
+    def get_docker_observability_urls(self) -> dict[str, str]:
+        public_inference_base = clean_optional_string(os.environ.get("LOG_MONITOR_PUBLIC_INFERENCE_URL"))
+        internal_inference_base = clean_optional_string(os.environ.get("LOG_MONITOR_INTERNAL_INFERENCE_URL")) or public_inference_base or "http://inference:8000"
+        public_prometheus_base = clean_optional_string(os.environ.get("LOG_MONITOR_PUBLIC_PROMETHEUS_URL"))
+        public_grafana_base = clean_optional_string(os.environ.get("LOG_MONITOR_PUBLIC_GRAFANA_URL"))
+        public_mlflow_base = clean_optional_string(os.environ.get("LOG_MONITOR_PUBLIC_MLFLOW_URL"))
+
+        def public_url(base: str, suffix: str = "") -> str:
+            return base.rstrip("/") + suffix if base else ""
+
+        return {
+            "api_url": public_url(public_inference_base, "/predict"),
+            "health_url": public_url(public_inference_base, "/health"),
+            "metrics_url": public_url(public_inference_base, "/metrics"),
+            "reload_url": internal_inference_base.rstrip("/") + "/reload",
+            "unload_url": internal_inference_base.rstrip("/") + "/unload",
+            "internal_health_url": internal_inference_base.rstrip("/") + "/health",
+            "internal_metrics_url": internal_inference_base.rstrip("/") + "/metrics",
+            "prometheus_url": public_url(public_prometheus_base),
+            "grafana_url": public_url(public_grafana_base),
+            "mlflow_url": public_url(public_mlflow_base),
+            "dashboard_url": public_url(public_grafana_base, "/d/log-monitor-local/log-monitor-local-hosting?orgId=1&refresh=10s"),
+        }
+
     def find_free_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))

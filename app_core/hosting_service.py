@@ -68,7 +68,39 @@ class HostingService:
         return self.job_manager.cancel_job(job_id)
 
     def stop_local_stack(self) -> None:
+        if self.observability_service.is_docker_runtime():
+            urls = self.observability_service.get_docker_observability_urls()
+            try:
+                requests.post(urls["unload_url"], timeout=10)
+            except Exception:
+                pass
+            self.observability_service.state_store.set_value("active_local_hosting", {})
+            return
         self.observability_service.shutdown_local_hosting_stack()
+
+    def _docker_model_dir_for_runtime_path(self, model_dir: str) -> str:
+        raw_model_dir = clean_optional_string(model_dir)
+        if not raw_model_dir:
+            return ""
+        path = Path(raw_model_dir).expanduser()
+        if not path.is_absolute():
+            path = self.project_dir / path
+        path = path.resolve()
+        path_posix = path.as_posix().rstrip("/")
+        if path_posix.startswith("/workspace/"):
+            return path_posix
+
+        for host_root, container_root in (
+            (self.project_dir / "outputs", "/workspace/outputs"),
+            (self.project_dir / "downloaded_model", "/workspace/downloaded_model"),
+        ):
+            try:
+                relative_path = path.relative_to(host_root.resolve())
+            except ValueError:
+                continue
+            relative_posix = relative_path.as_posix()
+            return container_root if relative_posix in {"", "."} else f"{container_root}/{relative_posix}"
+        return ""
 
     def _resolve_gate_input_path(self, raw_path: str, default_relative_path: str) -> Path:
         candidate = clean_optional_string(raw_path) or default_relative_path
@@ -676,6 +708,9 @@ class HostingService:
             persist_pr_metadata({"github_pr_error": result["github_pr_error"], "github_pr_prompt": prompt_info})
 
     def _run_local_hosting(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
+        if self.observability_service.is_docker_runtime():
+            return self._run_docker_local_hosting(ctx, request)
+
         serve_script = os.path.join(self.project_dir, "serve_model.py")
         if not os.path.exists(serve_script):
             raise FileNotFoundError("Could not find 'serve_model.py' in the app directory.")
@@ -708,6 +743,7 @@ class HostingService:
         ctx.register_subprocess("local_api", process)
         deadline = time.time() + 60
         ready = False
+        model_load_error = ""
         while time.time() < deadline:
             ctx.check_cancelled()
             if process.poll() is not None:
@@ -716,11 +752,22 @@ class HostingService:
             try:
                 response = requests.get(health_url, timeout=2)
                 if response.ok:
+                    try:
+                        health_payload = response.json()
+                    except Exception:
+                        health_payload = {}
+                    if isinstance(health_payload, dict) and health_payload.get("model_loaded") is False:
+                        model_load_error = clean_optional_string(health_payload.get("message")) or "Model is not loaded."
+                        break
                     ready = True
                     break
             except Exception:
                 pass
+            if model_load_error:
+                break
             time.sleep(1)
+        if model_load_error:
+            raise RuntimeError(f"Local prediction API could not load the selected model.\n\n{model_load_error}")
         if not ready:
             raise TimeoutError("Timed out waiting for the local prediction API to become ready.")
 
@@ -794,6 +841,80 @@ class HostingService:
                 f"Local Grafana hosting stack is running.\nPOST {api_url}\nGrafana: {dashboard_url}\n"
                 f"Prometheus: {prometheus_url}\nMetrics: {metrics_url}\nBody: {{\"errorMessage\": \"...\"}}\n"
                 "Response: {\"prediction\": \"...\"}"
+            ),
+        }
+
+    def _run_docker_local_hosting(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
+        urls = self.observability_service.get_docker_observability_urls()
+        requested_container_model_dir = self._docker_model_dir_for_runtime_path(request.model_dir)
+        if not requested_container_model_dir:
+            raise RuntimeError(
+                "Docker hosting can only serve models mounted into the Compose stack.\n\n"
+                "Move the model under `outputs/` or `downloaded_model/`, or add a matching Compose volume."
+            )
+
+        active_model_file = self.project_dir / "outputs" / "active_model_dir.txt"
+        active_model_file.parent.mkdir(parents=True, exist_ok=True)
+        active_model_file.write_text(requested_container_model_dir + "\n", encoding="utf-8")
+
+        ctx.emit("progress", "Reloading Docker inference service with the selected model...")
+        try:
+            reload_response = requests.post(urls["reload_url"], timeout=120)
+            if reload_response.status_code >= 400:
+                raise RuntimeError(reload_response.text.strip() or f"HTTP {reload_response.status_code}")
+        except Exception as exc:
+            raise RuntimeError(
+                "Docker inference service could not load the selected model.\n\n"
+                "Ensure the Compose stack is running with `docker compose up --build` and the model exists.\n\n"
+                f"Details: {exc}"
+            ) from exc
+
+        if not self.observability_service.wait_for_http_endpoint(
+            urls["internal_health_url"],
+            timeout_seconds=45,
+            ready_statuses=(200,),
+        ):
+            raise RuntimeError("Docker inference service did not become healthy after model reload.")
+
+        training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
+        local_hosting_meta = {
+            "mode": "local",
+            "service_kind": "docker_compose",
+            "model_dir": request.model_dir,
+            "container_model_dir": requested_container_model_dir,
+            "active_model_file": str(active_model_file.resolve()),
+            "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
+            "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
+            "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
+            "api_url": urls["api_url"],
+            "health_url": urls["health_url"],
+            "metrics_url": urls["metrics_url"],
+            "prometheus_url": urls["prometheus_url"],
+            "grafana_url": urls["grafana_url"],
+            "dashboard_url": urls["dashboard_url"],
+            "mlflow_url": urls["mlflow_url"],
+            "created_at": now_utc_iso(),
+        }
+        metadata_path = self.model_catalog_service.save_last_hosting_metadata(local_hosting_meta)
+        self.observability_service.state_store.set_value("active_local_hosting", local_hosting_meta)
+        api_display = urls["api_url"] or "Run `docker compose port inference 8000`, then POST /predict on that host port."
+        grafana_display = urls["dashboard_url"] or "Run `docker compose port grafana 3000` to find the Grafana URL."
+        prometheus_display = urls["prometheus_url"] or "Run `docker compose port prometheus 9090` to find the Prometheus URL."
+        mlflow_display = urls["mlflow_url"] or "Run `docker compose port mlflow 5000` to find the MLflow URL."
+        metrics_display = urls["metrics_url"] or "Run `docker compose port inference 8000`, then open /metrics on that host port."
+        return {
+            "operation": "hosting",
+            "message": "Docker Compose hosting stack is ready.",
+            "api_url": urls["api_url"],
+            "dashboard_url": urls["dashboard_url"],
+            "prometheus_url": urls["prometheus_url"],
+            "grafana_url": urls["grafana_url"],
+            "mlflow_url": urls["mlflow_url"],
+            "metadata_path": metadata_path,
+            "summary": (
+                f"Docker Compose hosting stack is running.\nPOST {api_display}\n"
+                f"Grafana: {grafana_display}\nPrometheus: {prometheus_display}\n"
+                f"MLflow: {mlflow_display}\nMetrics: {metrics_display}"
             ),
         }
 

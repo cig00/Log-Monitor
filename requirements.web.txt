@@ -1,0 +1,16 @@
+requests
+pandas
+datasets
+transformers
+accelerate
+sentencepiece
+protobuf
+azure-identity
+azure-ai-ml
+azure-mgmt-resource
+azure-storage-blob
+mlflow==2.9.2
+scikit-learn
+fastapi
+uvicorn[standard]
+python-multipart

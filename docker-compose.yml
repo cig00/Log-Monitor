@@ -1,0 +1,131 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: log-monitor-web:latest
+    restart: unless-stopped
+    environment:
+      LOG_MONITOR_RUNTIME: docker
+      LOG_MONITOR_PROJECT_DIR: /workspace
+      LOG_MONITOR_UPLOAD_DIR: /workspace/uploads
+      LOG_MONITOR_INTERNAL_INFERENCE_URL: http://inference:8000
+      LOG_MONITOR_PUBLIC_WEB_URL: ${LOG_MONITOR_PUBLIC_WEB_URL:-}
+      LOG_MONITOR_PUBLIC_INFERENCE_URL: ${LOG_MONITOR_PUBLIC_INFERENCE_URL:-}
+      LOG_MONITOR_PUBLIC_MLFLOW_URL: ${LOG_MONITOR_PUBLIC_MLFLOW_URL:-}
+      LOG_MONITOR_PUBLIC_PROMETHEUS_URL: ${LOG_MONITOR_PUBLIC_PROMETHEUS_URL:-}
+      LOG_MONITOR_PUBLIC_GRAFANA_URL: ${LOG_MONITOR_PUBLIC_GRAFANA_URL:-}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      AZURE_RESOURCE_GROUP: ${AZURE_RESOURCE_GROUP:-LogClassifier-RG}
+      AZURE_WORKSPACE_NAME: ${AZURE_WORKSPACE_NAME:-LogClassifier-Workspace}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      AZURE_SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID:-}
+    volumes:
+      - ./outputs:/workspace/outputs
+      - ./gates:/workspace/gates
+      - ./downloaded_model:/workspace/downloaded_model
+      - ./uploads:/workspace/uploads
+      - ./mlruns:/workspace/mlruns
+      - hf-cache:/workspace/.cache/huggingface
+    ports:
+      - "8080"
+    depends_on:
+      inference:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+      prometheus:
+        condition: service_started
+      grafana:
+        condition: service_started
+
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile.inference
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: log-monitor-inference:latest
+    restart: unless-stopped
+    environment:
+      MODEL_DIR: /workspace/outputs/final_model
+      ACTIVE_MODEL_DIR_FILE: /workspace/outputs/active_model_dir.txt
+      HF_HOME: /workspace/.cache/huggingface
+      TRANSFORMERS_CACHE: /workspace/.cache/huggingface
+    volumes:
+      - ./outputs:/workspace/outputs
+      - ./downloaded_model:/workspace/downloaded_model
+      - hf-cache:/workspace/.cache/huggingface
+    ports:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    restart: unless-stopped
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - /mlruns
+      - --default-artifact-root
+      - /mlruns
+    volumes:
+      - ./mlruns:/mlruns
+    ports:
+      - "5000"
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090"
+    depends_on:
+      inference:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+
+volumes:
+  grafana-data:
+  prometheus-data:
+  hf-cache:

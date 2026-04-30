@@ -1,0 +1,20 @@
+{
+  "id": null,
+  "uid": "log-monitor-local",
+  "title": "Log Monitor Local Hosting",
+  "tags": ["log-monitor", "docker", "local"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {"from": "now-6h", "to": "now"},
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {"id": 1, "type": "stat", "title": "Prediction Requests", "datasource": {"type": "prometheus", "uid": "local-prometheus"}, "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}, "targets": [{"expr": "sum(log_monitor_predictions_total)", "instant": true, "refId": "A"}]},
+    {"id": 2, "type": "stat", "title": "Model Loaded", "datasource": {"type": "prometheus", "uid": "local-prometheus"}, "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}, "targets": [{"expr": "log_monitor_model_loaded", "instant": true, "refId": "A"}]},
+    {"id": 3, "type": "timeseries", "title": "Requests By Status", "datasource": {"type": "prometheus", "uid": "local-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}, "targets": [{"expr": "sum by (status) (rate(log_monitor_http_requests_total[1m]))", "refId": "A"}]},
+    {"id": 4, "type": "barchart", "title": "Predictions By Label", "datasource": {"type": "prometheus", "uid": "local-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}, "targets": [{"expr": "sum by (prediction) (log_monitor_predictions_total)", "instant": true, "refId": "A"}]}
+  ],
+  "templating": {"list": []}
+}

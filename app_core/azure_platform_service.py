@@ -38,7 +38,7 @@ try:
         from azure.ai.ml.entities import ServerlessEndpoint
     except Exception:
         ServerlessEndpoint = None
-    from azure.identity import InteractiveBrowserCredential
+    from azure.identity import ClientSecretCredential, DefaultAzureCredential, DeviceCodeCredential, InteractiveBrowserCredential
     from azure.mgmt.resource import ResourceManagementClient
     AZURE_AVAILABLE = True
 except Exception:
@@ -63,6 +63,9 @@ except Exception:
     RecurrenceTrigger = Any
     ServerlessEndpoint = None
     Workspace = Any
+    ClientSecretCredential = Any
+    DefaultAzureCredential = Any
+    DeviceCodeCredential = Any
     InteractiveBrowserCredential = Any
     ResourceManagementClient = Any
     AZURE_AVAILABLE = False
@@ -909,6 +912,20 @@ class AzurePlatformService:
 
     def create_interactive_credential(self, tenant_id: str):
         self.ensure_azure_dependencies()
+        client_id = clean_optional_string(os.environ.get("AZURE_CLIENT_ID"))
+        client_secret = clean_optional_string(os.environ.get("AZURE_CLIENT_SECRET"))
+        env_tenant_id = clean_optional_string(os.environ.get("AZURE_TENANT_ID"))
+        credential_tenant_id = clean_optional_string(tenant_id) or env_tenant_id
+        if client_id and client_secret and credential_tenant_id:
+            return ClientSecretCredential(
+                tenant_id=credential_tenant_id,
+                client_id=client_id,
+                client_secret=client_secret,
+            )
+        if clean_optional_string(os.environ.get("AZURE_USE_DEVICE_CODE")).lower() in {"1", "true", "yes", "on"}:
+            return DeviceCodeCredential(tenant_id=credential_tenant_id or None)
+        if clean_optional_string(os.environ.get("LOG_MONITOR_RUNTIME")).lower() in {"docker", "compose"}:
+            return DefaultAzureCredential(exclude_interactive_browser_credential=True)
         return InteractiveBrowserCredential(tenant_id=tenant_id)
 
     def cancel_job(self, ml_client, job_name: str, wait: bool = False) -> None:

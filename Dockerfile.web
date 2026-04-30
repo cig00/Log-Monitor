@@ -1,0 +1,32 @@
+FROM python:3.11-slim-bookworm
+
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=600 \
+    PIP_RETRIES=10 \
+    HF_HOME=/workspace/.cache/huggingface \
+    TRANSFORMERS_CACHE=/workspace/.cache/huggingface \
+    LOG_MONITOR_PROJECT_DIR=/workspace \
+    LOG_MONITOR_RUNTIME=docker
+
+WORKDIR /workspace
+
+COPY requirements.web.txt /workspace/requirements.web.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --retries 10 --timeout 600 --progress-bar off --index-url "${TORCH_INDEX_URL}" torch
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --retries 10 --timeout 600 --progress-bar off \
+        numpy pandas scikit-learn packaging pyyaml regex tqdm safetensors tokenizers sentencepiece protobuf
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --retries 10 --timeout 600 --progress-bar off transformers accelerate datasets
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --retries 10 --timeout 600 --progress-bar off \
+        requests fastapi "uvicorn[standard]" python-multipart mlflow==2.9.2 \
+        azure-identity azure-ai-ml azure-mgmt-resource azure-storage-blob
+
+COPY . /workspace
+
+CMD ["uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8080"]

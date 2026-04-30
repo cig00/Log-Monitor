@@ -38,6 +38,7 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 4. `Hosting`
    - starts a local prediction API, or
    - deploys an Azure ML batch endpoint backed by scale-from-zero compute
+   - enforces a deployment gate against a golden labeled dataset before any local or Azure deploy is allowed
 
 5. `Consumption`
    - local clients send:
@@ -76,6 +77,7 @@ At a high level, the application turns unlabeled operational logs into a hosted 
 - `mlops_utils.py`: shared helpers for hashes, sidecars, JSON, model discovery, and prompt metadata.
 - `inference_utils.py`: shared inference loader and prediction helper.
 - `serve_model.py`: local HTTP prediction service.
+- `gates/deployment_policy.json`: default deployment-gate threshold policy.
 - `azure_score.py`: legacy Azure ML online endpoint scoring entrypoint.
 - `azure_batch_score.py`: Azure ML batch endpoint scoring entrypoint.
 - `prompt.txt`: system prompt used during OpenAI labeling.
@@ -306,6 +308,8 @@ Printed training output includes:
 Use the `Hosting` section:
 
 - `Generated Model`: select the trained model directory
+- `Gate Golden Set`: labeled CSV used as the deployment acceptance gate (`LogMessage` + `class`, with common aliases accepted)
+- `Gate Policy`: JSON thresholds (`gates/deployment_policy.json` by default)
 - `Available Models`: review and select discovered local versioned models, latest local output, downloaded models, or the current manual selection
 - `Host Target`:
   - `Local`
@@ -320,7 +324,7 @@ The selected model path can be:
 - the exact `final_model` directory, or
 - a parent directory that contains a discoverable model folder
 
-Serverless endpoint hosting does not use the local generated model directory. The app pre-fills `Serverless Model ID` with `azureml://registries/azureml/models/Phi-4-mini-instruct` and generates a unique endpoint name automatically. You can edit either field; if the model ID includes `/versions/...`, the app strips that suffix because Azure serverless deployments use the latest catalog version.
+Serverless endpoint hosting still requires selecting a local generated model directory because deployment gate evaluation runs locally before deployment. The model folder is used only for gate evaluation and is not uploaded for serverless deployment. The app pre-fills `Serverless Model ID` with `azureml://registries/azureml/models/Phi-4-mini-instruct` and generates a unique endpoint name automatically. You can edit either field; if the model ID includes `/versions/...`, the app strips that suffix because Azure serverless deployments use the latest catalog version.
 
 The app resolves the actual model directory by searching for:
 
@@ -329,6 +333,16 @@ The app resolves the actual model directory by searching for:
   - `pytorch_model.bin`
   - `model.safetensors`
   - `tf_model.h5`
+
+Before deployment starts, the app evaluates the selected model against the golden set and blocks deployment if thresholds are not met.
+
+Deployment gate outputs are written to:
+
+- `outputs/gates/gate_eval_<timestamp>.json`
+- `outputs/gates/gate_eval_<timestamp>_predictions.csv`
+- `outputs/gates/latest_gate_eval.json`
+
+Gate PASS evaluations are cached by `model_hash + golden_set_hash + policy_hash` and reused automatically.
 
 ### 5. Query The Prediction API
 
@@ -460,6 +474,8 @@ Local runtime policy:
 - `Branch`
 - `Create PR`: after hosting succeeds, create a GitHub Copilot coding-agent task in the selected repo/branch to add async log forwarding to the created endpoint
 - `Generated Model`
+- `Gate Golden Set`
+- `Gate Policy`
 - `Host Target`
 - Azure-host-only fields:
   - `Azure Service`

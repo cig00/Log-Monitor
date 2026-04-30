@@ -127,7 +127,11 @@ class LogProcessorApp:
         self.grafana_process = None
         self.hosting_mode_var = tk.StringVar(value="local")
         default_model_dir = Path(self.project_dir) / "outputs" / "final_model"
+        default_gate_golden = Path(self.project_dir) / "gates" / "deployment_golden.csv"
+        default_gate_policy = Path(self.project_dir) / "gates" / "deployment_policy.json"
         self.hosted_model_path_var = tk.StringVar(value=str(default_model_dir) if default_model_dir.exists() else "")
+        self.host_gate_golden_path_var = tk.StringVar(value=str(default_gate_golden))
+        self.host_gate_policy_path_var = tk.StringVar(value=str(default_gate_policy))
         self.hosted_model_inventory = []
         self.available_model_choice_var = tk.StringVar(value="")
         self.hosting_api_url_var = tk.StringVar(value="")
@@ -648,19 +652,49 @@ class LogProcessorApp:
             hosting_frame,
             text=(
                 "Serverless hosting uses an auto-filled Azure ML catalog model ID and endpoint name. "
-                "You can edit either field; the local generated model folder is not uploaded."
+                "You can edit either field; the selected local model is only used for gate evaluation and is not uploaded."
             ),
             wraplength=460,
             justify="left",
         )
-        self.azure_serverless_note_label.grid(row=10, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
+        self.azure_serverless_note_label.grid(row=12, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
+
+        self.gate_golden_label = ttk.Label(hosting_frame, text="Gate Golden Set:")
+        self.gate_golden_label.grid(row=10, column=0, sticky="w", padx=5, pady=5)
+        self.gate_golden_entry = ttk.Entry(
+            hosting_frame,
+            textvariable=self.host_gate_golden_path_var,
+            width=30,
+        )
+        self.gate_golden_entry.grid(row=10, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.gate_golden_browse_btn = ttk.Button(
+            hosting_frame,
+            text="Browse",
+            command=self.browse_gate_golden_path,
+        )
+        self.gate_golden_browse_btn.grid(row=10, column=3, padx=5, pady=5)
+
+        self.gate_policy_label = ttk.Label(hosting_frame, text="Gate Policy:")
+        self.gate_policy_label.grid(row=11, column=0, sticky="w", padx=5, pady=5)
+        self.gate_policy_entry = ttk.Entry(
+            hosting_frame,
+            textvariable=self.host_gate_policy_path_var,
+            width=30,
+        )
+        self.gate_policy_entry.grid(row=11, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.gate_policy_browse_btn = ttk.Button(
+            hosting_frame,
+            text="Browse",
+            command=self.browse_gate_policy_path,
+        )
+        self.gate_policy_browse_btn.grid(row=11, column=3, padx=5, pady=5)
 
         self.host_service_btn = ttk.Button(
             hosting_frame,
             text="Host Service",
             command=self.start_hosting_thread,
         )
-        self.host_service_btn.grid(row=11, column=0, columnspan=2, sticky="ew", padx=5, pady=10)
+        self.host_service_btn.grid(row=13, column=0, columnspan=2, sticky="ew", padx=5, pady=10)
 
         self.stop_hosting_btn = ttk.Button(
             hosting_frame,
@@ -668,106 +702,106 @@ class LogProcessorApp:
             command=self.stop_hosting,
             state="disabled",
         )
-        self.stop_hosting_btn.grid(row=11, column=2, columnspan=2, sticky="ew", padx=5, pady=10)
+        self.stop_hosting_btn.grid(row=13, column=2, columnspan=2, sticky="ew", padx=5, pady=10)
 
-        ttk.Label(hosting_frame, text="Endpoint URL:").grid(row=12, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Endpoint URL:").grid(row=14, column=0, sticky="w", padx=5, pady=5)
         self.hosting_api_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.hosting_api_url_var,
             width=30,
             state="readonly",
         )
-        self.hosting_api_url_entry.grid(row=12, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.hosting_api_url_entry.grid(row=14, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_hosting_api_btn = ttk.Button(
             hosting_frame,
             text="Open Endpoint",
             command=lambda: self.open_url_value(self.hosting_api_url_var.get(), "Endpoint"),
         )
-        self.open_hosting_api_btn.grid(row=12, column=3, padx=5, pady=5)
+        self.open_hosting_api_btn.grid(row=14, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Feedback API:").grid(row=13, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Feedback API:").grid(row=15, column=0, sticky="w", padx=5, pady=5)
         self.feedback_api_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.feedback_api_url_var,
             width=30,
             state="readonly",
         )
-        self.feedback_api_url_entry.grid(row=13, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.feedback_api_url_entry.grid(row=15, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_feedback_api_btn = ttk.Button(
             hosting_frame,
             text="Copy API",
             command=lambda: self.copy_url_value(self.feedback_api_url_var.get(), "Feedback API"),
         )
-        self.open_feedback_api_btn.grid(row=13, column=3, padx=5, pady=5)
+        self.open_feedback_api_btn.grid(row=15, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Feedback Status:").grid(row=14, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Feedback Status:").grid(row=16, column=0, sticky="w", padx=5, pady=5)
         self.feedback_status_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.feedback_status_url_var,
             width=30,
             state="readonly",
         )
-        self.feedback_status_url_entry.grid(row=14, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.feedback_status_url_entry.grid(row=16, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_feedback_status_btn = ttk.Button(
             hosting_frame,
             text="Open Status",
             command=lambda: self.open_url_value(self.feedback_status_url_var.get(), "Feedback status"),
         )
-        self.open_feedback_status_btn.grid(row=14, column=3, padx=5, pady=5)
+        self.open_feedback_status_btn.grid(row=16, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="GitHub PR Task:").grid(row=15, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="GitHub PR Task:").grid(row=17, column=0, sticky="w", padx=5, pady=5)
         self.github_pr_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.github_pr_url_var,
             width=30,
             state="readonly",
         )
-        self.github_pr_url_entry.grid(row=15, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.github_pr_url_entry.grid(row=17, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_github_pr_btn = ttk.Button(
             hosting_frame,
             text="Open PR Task",
             command=lambda: self.open_url_value(self.github_pr_url_var.get(), "GitHub PR task"),
         )
-        self.open_github_pr_btn.grid(row=15, column=3, padx=5, pady=5)
+        self.open_github_pr_btn.grid(row=17, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Hosting Status:").grid(row=16, column=0, sticky="nw", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Hosting Status:").grid(row=18, column=0, sticky="nw", padx=5, pady=5)
         self.hosting_status_label = ttk.Label(
             hosting_frame,
             textvariable=self.hosting_mode_summary_var,
             wraplength=460,
             justify="left",
         )
-        self.hosting_status_label.grid(row=16, column=1, columnspan=3, sticky="w", padx=5, pady=5)
+        self.hosting_status_label.grid(row=18, column=1, columnspan=3, sticky="w", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Azure MLOps URL:").grid(row=17, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Azure MLOps URL:").grid(row=19, column=0, sticky="w", padx=5, pady=5)
         self.azure_mlops_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.azure_mlops_url_var,
             width=30,
             state="readonly",
         )
-        self.azure_mlops_url_entry.grid(row=17, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_mlops_url_entry.grid(row=19, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_azure_mlops_btn = ttk.Button(
             hosting_frame,
             text="Open MLOps",
             command=lambda: self.open_url_value(self.azure_mlops_url_var.get(), "Azure MLOps dashboard"),
         )
-        self.open_azure_mlops_btn.grid(row=17, column=3, padx=5, pady=5)
+        self.open_azure_mlops_btn.grid(row=19, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Azure LLMOps URL:").grid(row=18, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(hosting_frame, text="Azure LLMOps URL:").grid(row=20, column=0, sticky="w", padx=5, pady=5)
         self.azure_llmops_url_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.azure_llmops_url_var,
             width=30,
             state="readonly",
         )
-        self.azure_llmops_url_entry.grid(row=18, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_llmops_url_entry.grid(row=20, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.open_azure_llmops_btn = ttk.Button(
             hosting_frame,
             text="Open LLMOps",
             command=lambda: self.open_url_value(self.azure_llmops_url_var.get(), "Azure LLMOps dashboard"),
         )
-        self.open_azure_llmops_btn.grid(row=18, column=3, padx=5, pady=5)
+        self.open_azure_llmops_btn.grid(row=20, column=3, padx=5, pady=5)
 
         # Status Bar
         self.status_var = tk.StringVar()
@@ -1010,6 +1044,28 @@ class LogProcessorApp:
         if selected_dir:
             self.hosted_model_path_var.set(selected_dir)
             self.refresh_hosted_model_inventory(preferred_path=selected_dir)
+
+    def browse_gate_golden_path(self):
+        initial_file = clean_optional_string(self.host_gate_golden_path_var.get())
+        initial_dir = str(Path(initial_file).expanduser().resolve().parent) if initial_file else self.project_dir
+        selected_file = filedialog.askopenfilename(
+            title="Select Deployment Golden Set CSV",
+            initialdir=initial_dir,
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+        )
+        if selected_file:
+            self.host_gate_golden_path_var.set(selected_file)
+
+    def browse_gate_policy_path(self):
+        initial_file = clean_optional_string(self.host_gate_policy_path_var.get())
+        initial_dir = str(Path(initial_file).expanduser().resolve().parent) if initial_file else self.project_dir
+        selected_file = filedialog.askopenfilename(
+            title="Select Deployment Gate Policy JSON",
+            initialdir=initial_dir,
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if selected_file:
+            self.host_gate_policy_path_var.set(selected_file)
 
     def refresh_azure_training_instance_options(self, preferred: str = ""):
         candidates = self.azure_platform_service.get_azure_training_instance_candidates(self.azure_compute_var.get())
@@ -1314,10 +1370,11 @@ class LogProcessorApp:
     def start_hosting_thread(self):
         hosting_mode = self.hosting_mode_var.get().strip() or "local"
         azure_service = clean_optional_string(self.azure_host_service_var.get()) or "queued_batch"
-        is_serverless = hosting_mode == "azure" and azure_service == "serverless"
         model_path = clean_optional_string(self.hosted_model_path_var.get())
+        gate_golden_path = clean_optional_string(self.host_gate_golden_path_var.get())
+        gate_policy_path = clean_optional_string(self.host_gate_policy_path_var.get())
         resolved_model_dir = ""
-        if not model_path and not is_serverless:
+        if not model_path:
             messagebox.showwarning("Hosting", "Please select the generated model directory first.")
             return
 
@@ -1325,10 +1382,33 @@ class LogProcessorApp:
             try:
                 resolved_model_dir = discover_model_dir(model_path)
             except Exception as exc:
-                if not is_serverless:
-                    messagebox.showerror("Hosting", f"Could not locate a saved model in that path.\n\n{exc}")
-                    return
-                resolved_model_dir = model_path
+                messagebox.showerror("Hosting", f"Could not locate a saved model in that path.\n\n{exc}")
+                return
+
+        def resolve_gate_path(raw_path: str) -> Path:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                return (Path(self.project_dir) / path).resolve()
+            return path.resolve()
+
+        if not gate_golden_path:
+            messagebox.showwarning("Hosting", "Please select the deployment gate golden set CSV.")
+            return
+        if not gate_policy_path:
+            messagebox.showwarning("Hosting", "Please select the deployment gate policy JSON.")
+            return
+
+        resolved_gate_golden_path = resolve_gate_path(gate_golden_path)
+        resolved_gate_policy_path = resolve_gate_path(gate_policy_path)
+        if not resolved_gate_golden_path.exists() or not resolved_gate_golden_path.is_file():
+            messagebox.showerror("Hosting", f"Deployment gate golden set file not found.\n\n{resolved_gate_golden_path}")
+            return
+        if not resolved_gate_policy_path.exists() or not resolved_gate_policy_path.is_file():
+            messagebox.showerror("Hosting", f"Deployment gate policy file not found.\n\n{resolved_gate_policy_path}")
+            return
+
+        self.host_gate_golden_path_var.set(str(resolved_gate_golden_path))
+        self.host_gate_policy_path_var.set(str(resolved_gate_policy_path))
 
         if resolved_model_dir:
             self.hosted_model_path_var.set(resolved_model_dir)
@@ -1346,6 +1426,8 @@ class LogProcessorApp:
         request_kwargs = {
             "model_dir": resolved_model_dir,
             "mode": hosting_mode,
+            "deployment_gate_golden_path": str(resolved_gate_golden_path),
+            "deployment_gate_policy_path": str(resolved_gate_policy_path),
         }
         create_github_pr = bool(self.create_pr_var.get())
         github_token = clean_optional_string(self.github_key_entry.get())

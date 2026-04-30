@@ -279,6 +279,133 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_BATCH_ENDPOINT_NAME"], "batch-endpoint")
         self.assertEqual(captured["settings"]["LOGMONITOR_RETRAIN_COMPUTE_NAME"], "log-monitor-batch-cpu")
 
+    def test_hosting_run_blocks_when_gate_fails(self):
+        request = HostingRequest(model_dir=str(self.project_dir), mode="local")
+        ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
+        with mock.patch.object(self.hosting, "_enforce_deployment_gate", side_effect=RuntimeError("gate failed")), mock.patch.object(
+            self.hosting,
+            "_run_local_hosting",
+        ) as local_host_mock:
+            with self.assertRaises(RuntimeError):
+                self.hosting._run(ctx, request)
+        local_host_mock.assert_not_called()
+
+    def test_hosting_run_attaches_gate_summary_when_gate_passes(self):
+        request = HostingRequest(model_dir=str(self.project_dir), mode="local")
+        ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
+        gate_payload = {
+            "gate_pass": True,
+            "cached": False,
+            "report_path": str(self.project_dir / "outputs" / "gates" / "gate_eval_1.json"),
+            "predictions_path": str(self.project_dir / "outputs" / "gates" / "gate_eval_1_predictions.csv"),
+            "model_hash": "m",
+            "golden_set_hash": "g",
+            "policy_hash": "p",
+            "sample_count": 4,
+            "metrics": {"accuracy": 0.9, "weighted_f1": 0.89},
+            "golden_set_path": str(self.project_dir / "gates" / "deployment_golden.csv"),
+            "policy_path": str(self.project_dir / "gates" / "deployment_policy.json"),
+        }
+        with mock.patch.object(self.hosting, "_enforce_deployment_gate", return_value=gate_payload), mock.patch.object(
+            self.hosting,
+            "_run_local_hosting",
+            return_value={"operation": "hosting", "message": "Local stack is ready.", "summary": "Local stack is ready."},
+        ):
+            result = self.hosting._run(ctx, request)
+
+        self.assertTrue(result["gate"]["gate_pass"])
+        self.assertIn("Deployment gate: PASS", result["message"])
+        self.assertIn("Deployment gate: PASS", result["summary"])
+        self.assertEqual(result["gate"]["sample_count"], 4)
+
+    def test_enforce_deployment_gate_reuses_cached_pass(self):
+        model_dir = self.project_dir / "outputs" / "final_model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        (model_dir / "pytorch_model.bin").write_bytes(b"1")
+        gates_dir = self.project_dir / "gates"
+        gates_dir.mkdir(parents=True, exist_ok=True)
+        golden_path = gates_dir / "deployment_golden.csv"
+        policy_path = gates_dir / "deployment_policy.json"
+        golden_path.write_text("LogMessage,class\nprocessed Canceled,Noise\n", encoding="utf-8")
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "min_accuracy": 0.8,
+                    "min_weighted_f1": 0.8,
+                    "min_macro_f1": 0.8,
+                    "min_recall_per_class": {"Noise": 0.8},
+                }
+            ),
+            encoding="utf-8",
+        )
+        request = HostingRequest(
+            model_dir=str(model_dir),
+            mode="local",
+            deployment_gate_golden_path=str(golden_path),
+            deployment_gate_policy_path=str(policy_path),
+        )
+        ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
+
+        with mock.patch("app_core.hosting_service.load_model_bundle", return_value=object()), mock.patch(
+            "app_core.hosting_service.predict_error_message",
+            return_value="Noise",
+        ), mock.patch.object(
+            self.hosting,
+            "_compute_gate_metrics",
+            return_value={
+                "accuracy": 1.0,
+                "weighted_precision": 1.0,
+                "weighted_recall": 1.0,
+                "weighted_f1": 1.0,
+                "macro_precision": 1.0,
+                "macro_recall": 1.0,
+                "macro_f1": 1.0,
+                "per_class": {"Noise": {"precision": 1.0, "recall": 1.0, "f1": 1.0, "support": 1}},
+                "confusion_matrix": {"labels": ["Noise"], "matrix": [[1]]},
+            },
+        ):
+            first = self.hosting._enforce_deployment_gate(ctx, request)
+        self.assertTrue(first["gate_pass"])
+        self.assertFalse(first["cached"])
+
+        with mock.patch(
+            "app_core.hosting_service.load_model_bundle",
+            side_effect=AssertionError("load_model_bundle should not run on cache hit"),
+        ):
+            second = self.hosting._enforce_deployment_gate(ctx, request)
+        self.assertTrue(second["gate_pass"])
+        self.assertTrue(second["cached"])
+
+    def test_enforce_deployment_gate_requires_golden_file(self):
+        model_dir = self.project_dir / "outputs" / "final_model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        (model_dir / "pytorch_model.bin").write_bytes(b"1")
+        gates_dir = self.project_dir / "gates"
+        gates_dir.mkdir(parents=True, exist_ok=True)
+        policy_path = gates_dir / "deployment_policy.json"
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "min_accuracy": 0.8,
+                    "min_weighted_f1": 0.8,
+                    "min_macro_f1": 0.8,
+                    "min_recall_per_class": {"Noise": 0.8},
+                }
+            ),
+            encoding="utf-8",
+        )
+        request = HostingRequest(
+            model_dir=str(model_dir),
+            mode="local",
+            deployment_gate_golden_path=str(gates_dir / "missing.csv"),
+            deployment_gate_policy_path=str(policy_path),
+        )
+        ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
+        with self.assertRaises(FileNotFoundError):
+            self.hosting._enforce_deployment_gate(ctx, request)
+
     def test_azure_platform_deploys_serverless_endpoint_from_catalog_model_id(self):
         service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
         service.ensure_azure_dependencies = lambda: None

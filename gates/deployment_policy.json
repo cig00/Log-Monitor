@@ -1,0 +1,11 @@
+{
+  "min_accuracy": 0.85,
+  "min_weighted_f1": 0.85,
+  "min_macro_f1": 0.8,
+  "min_recall_per_class": {
+    "Error": 0.75,
+    "CONFIGURATION": 0.75,
+    "SYSTEM": 0.7,
+    "Noise": 0.7
+  }
+}

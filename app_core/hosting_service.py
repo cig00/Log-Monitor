@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import hashlib
 import os
 import shlex
 import subprocess
@@ -10,9 +12,14 @@ from typing import Any
 
 import requests
 
+from inference_utils import LABEL_NAMES, load_model_bundle, predict_error_message
 from mlops_utils import (
     clean_optional_string,
+    compute_file_sha256,
+    discover_model_dir,
     now_utc_iso,
+    read_json,
+    write_json,
 )
 
 from .azure_platform_service import AZURE_AVAILABLE, AzurePlatformService
@@ -22,6 +29,13 @@ from .mlops_service import MlopsService
 from .model_catalog_service import ModelCatalogService
 from .observability_service import ObservabilityService
 from .runtime import JobContext, JobManager
+
+try:
+    from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
+except Exception:
+    accuracy_score = None
+    confusion_matrix = None
+    precision_recall_fscore_support = None
 
 
 class HostingService:
@@ -56,11 +70,425 @@ class HostingService:
     def stop_local_stack(self) -> None:
         self.observability_service.shutdown_local_hosting_stack()
 
+    def _resolve_gate_input_path(self, raw_path: str, default_relative_path: str) -> Path:
+        candidate = clean_optional_string(raw_path) or default_relative_path
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = (self.project_dir / path).resolve()
+        else:
+            path = path.resolve()
+        return path
+
+    def _load_gate_policy(self, policy_path: Path) -> dict[str, Any]:
+        payload = read_json(str(policy_path))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Gate policy must be a JSON object: {policy_path}")
+
+        required_scalar_keys = ("min_accuracy", "min_weighted_f1", "min_macro_f1")
+        normalized: dict[str, Any] = {}
+        for key in required_scalar_keys:
+            if key not in payload:
+                raise ValueError(f"Gate policy is missing required key `{key}`: {policy_path}")
+            try:
+                value = float(payload[key])
+            except Exception as exc:
+                raise ValueError(f"Gate policy key `{key}` must be numeric: {exc}") from exc
+            if value < 0 or value > 1:
+                raise ValueError(f"Gate policy key `{key}` must be within [0, 1].")
+            normalized[key] = value
+
+        recalls = payload.get("min_recall_per_class")
+        if not isinstance(recalls, dict):
+            raise ValueError("Gate policy key `min_recall_per_class` must be an object.")
+        normalized_recalls: dict[str, float] = {}
+        for raw_label, raw_value in recalls.items():
+            label = clean_optional_string(raw_label)
+            if not label:
+                continue
+            try:
+                value = float(raw_value)
+            except Exception as exc:
+                raise ValueError(f"Gate policy recall threshold for `{label}` must be numeric: {exc}") from exc
+            if value < 0 or value > 1:
+                raise ValueError(f"Gate policy recall threshold for `{label}` must be within [0, 1].")
+            normalized_recalls[label] = value
+        normalized["min_recall_per_class"] = normalized_recalls
+        return normalized
+
+    def _resolve_gate_dataset_columns(self, fieldnames: list[str]) -> tuple[str, str]:
+        normalized_map: dict[str, str] = {clean_optional_string(name).lower(): name for name in fieldnames}
+        message_candidates = ("logmessage", "log_message", "message", "errormessage", "error_message", "log")
+        label_candidates = ("class", "label", "classification", "target", "y")
+
+        message_column = ""
+        for candidate in message_candidates:
+            if candidate in normalized_map:
+                message_column = normalized_map[candidate]
+                break
+        if not message_column:
+            raise ValueError("Golden set is missing a message column (expected LogMessage/message/errorMessage).")
+
+        label_column = ""
+        for candidate in label_candidates:
+            if candidate in normalized_map:
+                label_column = normalized_map[candidate]
+                break
+        if not label_column:
+            raise ValueError("Golden set is missing a label column (expected class/label).")
+        return message_column, label_column
+
+    def _load_gate_dataset_rows(self, golden_path: Path) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        with open(golden_path, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                raise ValueError(f"Golden set has no header columns: {golden_path}")
+            message_column, label_column = self._resolve_gate_dataset_columns(list(reader.fieldnames))
+            for line_number, row in enumerate(reader, start=2):
+                message = clean_optional_string((row or {}).get(message_column, ""))
+                label = clean_optional_string((row or {}).get(label_column, ""))
+                if not message:
+                    raise ValueError(f"Golden set row {line_number} has empty message text.")
+                if not label:
+                    raise ValueError(f"Golden set row {line_number} has empty label.")
+                rows.append(
+                    {
+                        "line_number": line_number,
+                        "message": message,
+                        "label": label,
+                    }
+                )
+        if not rows:
+            raise ValueError(f"Golden set has no data rows: {golden_path}")
+        return rows
+
+    def _compute_model_dir_hash(self, model_dir: Path) -> str:
+        digest = hashlib.sha256()
+        files = sorted([path for path in model_dir.rglob("*") if path.is_file()])
+        if not files:
+            raise ValueError(f"No files found under model directory: {model_dir}")
+        for file_path in files:
+            relative_path = file_path.relative_to(model_dir).as_posix()
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(compute_file_sha256(str(file_path)).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _compute_gate_metrics(self, y_true: list[str], y_pred: list[str]) -> dict[str, Any]:
+        if accuracy_score is None or precision_recall_fscore_support is None or confusion_matrix is None:
+            raise RuntimeError("scikit-learn is required for deployment gate metrics, but it is not available.")
+        if len(y_true) != len(y_pred):
+            raise ValueError("Gate metric computation received mismatched true/predicted label lengths.")
+        if not y_true:
+            raise ValueError("Gate metric computation received an empty dataset.")
+
+        labels = list(LABEL_NAMES)
+        for label in y_true:
+            clean_label = clean_optional_string(label)
+            if clean_label and clean_label not in labels:
+                labels.append(clean_label)
+        for label in y_pred:
+            clean_label = clean_optional_string(label)
+            if clean_label and clean_label not in labels:
+                labels.append(clean_label)
+
+        accuracy = float(accuracy_score(y_true, y_pred))
+        weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            average="weighted",
+            zero_division=0,
+        )
+        macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0,
+        )
+        per_precision, per_recall, per_f1, per_support = precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            labels=labels,
+            average=None,
+            zero_division=0,
+        )
+        per_class: dict[str, dict[str, Any]] = {}
+        for index, label in enumerate(labels):
+            per_class[label] = {
+                "precision": float(per_precision[index]),
+                "recall": float(per_recall[index]),
+                "f1": float(per_f1[index]),
+                "support": int(per_support[index]),
+            }
+
+        confusion = confusion_matrix(y_true, y_pred, labels=labels).tolist()
+        return {
+            "accuracy": accuracy,
+            "weighted_precision": float(weighted_precision),
+            "weighted_recall": float(weighted_recall),
+            "weighted_f1": float(weighted_f1),
+            "macro_precision": float(macro_precision),
+            "macro_recall": float(macro_recall),
+            "macro_f1": float(macro_f1),
+            "per_class": per_class,
+            "confusion_matrix": {"labels": labels, "matrix": confusion},
+        }
+
+    def _check_deployment_gate_cache(
+        self,
+        *,
+        gate_root: Path,
+        model_hash: str,
+        golden_hash: str,
+        policy_hash: str,
+    ) -> dict[str, Any] | None:
+        if not gate_root.exists():
+            return None
+        try:
+            candidates = sorted(gate_root.glob("gate_eval_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        except Exception:
+            return None
+        for candidate in candidates[:200]:
+            payload = read_json(str(candidate))
+            if not isinstance(payload, dict):
+                continue
+            if not bool(payload.get("gate_pass")):
+                continue
+            if clean_optional_string(payload.get("model_hash")) != model_hash:
+                continue
+            if clean_optional_string(payload.get("golden_set_hash")) != golden_hash:
+                continue
+            if clean_optional_string(payload.get("policy_hash")) != policy_hash:
+                continue
+            if not clean_optional_string(payload.get("report_path")):
+                payload["report_path"] = str(candidate.resolve())
+            payload["_cache_hit"] = True
+            return payload
+        return None
+
+    def _write_deployment_gate_artifacts(
+        self,
+        *,
+        gate_root: Path,
+        payload: dict[str, Any],
+        predictions: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        gate_root.mkdir(parents=True, exist_ok=True)
+        stamp = str(int(time.time() * 1000))
+        report_path = gate_root / f"gate_eval_{stamp}.json"
+        predictions_path = gate_root / f"gate_eval_{stamp}_predictions.csv"
+
+        with open(predictions_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["line_number", "message", "true_label", "predicted_label", "match"],
+            )
+            writer.writeheader()
+            for row in predictions:
+                writer.writerow(
+                    {
+                        "line_number": row.get("line_number", ""),
+                        "message": clean_optional_string(row.get("message")),
+                        "true_label": clean_optional_string(row.get("true_label")),
+                        "predicted_label": clean_optional_string(row.get("predicted_label")),
+                        "match": bool(row.get("match")),
+                    }
+                )
+
+        payload_with_paths = dict(payload)
+        payload_with_paths["report_path"] = str(report_path.resolve())
+        payload_with_paths["predictions_path"] = str(predictions_path.resolve())
+        write_json(str(report_path), payload_with_paths)
+        write_json(str((gate_root / "latest_gate_eval.json").resolve()), payload_with_paths)
+        return {
+            "report_path": str(report_path.resolve()),
+            "predictions_path": str(predictions_path.resolve()),
+        }
+
+    def _enforce_deployment_gate(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
+        ctx.emit("progress", "Evaluating deployment gate against golden dataset...")
+
+        resolved_model_dir = Path(discover_model_dir(request.model_dir)).resolve()
+        golden_path = self._resolve_gate_input_path(request.deployment_gate_golden_path, "gates/deployment_golden.csv")
+        policy_path = self._resolve_gate_input_path(request.deployment_gate_policy_path, "gates/deployment_policy.json")
+        if not golden_path.exists():
+            raise FileNotFoundError(f"Deployment gate golden set file not found: {golden_path}")
+        if not policy_path.exists():
+            raise FileNotFoundError(f"Deployment gate policy file not found: {policy_path}")
+
+        policy = self._load_gate_policy(policy_path)
+        golden_rows = self._load_gate_dataset_rows(golden_path)
+        model_hash = self._compute_model_dir_hash(resolved_model_dir)
+        golden_hash = compute_file_sha256(str(golden_path))
+        policy_hash = compute_file_sha256(str(policy_path))
+        gate_root = (self.project_dir / "outputs" / "gates").resolve()
+
+        cached = self._check_deployment_gate_cache(
+            gate_root=gate_root,
+            model_hash=model_hash,
+            golden_hash=golden_hash,
+            policy_hash=policy_hash,
+        )
+        if isinstance(cached, dict):
+            cached_report = clean_optional_string(cached.get("report_path"))
+            ctx.emit(
+                "progress",
+                "Deployment gate cache hit: prior PASS was reused."
+                + (f" ({cached_report})" if cached_report else ""),
+            )
+            return {
+                "gate_pass": True,
+                "cached": True,
+                "report_path": cached_report,
+                "predictions_path": clean_optional_string(cached.get("predictions_path")),
+                "model_hash": model_hash,
+                "golden_set_hash": golden_hash,
+                "policy_hash": policy_hash,
+                "sample_count": int(cached.get("sample_count") or len(golden_rows)),
+                "metrics": cached.get("metrics", {}),
+                "failed_checks": [],
+                "golden_set_path": str(golden_path.resolve()),
+                "policy_path": str(policy_path.resolve()),
+            }
+
+        bundle = load_model_bundle(str(resolved_model_dir))
+        y_true: list[str] = []
+        y_pred: list[str] = []
+        predictions: list[dict[str, Any]] = []
+        for row in golden_rows:
+            true_label = clean_optional_string(row.get("label"))
+            predicted_label = clean_optional_string(predict_error_message(bundle, clean_optional_string(row.get("message"))))
+            y_true.append(true_label)
+            y_pred.append(predicted_label)
+            predictions.append(
+                {
+                    "line_number": int(row.get("line_number", 0)),
+                    "message": clean_optional_string(row.get("message")),
+                    "true_label": true_label,
+                    "predicted_label": predicted_label,
+                    "match": predicted_label == true_label,
+                }
+            )
+
+        metrics = self._compute_gate_metrics(y_true, y_pred)
+        failed_checks: list[str] = []
+        if float(metrics.get("accuracy", 0.0)) < float(policy["min_accuracy"]):
+            failed_checks.append(
+                f"accuracy {float(metrics.get('accuracy', 0.0)):.4f} < min_accuracy {float(policy['min_accuracy']):.4f}"
+            )
+        if float(metrics.get("weighted_f1", 0.0)) < float(policy["min_weighted_f1"]):
+            failed_checks.append(
+                f"weighted_f1 {float(metrics.get('weighted_f1', 0.0)):.4f} < min_weighted_f1 {float(policy['min_weighted_f1']):.4f}"
+            )
+        if float(metrics.get("macro_f1", 0.0)) < float(policy["min_macro_f1"]):
+            failed_checks.append(
+                f"macro_f1 {float(metrics.get('macro_f1', 0.0)):.4f} < min_macro_f1 {float(policy['min_macro_f1']):.4f}"
+            )
+
+        per_class = metrics.get("per_class") if isinstance(metrics.get("per_class"), dict) else {}
+        recall_thresholds = policy.get("min_recall_per_class") if isinstance(policy.get("min_recall_per_class"), dict) else {}
+        for raw_label, raw_threshold in recall_thresholds.items():
+            label = clean_optional_string(raw_label)
+            if not label:
+                continue
+            threshold = float(raw_threshold)
+            class_recall = 0.0
+            class_payload = per_class.get(label) if isinstance(per_class, dict) else None
+            if isinstance(class_payload, dict):
+                class_recall = float(class_payload.get("recall", 0.0))
+            if class_recall < threshold:
+                failed_checks.append(
+                    f"recall[{label}] {class_recall:.4f} < min_recall_per_class[{label}] {threshold:.4f}"
+                )
+
+        gate_pass = len(failed_checks) == 0
+        report_payload: dict[str, Any] = {
+            "created_at": now_utc_iso(),
+            "gate_pass": gate_pass,
+            "failed_checks": failed_checks,
+            "sample_count": len(golden_rows),
+            "model_dir": str(resolved_model_dir),
+            "model_hash": model_hash,
+            "golden_set_path": str(golden_path.resolve()),
+            "golden_set_hash": golden_hash,
+            "policy_path": str(policy_path.resolve()),
+            "policy_hash": policy_hash,
+            "policy": policy,
+            "metrics": metrics,
+            "cached": False,
+        }
+        artifact_paths = self._write_deployment_gate_artifacts(
+            gate_root=gate_root,
+            payload=report_payload,
+            predictions=predictions,
+        )
+        report_payload.update(artifact_paths)
+
+        if not gate_pass:
+            raise RuntimeError(
+                "Deployment gate rejected this model.\n\n"
+                + "\n".join(f"- {reason}" for reason in failed_checks)
+                + f"\n\nReport: {artifact_paths['report_path']}"
+            )
+
+        ctx.emit(
+            "progress",
+            (
+                "Deployment gate PASSED. "
+                f"accuracy={float(metrics.get('accuracy', 0.0)):.4f}, "
+                f"weighted_f1={float(metrics.get('weighted_f1', 0.0)):.4f}, "
+                f"macro_f1={float(metrics.get('macro_f1', 0.0)):.4f}"
+            ),
+        )
+        return report_payload
+
+    def _attach_deployment_gate_to_result(self, result: dict[str, Any], gate_payload: dict[str, Any]) -> None:
+        gate_pass = bool(gate_payload.get("gate_pass"))
+        if not gate_pass:
+            return
+        gate_summary = (
+            "Deployment gate: PASS"
+            + (" (cache hit)" if bool(gate_payload.get("cached")) else "")
+            + f" | accuracy={float((gate_payload.get('metrics') or {}).get('accuracy', 0.0)):.4f}"
+            + f" | weighted_f1={float((gate_payload.get('metrics') or {}).get('weighted_f1', 0.0)):.4f}"
+        )
+        result["gate"] = {
+            "gate_pass": True,
+            "cached": bool(gate_payload.get("cached")),
+            "report_path": clean_optional_string(gate_payload.get("report_path")),
+            "predictions_path": clean_optional_string(gate_payload.get("predictions_path")),
+            "model_hash": clean_optional_string(gate_payload.get("model_hash")),
+            "golden_set_hash": clean_optional_string(gate_payload.get("golden_set_hash")),
+            "policy_hash": clean_optional_string(gate_payload.get("policy_hash")),
+            "sample_count": int(gate_payload.get("sample_count") or 0),
+            "metrics": gate_payload.get("metrics", {}),
+            "golden_set_path": clean_optional_string(gate_payload.get("golden_set_path")),
+            "policy_path": clean_optional_string(gate_payload.get("policy_path")),
+        }
+        result["message"] = (
+            clean_optional_string(result.get("message")) + "\n" + gate_summary
+            if clean_optional_string(result.get("message"))
+            else gate_summary
+        )
+        result["summary"] = (
+            clean_optional_string(result.get("summary")) + "\n" + gate_summary
+            if clean_optional_string(result.get("summary"))
+            else gate_summary
+        )
+
+        try:
+            hosting_meta = self.model_catalog_service.read_last_hosting_metadata() or {}
+            hosting_meta["deployment_gate"] = result["gate"]
+            result["metadata_path"] = self.model_catalog_service.save_last_hosting_metadata(hosting_meta)
+        except Exception:
+            pass
+
     def _run(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
+        gate_payload = self._enforce_deployment_gate(ctx, request)
         if request.mode == "azure":
             result = self._run_azure_hosting(ctx, request)
         else:
             result = self._run_local_hosting(ctx, request)
+        self._attach_deployment_gate_to_result(result, gate_payload)
         if request.create_github_pr:
             self._attach_github_copilot_pr_task(ctx, request, result)
         return result

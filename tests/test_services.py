@@ -64,6 +64,39 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(service.fetch_repos("token"), ["owner/repo"])
             self.assertEqual(service.fetch_branches("token", "owner/repo"), ["main"])
 
+    def test_github_copilot_prompt_does_not_require_token_settings_by_default(self):
+        service = GitHubService()
+
+        prompt = service.build_log_forwarding_copilot_prompt(
+            repo_name="owner/repo",
+            base_branch="main",
+            endpoint_url="https://example.test/api/logs?code=function-key",
+            endpoint_auth_mode="configured by environment",
+        )
+
+        self.assertIn("LOG_MONITOR_ENDPOINT_URL", prompt)
+        self.assertIn("LOG_MONITOR_FORWARDING_ENABLED", prompt)
+        self.assertIn("Do not add endpoint key or token settings by default", prompt)
+        self.assertNotIn("LOG_MONITOR_ENDPOINT_KEY`, and", prompt)
+        self.assertNotIn("bearer-token", prompt.lower())
+        self.assertNotIn("bearer token", prompt.lower())
+
+    def test_github_copilot_prompt_mentions_endpoint_key_only_for_key_auth(self):
+        service = GitHubService()
+
+        prompt = service.build_log_forwarding_copilot_prompt(
+            repo_name="owner/repo",
+            base_branch="main",
+            endpoint_url="https://example.test/score",
+            endpoint_auth_mode="key",
+        )
+
+        self.assertIn("Authentication mode: key", prompt)
+        self.assertIn("LOG_MONITOR_ENDPOINT_KEY", prompt)
+        self.assertIn("documented key-based authorization", prompt)
+        self.assertNotIn("bearer-token", prompt.lower())
+        self.assertNotIn("bearer token", prompt.lower())
+
     def test_model_catalog_archives_dataset_and_finds_models(self):
         dataset_path = self.project_dir / "sample.csv"
         dataset_path.write_text("LogMessage,class\nhello,Noise\n", encoding="utf-8")

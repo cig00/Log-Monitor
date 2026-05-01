@@ -47,6 +47,24 @@ class GitHubService:
         clean_auth_mode = clean_optional_string(endpoint_auth_mode) or "configured by environment"
         clean_service_kind = clean_optional_string(service_kind) or "hosted endpoint"
         clean_hosting_mode = clean_optional_string(hosting_mode) or "hosting"
+        clean_auth_mode_key = clean_auth_mode.lower().replace("-", "_").replace(" ", "_")
+        if clean_auth_mode_key == "key":
+            auth_guidance = (
+                "If this key-authenticated endpoint is used directly, read its key from "
+                "`LOG_MONITOR_ENDPOINT_KEY` and use the endpoint's documented key-based authorization. "
+                "If the key is not configured, keep forwarding disabled or fail closed locally instead of "
+                "inventing another token setting."
+            )
+        elif clean_auth_mode_key in {"aad", "aad_token", "entra", "entra_id", "managed_identity"}:
+            auth_guidance = (
+                "Do not add endpoint key or token settings by default for this identity-authenticated endpoint. "
+                "Use an existing managed identity or app auth pattern only if the target repository already has one."
+            )
+        else:
+            auth_guidance = (
+                "Do not add endpoint key or token settings by default. Use endpoint auth only when this "
+                "repository already has the matching secret or config value."
+            )
         return f"""You are GitHub Copilot coding agent working in `{clean_repo}` from base branch `{clean_branch}`.
 
 Goal:
@@ -65,7 +83,8 @@ Send application logs and error events to the endpoint without degrading user ex
 Implementation guidance:
 - First inspect the repository to find its language, framework, logging layer, error handlers, and app startup/configuration patterns.
 - Add the smallest idiomatic integration for that stack.
-- Use environment/config values such as `LOG_MONITOR_ENDPOINT_URL`, `LOG_MONITOR_ENDPOINT_KEY`, and `LOG_MONITOR_FORWARDING_ENABLED`.
+- Use environment/config values such as `LOG_MONITOR_ENDPOINT_URL` and `LOG_MONITOR_FORWARDING_ENABLED`.
+- {auth_guidance}
 - Do not hard-code secrets. Do not commit endpoint keys or tokens.
 - Forward logs asynchronously:
   - enqueue logs and drain them in a background worker, task, thread, queue, or framework-native async mechanism;
@@ -80,7 +99,7 @@ Implementation guidance:
 Endpoint request contract:
 - If this repository can send plain app logs, send each log as JSON including at least `message`, `level`, `timestamp`, `source`, and optional structured metadata.
 - If the endpoint is a Log Monitor prediction API that expects `{{"errorMessage": "..."}}`, adapt the sender to that request body.
-- If the endpoint requires an Azure/serverless key, read it from `LOG_MONITOR_ENDPOINT_KEY` and use the authorization style required by the endpoint. Do not block the user path while obtaining or sending it.
+- Follow the authentication guidance above, and do not block the user path while obtaining or sending endpoint credentials.
 
 Verification:
 - Run the existing formatter/linter/tests when they are already available and cheap.

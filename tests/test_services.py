@@ -290,6 +290,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_BATCH_ENABLED"], "0")
         self.assertEqual(captured["settings"]["LOGMONITOR_HOSTING_SERVICE_KIND"], "serverless")
         self.assertEqual(captured["settings"]["LOGMONITOR_RETRAIN_ENABLED"], "1")
+        self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_ENABLED"], "0")
         self.assertEqual(captured["settings"]["LOGMONITOR_BASE_DATASET_BLOB"], "feedback/base/123/dataset.csv")
         self.assertEqual(captured["uploaded_blob"], "feedback/base/123/dataset.csv")
 
@@ -311,6 +312,52 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_BATCH_ENABLED"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_BATCH_ENDPOINT_NAME"], "batch-endpoint")
         self.assertEqual(captured["settings"]["LOGMONITOR_RETRAIN_COMPUTE_NAME"], "log-monitor-batch-cpu")
+
+        triage_request = HostingRequest(
+            model_dir=str(self.project_dir),
+            mode="azure",
+            azure_sub_id="sub",
+            azure_tenant_id="tenant",
+            azure_compute="cpu",
+            azure_instance_type="Standard_D2as_v4",
+            azure_service="online",
+            github_token="gh-token",
+            github_repo="owner/repo",
+            github_branch="main",
+            triage_enabled=True,
+            azure_prediction_key="prediction-key",
+            configuration_email="email1@example.test",
+            system_email="email2@example.test",
+            acs_connection_string="endpoint=https://acs.example/;accesskey=secret",
+            acs_sender_address="alerts@example.test",
+            jira_site_url="https://jira.example.test",
+            jira_account_email="jira@example.test",
+            jira_api_token="jira-token",
+            jira_project_key="OPS",
+            jira_issue_type="Bug",
+            jira_priority="High",
+            jira_labels="log-monitor,triage",
+        )
+        triage_result = self.hosting._deploy_azure_feedback_bridge(
+            ctx=SimpleNamespace(emit=lambda *args, **kwargs: None),
+            credential=object(),
+            ml_client=object(),
+            request=triage_request,
+            service_kind="online",
+            timestamp=125,
+            training_metadata={"data_version_path": str(dataset_path)},
+            source_endpoint_name="online-endpoint",
+            source_api_url="https://score",
+            batch_enabled=False,
+        )
+        self.assertEqual(triage_result["triage_api_url"], "https://func.azurewebsites.net/api/triage?code=key")
+        self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_ENABLED"], "1")
+        self.assertEqual(captured["settings"]["LOGMONITOR_PREDICTION_ENDPOINT_URL"], "https://score")
+        self.assertEqual(captured["settings"]["LOGMONITOR_PREDICTION_KEY"], "prediction-key")
+        self.assertEqual(captured["settings"]["LOGMONITOR_CONFIGURATION_EMAIL"], "email1@example.test")
+        self.assertEqual(captured["settings"]["LOGMONITOR_SYSTEM_EMAIL"], "email2@example.test")
+        self.assertEqual(captured["settings"]["LOGMONITOR_GITHUB_REPO"], "owner/repo")
+        self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_PROJECT_KEY"], "OPS")
 
     def test_hosting_run_blocks_when_gate_fails(self):
         request = HostingRequest(model_dir=str(self.project_dir), mode="local")

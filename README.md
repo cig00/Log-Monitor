@@ -430,7 +430,28 @@ The hosting summary includes:
 
 For model-based Azure hosting, the app uploads the current local labeled data version as the feedback base dataset when it can find it from training metadata. If no base dataset is available, the feedback pipeline still creates data versions from submitted corrections, but retraining may need enough feedback rows to satisfy the training split and label distribution requirements.
 
-### 7. Inspect Dashboards
+### 7. Azure Real-Time Triage Automation
+
+Azure real-time endpoint hosting can also expose a Function-backed triage endpoint in front of the prediction endpoint. The desktop form asks for:
+
+- Azure endpoint key
+- GitHub PAT, repository, and branch
+- Configuration email and System email
+- Azure Communication Services Email connection string and sender address
+- Jira site URL, account email, API token, project key, issue type, optional priority, and labels
+
+Triage behavior:
+
+- `Noise`: no action
+- `CONFIGURATION`: sends email to the configured configuration recipient
+- `SYSTEM`: sends email to the configured system recipient
+- `Error`: creates a Jira issue with the log payload, prediction response, endpoint metadata, and GitHub commit context
+
+GitHub history is included only as a non-conclusive investigation signal. A recent or matching commit is not treated as proof that a developer caused the error.
+
+GitHub PAT, repository, and branch are required for Azure hosting so the Function app has enough repository context for incident triage.
+
+### 8. Inspect Dashboards
 
 Depending on backend and environment:
 

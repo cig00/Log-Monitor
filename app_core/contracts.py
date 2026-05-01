@@ -70,6 +70,19 @@ class HostingRequest:
     github_token: str = ""
     github_repo: str = ""
     github_branch: str = ""
+    triage_enabled: bool = False
+    azure_prediction_key: str = ""
+    configuration_email: str = ""
+    system_email: str = ""
+    acs_connection_string: str = ""
+    acs_sender_address: str = ""
+    jira_site_url: str = ""
+    jira_account_email: str = ""
+    jira_api_token: str = ""
+    jira_project_key: str = ""
+    jira_issue_type: str = "Bug"
+    jira_priority: str = ""
+    jira_labels: str = "log-monitor,ml-triage"
 
 
 @dataclass(slots=True)

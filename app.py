@@ -166,6 +166,18 @@ class LogProcessorApp:
         self.azure_hosted_endpoint_name_var = tk.StringVar(value="")
         self.create_pr_var = tk.BooleanVar(value=False)
         self.github_pr_url_var = tk.StringVar(value="")
+        self.azure_prediction_key_var = tk.StringVar(value="")
+        self.configuration_email_var = tk.StringVar(value="")
+        self.system_email_var = tk.StringVar(value="")
+        self.acs_connection_string_var = tk.StringVar(value="")
+        self.acs_sender_address_var = tk.StringVar(value="")
+        self.jira_site_url_var = tk.StringVar(value="")
+        self.jira_account_email_var = tk.StringVar(value="")
+        self.jira_api_token_var = tk.StringVar(value="")
+        self.jira_project_key_var = tk.StringVar(value="")
+        self.jira_issue_type_var = tk.StringVar(value="Bug")
+        self.jira_priority_var = tk.StringVar(value="")
+        self.jira_labels_var = tk.StringVar(value="log-monitor,ml-triage")
         self.mlflow_enabled_var = tk.BooleanVar(value=False)
         self.mlflow_backend_var = tk.StringVar(value="local")
         self.mlflow_tracking_uri_var = tk.StringVar(value=self.local_mlflow_tracking_uri)
@@ -650,7 +662,7 @@ class LogProcessorApp:
             wraplength=460,
             justify="left",
         )
-        self.azure_batch_note_label.grid(row=14, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
+        self.azure_batch_note_label.grid(row=10, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
 
         self.azure_serverless_note_label = ttk.Label(
             hosting_frame,
@@ -661,67 +673,132 @@ class LogProcessorApp:
             wraplength=460,
             justify="left",
         )
-        self.azure_serverless_note_label.grid(row=14, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
+        self.azure_serverless_note_label.grid(row=10, column=1, columnspan=3, sticky="w", padx=5, pady=(0, 6))
+
+        self.azure_triage_frame = ttk.LabelFrame(hosting_frame, text="Azure Triage Automation", padding=(8, 6))
+        self.azure_triage_frame.grid(row=10, column=0, columnspan=4, sticky="ew", padx=5, pady=(6, 8))
+        self.azure_triage_frame.columnconfigure(1, weight=1)
+        self.azure_triage_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(self.azure_triage_frame, text="Endpoint Key:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.azure_prediction_key_entry = ttk.Entry(
+            self.azure_triage_frame,
+            textvariable=self.azure_prediction_key_var,
+            show="*",
+        )
+        self.azure_prediction_key_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="Configuration Email:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
+        self.configuration_email_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.configuration_email_var)
+        self.configuration_email_entry.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="System Email:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        self.system_email_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.system_email_var)
+        self.system_email_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="ACS Sender:").grid(row=1, column=2, sticky="w", padx=4, pady=4)
+        self.acs_sender_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.acs_sender_address_var)
+        self.acs_sender_entry.grid(row=1, column=3, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="ACS Connection:").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        self.acs_connection_entry = ttk.Entry(
+            self.azure_triage_frame,
+            textvariable=self.acs_connection_string_var,
+            show="*",
+        )
+        self.acs_connection_entry.grid(row=2, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="Jira Site URL:").grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        self.jira_site_url_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.jira_site_url_var)
+        self.jira_site_url_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="Jira Email:").grid(row=3, column=2, sticky="w", padx=4, pady=4)
+        self.jira_account_email_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.jira_account_email_var)
+        self.jira_account_email_entry.grid(row=3, column=3, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="Jira API Token:").grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.jira_api_token_entry = ttk.Entry(
+            self.azure_triage_frame,
+            textvariable=self.jira_api_token_var,
+            show="*",
+        )
+        self.jira_api_token_entry.grid(row=4, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="Jira Project:").grid(row=4, column=2, sticky="w", padx=4, pady=4)
+        self.jira_project_key_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.jira_project_key_var)
+        self.jira_project_key_entry.grid(row=4, column=3, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="Issue Type:").grid(row=5, column=0, sticky="w", padx=4, pady=4)
+        self.jira_issue_type_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.jira_issue_type_var)
+        self.jira_issue_type_entry.grid(row=5, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="Priority:").grid(row=5, column=2, sticky="w", padx=4, pady=4)
+        self.jira_priority_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.jira_priority_var)
+        self.jira_priority_entry.grid(row=5, column=3, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(self.azure_triage_frame, text="Labels:").grid(row=6, column=0, sticky="w", padx=4, pady=4)
+        self.jira_labels_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.jira_labels_var)
+        self.jira_labels_entry.grid(row=6, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
 
         self.gate_golden_label = ttk.Label(hosting_frame, text="Gate Golden Set:")
-        self.gate_golden_label.grid(row=10, column=0, sticky="w", padx=5, pady=5)
+        self.gate_golden_label.grid(row=11, column=0, sticky="w", padx=5, pady=5)
         self.gate_golden_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.host_gate_golden_path_var,
             width=30,
         )
-        self.gate_golden_entry.grid(row=10, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.gate_golden_entry.grid(row=11, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.gate_golden_browse_btn = ttk.Button(
             hosting_frame,
             text="Browse",
             command=self.browse_gate_golden_path,
         )
-        self.gate_golden_browse_btn.grid(row=10, column=3, padx=5, pady=5)
+        self.gate_golden_browse_btn.grid(row=11, column=3, padx=5, pady=5)
 
         self.gate_policy_label = ttk.Label(hosting_frame, text="Gate Policy:")
-        self.gate_policy_label.grid(row=11, column=0, sticky="w", padx=5, pady=5)
+        self.gate_policy_label.grid(row=12, column=0, sticky="w", padx=5, pady=5)
         self.gate_policy_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.host_gate_policy_path_var,
             width=30,
         )
-        self.gate_policy_entry.grid(row=11, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.gate_policy_entry.grid(row=12, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.gate_policy_browse_btn = ttk.Button(
             hosting_frame,
             text="Browse",
             command=self.browse_gate_policy_path,
         )
-        self.gate_policy_browse_btn.grid(row=11, column=3, padx=5, pady=5)
+        self.gate_policy_browse_btn.grid(row=12, column=3, padx=5, pady=5)
 
         self.drift_golden_label = ttk.Label(hosting_frame, text="Drift Golden Set:")
-        self.drift_golden_label.grid(row=12, column=0, sticky="w", padx=5, pady=5)
+        self.drift_golden_label.grid(row=13, column=0, sticky="w", padx=5, pady=5)
         self.drift_golden_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.host_drift_golden_path_var,
             width=30,
         )
-        self.drift_golden_entry.grid(row=12, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.drift_golden_entry.grid(row=13, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.drift_golden_browse_btn = ttk.Button(
             hosting_frame,
             text="Browse",
             command=self.browse_drift_golden_path,
         )
-        self.drift_golden_browse_btn.grid(row=12, column=3, padx=5, pady=5)
+        self.drift_golden_browse_btn.grid(row=13, column=3, padx=5, pady=5)
 
         self.drift_policy_label = ttk.Label(hosting_frame, text="Drift Policy:")
-        self.drift_policy_label.grid(row=13, column=0, sticky="w", padx=5, pady=5)
+        self.drift_policy_label.grid(row=14, column=0, sticky="w", padx=5, pady=5)
         self.drift_policy_entry = ttk.Entry(
             hosting_frame,
             textvariable=self.host_drift_policy_path_var,
             width=30,
         )
-        self.drift_policy_entry.grid(row=13, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.drift_policy_entry.grid(row=14, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.drift_policy_browse_btn = ttk.Button(
             hosting_frame,
             text="Browse",
             command=self.browse_drift_policy_path,
         )
-        self.drift_policy_browse_btn.grid(row=13, column=3, padx=5, pady=5)
+        self.drift_policy_browse_btn.grid(row=14, column=3, padx=5, pady=5)
 
         self.host_service_btn = ttk.Button(
             hosting_frame,
@@ -1252,6 +1329,7 @@ class LogProcessorApp:
         azure_service = self.azure_host_service_var.get().strip()
         is_queued_batch = is_azure and azure_service == "queued_batch"
         is_serverless = is_azure and azure_service == "serverless"
+        is_triage_online = is_azure and azure_service == "online"
         if is_serverless:
             self.ensure_azure_serverless_defaults(refresh_endpoint=False)
         show_batch_schedule = is_queued_batch
@@ -1297,6 +1375,11 @@ class LogProcessorApp:
                 widget.grid()
             else:
                 widget.grid_remove()
+
+        if is_triage_online:
+            self.azure_triage_frame.grid()
+        else:
+            self.azure_triage_frame.grid_remove()
 
         if is_queued_batch:
             self.azure_batch_note_label.config(
@@ -1599,6 +1682,58 @@ class LogProcessorApp:
                 self.finish_hosting_action()
                 messagebox.showwarning("Hosting", "Please provide your Azure Tenant ID for hosting.")
                 return
+            if not github_token:
+                self.finish_hosting_action()
+                messagebox.showwarning("Hosting", "Please enter a GitHub PAT before starting Azure hosting.")
+                return
+            if not github_repo:
+                self.finish_hosting_action()
+                messagebox.showwarning("Hosting", "Please select a GitHub repository before starting Azure hosting.")
+                return
+            if not github_branch:
+                self.finish_hosting_action()
+                messagebox.showwarning("Hosting", "Please select a GitHub branch before starting Azure hosting.")
+                return
+
+            triage_enabled = azure_service == "online"
+            triage_values = {
+                "azure_prediction_key": clean_optional_string(self.azure_prediction_key_var.get()),
+                "configuration_email": clean_optional_string(self.configuration_email_var.get()),
+                "system_email": clean_optional_string(self.system_email_var.get()),
+                "acs_connection_string": clean_optional_string(self.acs_connection_string_var.get()),
+                "acs_sender_address": clean_optional_string(self.acs_sender_address_var.get()),
+                "jira_site_url": clean_optional_string(self.jira_site_url_var.get()),
+                "jira_account_email": clean_optional_string(self.jira_account_email_var.get()),
+                "jira_api_token": clean_optional_string(self.jira_api_token_var.get()),
+                "jira_project_key": clean_optional_string(self.jira_project_key_var.get()),
+                "jira_issue_type": clean_optional_string(self.jira_issue_type_var.get()) or "Bug",
+                "jira_priority": clean_optional_string(self.jira_priority_var.get()),
+                "jira_labels": clean_optional_string(self.jira_labels_var.get()) or "log-monitor,ml-triage",
+            }
+            if triage_enabled:
+                required_triage_fields = [
+                    ("Azure endpoint key", triage_values["azure_prediction_key"]),
+                    ("GitHub PAT", github_token),
+                    ("GitHub repository", github_repo),
+                    ("GitHub branch", github_branch),
+                    ("Configuration email", triage_values["configuration_email"]),
+                    ("System email", triage_values["system_email"]),
+                    ("ACS connection string", triage_values["acs_connection_string"]),
+                    ("ACS sender address", triage_values["acs_sender_address"]),
+                    ("Jira site URL", triage_values["jira_site_url"]),
+                    ("Jira account email", triage_values["jira_account_email"]),
+                    ("Jira API token", triage_values["jira_api_token"]),
+                    ("Jira project key", triage_values["jira_project_key"]),
+                    ("Jira issue type", triage_values["jira_issue_type"]),
+                ]
+                missing_triage_fields = [label for label, value in required_triage_fields if not value]
+                if missing_triage_fields:
+                    self.finish_hosting_action()
+                    messagebox.showwarning(
+                        "Azure Triage Automation",
+                        "Azure real-time triage needs these values:\n- " + "\n- ".join(missing_triage_fields),
+                    )
+                    return
 
             request_kwargs.update(
                 {
@@ -1617,6 +1752,8 @@ class LogProcessorApp:
                     "github_token": github_token,
                     "github_repo": github_repo,
                     "github_branch": github_branch,
+                    "triage_enabled": triage_enabled,
+                    **triage_values,
                 }
             )
             job = self.hosting_service.submit_hosting(HostingRequest(**request_kwargs))

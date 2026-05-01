@@ -1,15 +1,18 @@
 import csv
+import base64
 import hashlib
 import io
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import azure.functions as func
+import requests
 from azure.ai.ml import Input, MLClient, command
 from azure.ai.ml.constants import AssetTypes
 from azure.ai.ml.entities import AmlCompute, Data
@@ -37,6 +40,10 @@ LABEL_ALIASES = {label.casefold(): label for label in LABEL_NAMES}
 _BLOB_SERVICE_CLIENT = None
 _SERVICE_BUS_CLIENT = None
 _ML_CLIENT = None
+
+SOURCE_PATH_PATTERN = re.compile(
+    r"(?P<path>(?:[A-Za-z]:)?(?:[\w ._-]+[\\/])*[\w.-]+\.(?:py|js|jsx|ts|tsx|java|cs|go|rb|php|c|cc|cpp|h|hpp|rs|kt|swift))"
+)
 
 
 def _now_utc_iso() -> str:
@@ -135,6 +142,354 @@ def _to_json_response(body: dict, status_code: int) -> func.HttpResponse:
         json.dumps(body, ensure_ascii=True),
         status_code=status_code,
         mimetype="application/json",
+    )
+
+
+def _truncate(value: object, max_chars: int = 4000) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 30] + "\n...[truncated by Log Monitor]"
+
+
+def _get_payload_value(payload: dict, keys: tuple[str, ...]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    for container_key in ("metadata", "context", "deployment", "git", "github"):
+        nested = payload.get(container_key)
+        if isinstance(nested, dict):
+            for key in keys:
+                value = nested.get(key)
+                if value not in (None, ""):
+                    return str(value).strip()
+    return ""
+
+
+def _normalize_prediction_label(raw_prediction: object) -> str:
+    if isinstance(raw_prediction, dict):
+        for key in ("prediction", "class", "label", "predictedLabel", "predicted_label"):
+            value = raw_prediction.get(key)
+            if value not in (None, ""):
+                return _normalize_prediction_label(value)
+        return ""
+    if isinstance(raw_prediction, list) and raw_prediction:
+        return _normalize_prediction_label(raw_prediction[0])
+    text = str(raw_prediction or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+        if parsed is not text:
+            nested = _normalize_prediction_label(parsed)
+            if nested:
+                return nested
+    except Exception:
+        pass
+    return LABEL_ALIASES.get(text.casefold(), text)
+
+
+def _call_prediction_endpoint(payload: dict) -> dict:
+    endpoint_url = _get_env("LOGMONITOR_PREDICTION_ENDPOINT_URL") or _get_env("LOGMONITOR_SOURCE_ENDPOINT_URL")
+    if not endpoint_url:
+        raise RuntimeError("Prediction endpoint URL is not configured.")
+    message = _extract_message(payload)
+    if not message:
+        raise ValueError("Triage payload needs a log message in errorMessage, LogMessage, message, log, msg, or text.")
+
+    headers = {"Content-Type": "application/json"}
+    auth_mode = _get_env("LOGMONITOR_PREDICTION_AUTH_MODE", "key").lower()
+    if auth_mode == "key":
+        prediction_key = _require_env("LOGMONITOR_PREDICTION_KEY")
+        headers["Authorization"] = f"Bearer {prediction_key}"
+    elif auth_mode in {"aad", "aad_token", "entra", "managed_identity"}:
+        credential = DefaultAzureCredential()
+        token = credential.get_token("https://ml.azure.com/.default").token
+        headers["Authorization"] = f"Bearer {token}"
+
+    response = requests.post(endpoint_url, headers=headers, json={"errorMessage": message}, timeout=60)
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = _truncate(response.text, 2000)
+        raise RuntimeError(f"Prediction endpoint failed ({response.status_code}). {detail}") from exc
+
+    try:
+        response_payload = response.json()
+    except Exception:
+        response_payload = response.text
+    prediction = _normalize_prediction_label(response_payload)
+    if not prediction:
+        raise RuntimeError("Prediction endpoint returned no prediction label.")
+    return {
+        "prediction": prediction,
+        "raw_response": response_payload,
+        "endpoint_url": endpoint_url,
+    }
+
+
+def _send_email(recipient: str, subject: str, plain_text: str) -> dict:
+    clean_recipient = str(recipient or "").strip()
+    if not clean_recipient:
+        raise RuntimeError("Email recipient is empty.")
+    connection_string = _require_env("LOGMONITOR_ACS_CONNECTION_STRING")
+    sender_address = _require_env("LOGMONITOR_ACS_SENDER_ADDRESS")
+    try:
+        from azure.communication.email import EmailClient
+    except Exception as exc:
+        raise RuntimeError("The Function package is missing azure-communication-email.") from exc
+
+    client = EmailClient.from_connection_string(connection_string)
+    message = {
+        "senderAddress": sender_address,
+        "recipients": {"to": [{"address": clean_recipient}]},
+        "content": {
+            "subject": _truncate(subject, 250),
+            "plainText": _truncate(plain_text, 12000),
+        },
+    }
+    poller = client.begin_send(message)
+    result = poller.result()
+    message_id = ""
+    if isinstance(result, dict):
+        message_id = str(result.get("id") or result.get("messageId") or "")
+    else:
+        message_id = str(getattr(result, "id", "") or getattr(result, "message_id", "") or "")
+    return {"recipient": clean_recipient, "message_id": message_id}
+
+
+def _github_headers() -> dict:
+    token = _get_env("LOGMONITOR_GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GitHub token is not configured.")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _github_request(path: str, params: dict | None = None) -> object:
+    repo = _require_env("LOGMONITOR_GITHUB_REPO")
+    url = f"https://api.github.com/repos/{repo}/{path.lstrip('/')}"
+    response = requests.get(url, headers=_github_headers(), params=params or {}, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def _extract_source_paths(payload: dict, message: str) -> list[str]:
+    candidates: list[str] = []
+    for value in (
+        _get_payload_value(payload, ("sourcePath", "source_path", "file", "filename", "path")),
+        message,
+        json.dumps(payload, ensure_ascii=True) if isinstance(payload, dict) else "",
+    ):
+        if not value:
+            continue
+        for match in SOURCE_PATH_PATTERN.finditer(value):
+            path = match.group("path").replace("\\", "/").strip("/")
+            if path and path not in candidates:
+                candidates.append(path)
+    return candidates[:8]
+
+
+def _summarize_github_commit(commit: dict, source: str, confidence: str) -> dict:
+    payload = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
+    author = payload.get("author") if isinstance(payload.get("author"), dict) else {}
+    github_author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+    files = commit.get("files") if isinstance(commit.get("files"), list) else []
+    return {
+        "sha": str(commit.get("sha") or "")[:40],
+        "html_url": str(commit.get("html_url") or ""),
+        "message": str(payload.get("message") or "").splitlines()[0][:240],
+        "author_name": str(author.get("name") or github_author.get("login") or ""),
+        "author_email": str(author.get("email") or ""),
+        "author_login": str(github_author.get("login") or ""),
+        "authored_at": str(author.get("date") or ""),
+        "source": source,
+        "confidence": confidence,
+        "files": [str(file_info.get("filename") or "") for file_info in files[:20] if isinstance(file_info, dict)],
+    }
+
+
+def _find_github_impact_context(payload: dict, message: str) -> dict:
+    caveat = (
+        "GitHub commit data is a non-conclusive signal only. "
+        "The error may be caused by configuration, infrastructure, external services, data, or runtime state."
+    )
+    repo = _get_env("LOGMONITOR_GITHUB_REPO")
+    branch = _get_env("LOGMONITOR_GITHUB_BRANCH")
+    if not _get_env("LOGMONITOR_GITHUB_TOKEN") or not repo:
+        return {"status": "skipped", "caveat": caveat, "reason": "GitHub token or repository is not configured.", "candidates": []}
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+
+    def add_candidate(commit: dict, source: str, confidence: str) -> None:
+        sha = str(commit.get("sha") or "")
+        if not sha or sha in seen:
+            return
+        seen.add(sha)
+        candidates.append(_summarize_github_commit(commit, source, confidence))
+
+    try:
+        commit_sha = _get_payload_value(payload, ("commitSha", "commit_sha", "gitSha", "git_sha", "sha"))
+        previous_sha = _get_payload_value(payload, ("previousSha", "previous_sha", "baseSha", "base_sha", "beforeSha", "before"))
+        if commit_sha:
+            commit = _github_request(f"commits/{commit_sha}")
+            if isinstance(commit, dict):
+                add_candidate(commit, "payload.commitSha", "medium")
+        if previous_sha and commit_sha:
+            comparison = _github_request(f"compare/{previous_sha}...{commit_sha}")
+            if isinstance(comparison, dict):
+                for commit in comparison.get("commits", [])[-5:]:
+                    if isinstance(commit, dict):
+                        add_candidate(commit, "payload.sha_range", "medium")
+
+        source_paths = _extract_source_paths(payload, message)
+        for path in source_paths[:5]:
+            path_commits = _github_request(
+                "commits",
+                params={"sha": branch, "path": path, "per_page": 3} if branch else {"path": path, "per_page": 3},
+            )
+            if isinstance(path_commits, list):
+                for commit in path_commits:
+                    if isinstance(commit, dict):
+                        add_candidate(commit, f"path:{path}", "low")
+
+        if not candidates:
+            recent = _github_request("commits", params={"sha": branch, "per_page": 5} if branch else {"per_page": 5})
+            if isinstance(recent, list):
+                for commit in recent:
+                    if isinstance(commit, dict):
+                        add_candidate(commit, "recent_branch_history", "low")
+    except Exception as exc:
+        LOGGER.exception("GitHub impact lookup failed.")
+        return {"status": "error", "caveat": caveat, "error": str(exc), "repo": repo, "branch": branch, "candidates": candidates[:5]}
+
+    return {
+        "status": "ok" if candidates else "empty",
+        "caveat": caveat,
+        "repo": repo,
+        "branch": branch,
+        "source_paths": _extract_source_paths(payload, message),
+        "candidates": candidates[:5],
+    }
+
+
+def _jira_adf_from_text(text: str) -> dict:
+    content = []
+    for line in _truncate(text, 25000).splitlines()[:220]:
+        content.append(
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": line if line else " "}],
+            }
+        )
+    if not content:
+        content.append({"type": "paragraph", "content": [{"type": "text", "text": "No details provided."}]})
+    return {"type": "doc", "version": 1, "content": content}
+
+
+def _parse_jira_labels(raw_labels: str) -> list[str]:
+    labels = []
+    for token in str(raw_labels or "").split(","):
+        label = re.sub(r"[^A-Za-z0-9_.-]+", "-", token.strip()).strip("-")
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _build_jira_description(payload: dict, prediction_result: dict, github_context: dict) -> str:
+    message = _extract_message(payload)
+    lines = [
+        "Log Monitor classified this event as Error.",
+        "",
+        "Important: GitHub history is included only as investigation context. It is not proof that a developer change caused the error.",
+        "",
+        f"Received At: {payload.get('received_at', _now_utc_iso()) if isinstance(payload, dict) else _now_utc_iso()}",
+        f"Prediction: {prediction_result.get('prediction', '')}",
+        f"Prediction Endpoint: {prediction_result.get('endpoint_url', '')}",
+        f"Source Endpoint Name: {_get_env('LOGMONITOR_SOURCE_ENDPOINT_NAME')}",
+        f"Hosting Service Kind: {_get_env('LOGMONITOR_HOSTING_SERVICE_KIND')}",
+        "",
+        "Log Message:",
+        _truncate(message, 5000),
+        "",
+        "GitHub Impact Context (non-conclusive):",
+        json.dumps(github_context, ensure_ascii=True, indent=2)[:10000],
+        "",
+        "Raw Payload:",
+        json.dumps(payload, ensure_ascii=True, indent=2)[:10000],
+        "",
+        "Raw Prediction Response:",
+        json.dumps(prediction_result.get("raw_response", ""), ensure_ascii=True, indent=2)[:5000],
+    ]
+    return "\n".join(lines)
+
+
+def _create_jira_issue(payload: dict, prediction_result: dict, github_context: dict) -> dict:
+    site_url = _require_env("LOGMONITOR_JIRA_SITE_URL").rstrip("/")
+    account_email = _require_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL")
+    api_token = _require_env("LOGMONITOR_JIRA_API_TOKEN")
+    project_key = _require_env("LOGMONITOR_JIRA_PROJECT_KEY")
+    issue_type = _get_env("LOGMONITOR_JIRA_ISSUE_TYPE", "Bug") or "Bug"
+    priority = _get_env("LOGMONITOR_JIRA_PRIORITY")
+    labels = _parse_jira_labels(_get_env("LOGMONITOR_JIRA_LABELS", "log-monitor,ml-triage"))
+    message = _extract_message(payload)
+    summary = _truncate("Log Monitor Error: " + (message.splitlines()[0] if message else "unclassified runtime error"), 240)
+    description_text = _build_jira_description(payload, prediction_result, github_context)
+    auth_token = base64.b64encode(f"{account_email}:{api_token}".encode("utf-8")).decode("ascii")
+    fields = {
+        "project": {"key": project_key},
+        "summary": summary,
+        "description": _jira_adf_from_text(description_text),
+        "issuetype": {"name": issue_type},
+    }
+    if labels:
+        fields["labels"] = labels
+    if priority:
+        fields["priority"] = {"name": priority}
+
+    response = requests.post(
+        f"{site_url}/rest/api/3/issue",
+        headers={
+            "Authorization": f"Basic {auth_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        json={"fields": fields},
+        timeout=30,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(f"Jira issue creation failed ({response.status_code}). {_truncate(response.text, 2000)}") from exc
+    result = response.json()
+    issue_key = str(result.get("key") or "")
+    return {
+        "issue_key": issue_key,
+        "issue_url": f"{site_url}/browse/{issue_key}" if issue_key else "",
+        "jira_response": result,
+    }
+
+
+def _build_notification_body(payload: dict, prediction_result: dict) -> str:
+    return "\n".join(
+        [
+            f"Log Monitor prediction: {prediction_result.get('prediction', '')}",
+            f"Received at: {payload.get('received_at', _now_utc_iso()) if isinstance(payload, dict) else _now_utc_iso()}",
+            f"Source endpoint: {_get_env('LOGMONITOR_SOURCE_ENDPOINT_NAME')}",
+            "",
+            "Log message:",
+            _truncate(_extract_message(payload), 6000),
+            "",
+            "Raw payload:",
+            json.dumps(payload, ensure_ascii=True, indent=2)[:10000],
+        ]
     )
 
 
@@ -664,3 +1019,104 @@ def feedback_status(req: func.HttpRequest) -> func.HttpResponse:
     del req
     state = _load_feedback_state()
     return _to_json_response({"feedback_state": state}, 200)
+
+
+@app.function_name(name="triage_log")
+@app.route(route="triage", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def triage_log(req: func.HttpRequest) -> func.HttpResponse:
+    if _get_env("LOGMONITOR_TRIAGE_ENABLED", "0").lower() not in {"1", "true", "yes", "on"}:
+        return _to_json_response(
+            {
+                "accepted": False,
+                "error": "Azure triage automation is not enabled for this deployment.",
+            },
+            404,
+        )
+
+    try:
+        payload = req.get_json()
+    except ValueError:
+        raw_text = req.get_body().decode("utf-8", errors="ignore").strip()
+        if not raw_text:
+            return _to_json_response(
+                {
+                    "accepted": False,
+                    "error": "Send a JSON body or plain-text log message.",
+                },
+                400,
+            )
+        payload = raw_text
+
+    normalized = _normalize_payload(payload)
+    message = _extract_message(normalized)
+    if not message:
+        return _to_json_response(
+            {
+                "accepted": False,
+                "error": "Triage payload needs a log message in errorMessage, LogMessage, message, log, msg, or text.",
+            },
+            400,
+        )
+
+    try:
+        prediction_result = _call_prediction_endpoint(normalized)
+    except Exception as exc:
+        LOGGER.exception("Prediction call failed during triage.")
+        return _to_json_response({"accepted": False, "error": str(exc)}, 502)
+
+    prediction = LABEL_ALIASES.get(str(prediction_result.get("prediction", "")).casefold(), prediction_result.get("prediction", ""))
+    actions: list[dict] = []
+    action_errors: list[dict] = []
+    github_context: dict = {}
+    jira_issue: dict = {}
+
+    if prediction == "Noise":
+        actions.append({"type": "ignore", "reason": "Prediction was Noise."})
+    elif prediction == "CONFIGURATION":
+        try:
+            email_result = _send_email(
+                _require_env("LOGMONITOR_CONFIGURATION_EMAIL"),
+                "Log Monitor CONFIGURATION alert",
+                _build_notification_body(normalized, prediction_result),
+            )
+            actions.append({"type": "email", "recipient_kind": "configuration", **email_result})
+        except Exception as exc:
+            LOGGER.exception("Failed to send CONFIGURATION email.")
+            action_errors.append({"type": "email", "recipient_kind": "configuration", "error": str(exc)})
+    elif prediction == "SYSTEM":
+        try:
+            email_result = _send_email(
+                _require_env("LOGMONITOR_SYSTEM_EMAIL"),
+                "Log Monitor SYSTEM alert",
+                _build_notification_body(normalized, prediction_result),
+            )
+            actions.append({"type": "email", "recipient_kind": "system", **email_result})
+        except Exception as exc:
+            LOGGER.exception("Failed to send SYSTEM email.")
+            action_errors.append({"type": "email", "recipient_kind": "system", "error": str(exc)})
+    elif prediction == "Error":
+        github_context = _find_github_impact_context(normalized, message)
+        try:
+            jira_issue = _create_jira_issue(normalized, prediction_result, github_context)
+            actions.append({"type": "jira", **jira_issue})
+        except Exception as exc:
+            LOGGER.exception("Failed to create Jira issue.")
+            action_errors.append({"type": "jira", "error": str(exc), "github_context": github_context})
+    else:
+        actions.append({"type": "none", "reason": f"No triage rule is configured for prediction '{prediction}'."})
+
+    return _to_json_response(
+        {
+            "accepted": True,
+            "prediction": prediction,
+            "actions": actions,
+            "action_errors": action_errors,
+            "github_context": github_context,
+            "jira_issue": jira_issue,
+            "received_at": normalized.get("received_at"),
+            "caveat": (
+                "GitHub history is an investigation aid only. A matching or recent commit does not prove developer impact."
+            ),
+        },
+        200,
+    )

@@ -925,6 +925,7 @@ class HostingService:
         retrain_instance_type = clean_optional_string(request.azure_instance_type) or "Standard_D2as_v4"
         retrain_compute = clean_optional_string(retrain_compute_name) or "log-monitor-feedback-cpu"
         batch_timezone_iana = self.azure_platform_service.get_azure_batch_timezone_iana(request.batch_timezone)
+        triage_enabled = bool(request.triage_enabled)
         settings = {
             "AzureWebJobsStorage__accountName": storage_account_name,
             "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
@@ -955,6 +956,24 @@ class HostingService:
             "LOGMONITOR_HOSTING_SERVICE_KIND": clean_service_kind,
             "LOGMONITOR_SOURCE_ENDPOINT_NAME": clean_optional_string(source_endpoint_name),
             "LOGMONITOR_SOURCE_ENDPOINT_URL": clean_optional_string(source_api_url),
+            "LOGMONITOR_TRIAGE_ENABLED": "1" if triage_enabled else "0",
+            "LOGMONITOR_PREDICTION_ENDPOINT_URL": clean_optional_string(source_api_url),
+            "LOGMONITOR_PREDICTION_AUTH_MODE": "key",
+            "LOGMONITOR_PREDICTION_KEY": clean_optional_string(request.azure_prediction_key),
+            "LOGMONITOR_CONFIGURATION_EMAIL": clean_optional_string(request.configuration_email),
+            "LOGMONITOR_SYSTEM_EMAIL": clean_optional_string(request.system_email),
+            "LOGMONITOR_ACS_CONNECTION_STRING": clean_optional_string(request.acs_connection_string),
+            "LOGMONITOR_ACS_SENDER_ADDRESS": clean_optional_string(request.acs_sender_address),
+            "LOGMONITOR_GITHUB_TOKEN": clean_optional_string(request.github_token),
+            "LOGMONITOR_GITHUB_REPO": clean_optional_string(request.github_repo),
+            "LOGMONITOR_GITHUB_BRANCH": clean_optional_string(request.github_branch),
+            "LOGMONITOR_JIRA_SITE_URL": clean_optional_string(request.jira_site_url),
+            "LOGMONITOR_JIRA_ACCOUNT_EMAIL": clean_optional_string(request.jira_account_email),
+            "LOGMONITOR_JIRA_API_TOKEN": clean_optional_string(request.jira_api_token),
+            "LOGMONITOR_JIRA_PROJECT_KEY": clean_optional_string(request.jira_project_key),
+            "LOGMONITOR_JIRA_ISSUE_TYPE": clean_optional_string(request.jira_issue_type) or "Bug",
+            "LOGMONITOR_JIRA_PRIORITY": clean_optional_string(request.jira_priority),
+            "LOGMONITOR_JIRA_LABELS": clean_optional_string(request.jira_labels) or "log-monitor,ml-triage",
         }
         ctx.emit("progress", "Updating Azure Function feedback settings...")
         self.azure_platform_service.set_function_app_settings(
@@ -995,12 +1014,24 @@ class HostingService:
             function_name="submit_feedback",
             route_path="feedback",
         )
+        triage_api_url = ""
+        if triage_enabled:
+            triage_api_url, _ = self.azure_platform_service.wait_for_function_bridge_endpoint(
+                credential=credential,
+                sub_id=request.azure_sub_id,
+                function_app_name=function_app_name,
+                function_host_name=function_host_name,
+                function_name="triage_log",
+                route_path="triage",
+            )
         feedback_status_url = f"https://{function_host_name}/api/feedback/status?code={function_key}" if function_key else ""
         return {
             "function_app_name": function_app_name,
             "function_host_name": function_host_name,
             "function_key": function_key,
             "log_api_url": log_api_url,
+            "triage_enabled": triage_enabled,
+            "triage_api_url": triage_api_url,
             "feedback_api_url": feedback_api_url,
             "feedback_status_url": feedback_status_url,
             "service_bus_namespace": service_bus_namespace_name,
@@ -1198,6 +1229,8 @@ class HostingService:
             source_api_url=scoring_uri,
             batch_enabled=False,
         )
+        triage_api_url = clean_optional_string(feedback_meta.get("triage_api_url"))
+        public_api_url = triage_api_url or scoring_uri
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
                 "mode": "azure",
@@ -1210,7 +1243,10 @@ class HostingService:
                 "deployment_name": deployment_name,
                 "instance_type": selected_instance_type,
                 "endpoint_auth_mode": "key",
-                "api_url": scoring_uri,
+                "api_url": public_api_url,
+                "prediction_api_url": scoring_uri,
+                "triage_enabled": bool(feedback_meta.get("triage_enabled")),
+                "triage_api_url": triage_api_url,
                 "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
                 "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
                 "feedback_bridge": feedback_meta,
@@ -1225,17 +1261,22 @@ class HostingService:
         return {
             "operation": "hosting",
             "message": "Azure real-time endpoint is ready.",
-            "api_url": scoring_uri,
+            "api_url": public_api_url,
+            "prediction_api_url": scoring_uri,
             "endpoint_name": endpoint_name,
+            "endpoint_auth_mode": "key",
+            "triage_api_url": triage_api_url,
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
-                f"Azure real-time endpoint is ready.\nPOST {scoring_uri}\nInstance Type: {selected_instance_type}\n"
+                f"Azure real-time endpoint is ready.\nPOST {public_api_url}\n"
+                f"Prediction target: {scoring_uri}\nInstance Type: {selected_instance_type}\n"
                 f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
-                "Body: {\"errorMessage\": \"...\"}\nResponse: {\"prediction\": \"...\"}\nAuthentication: endpoint keys."
+                + (f"Triage API: {triage_api_url}\n" if triage_api_url else "")
+                + "Body: {\"errorMessage\": \"...\"}\nResponse: {\"prediction\": \"...\"}\nAuthentication: endpoint keys."
             ),
         }
 

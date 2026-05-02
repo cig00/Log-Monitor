@@ -71,13 +71,16 @@ class ServiceTests(unittest.TestCase):
             repo_name="owner/repo",
             base_branch="main",
             endpoint_url="https://example.test/api/logs?code=function-key",
-            endpoint_auth_mode="configured by environment",
+            endpoint_auth_mode="",
         )
 
-        self.assertIn("LOG_MONITOR_ENDPOINT_URL", prompt)
-        self.assertIn("LOG_MONITOR_FORWARDING_ENABLED", prompt)
-        self.assertIn("Do not add endpoint key or token settings by default", prompt)
-        self.assertNotIn("LOG_MONITOR_ENDPOINT_KEY`, and", prompt)
+        self.assertIn("https://example.test/api/logs?code=function-key", prompt)
+        self.assertIn("Hard-code the deployed Log Monitor endpoint URL above as the default target", prompt)
+        self.assertIn("Do not require the user to access the server or set environment variables", prompt)
+        self.assertIn("already includes the required Function access code", prompt)
+        self.assertNotIn("LOG_MONITOR_ENDPOINT_URL", prompt)
+        self.assertNotIn("LOG_MONITOR_FORWARDING_ENABLED", prompt)
+        self.assertNotIn("LOG_MONITOR_ENDPOINT_KEY", prompt)
         self.assertNotIn("bearer-token", prompt.lower())
         self.assertNotIn("bearer token", prompt.lower())
 
@@ -92,10 +95,100 @@ class ServiceTests(unittest.TestCase):
         )
 
         self.assertIn("Authentication mode: key", prompt)
-        self.assertIn("LOG_MONITOR_ENDPOINT_KEY", prompt)
-        self.assertIn("documented key-based authorization", prompt)
+        self.assertIn("Use the exact deployed endpoint URL above as the committed forwarding target", prompt)
+        self.assertIn("Function proxy URL", prompt)
+        self.assertIn("TODO", prompt)
+        self.assertNotIn("LOG_MONITOR_ENDPOINT_KEY", prompt)
         self.assertNotIn("bearer-token", prompt.lower())
         self.assertNotIn("bearer token", prompt.lower())
+
+    def test_github_copilot_prompt_includes_azure_studio_and_prompt_version(self):
+        service = GitHubService()
+        studio_url = "https://ml.azure.com/endpoints?wsid=abc&tid=tenant&reloadCount=1"
+
+        prompt = service.build_log_forwarding_copilot_prompt(
+            repo_name="owner/repo",
+            base_branch="main",
+            endpoint_url="https://example.test/api/logs?code=function-key",
+            endpoint_name="log-monitor-endpoint",
+            endpoint_auth_mode="key",
+            service_kind="online",
+            hosting_mode="azure",
+            azure_studio_endpoint_url=studio_url,
+            copilot_prompt_version_label="abc123",
+            copilot_prompt_version_id="abc123full",
+        )
+        body = service.build_log_forwarding_issue_body(prompt, "https://example.test/api/logs?code=function-key", studio_url)
+
+        self.assertIn(studio_url, prompt)
+        self.assertIn("Copilot prompt version: abc123 (abc123full)", prompt)
+        self.assertIn("Azure ML Studio endpoint page", body)
+        self.assertIn(studio_url, body)
+
+    def test_hosting_copilot_pr_task_uses_studio_url_and_logs_prompt_version(self):
+        studio_url = "https://ml.azure.com/endpoints?wsid=abc&tid=tenant&reloadCount=1"
+        request = HostingRequest(
+            model_dir="",
+            mode="azure",
+            azure_service="online",
+            github_token="gh-token",
+            github_repo="owner/repo",
+            github_branch="main",
+        )
+        result = {
+            "operation": "hosting",
+            "message": "Azure endpoint is ready.",
+            "summary": "Azure endpoint is ready.",
+            "api_url": "https://score.azureml.net/score",
+            "log_api_url": "https://func.azurewebsites.net/api/logs?code=function-key",
+            "endpoint_name": "log-monitor-endpoint",
+            "endpoint_auth_mode": "key",
+            "service_kind": "online",
+            "azure_endpoint_studio_url": studio_url,
+            "azure_mlflow_tracking_uri": "azureml://tracking",
+        }
+        captured = {}
+
+        def fake_create_pr_task(**kwargs):
+            captured["create_pr_task"] = kwargs
+            return {
+                "title": "Integrate async Log Monitor log forwarding",
+                "repo_name": kwargs["repo_name"],
+                "base_branch": kwargs["base_branch"],
+                "issue_number": 17,
+                "issue_url": "https://api.github.test/issues/17",
+                "html_url": "https://github.test/owner/repo/issues/17",
+                "endpoint_url": kwargs["endpoint_url"],
+                "endpoint_name": kwargs["endpoint_name"],
+                "azure_studio_endpoint_url": kwargs["azure_studio_endpoint_url"],
+                "copilot_assignee": "copilot-swe-agent[bot]",
+                "copilot_model": "github-default-best-available",
+                "prompt_text": kwargs["prompt_text"],
+            }
+
+        def fake_log_prompt_mlflow(**kwargs):
+            captured["log_prompt_mlflow"] = kwargs
+            return {"copilot_prompt_mlflow_status": "logged", "copilot_prompt_mlflow_run_id": "run-123"}
+
+        with mock.patch.object(self.hosting.github_service, "create_copilot_log_forwarding_pr_task", side_effect=fake_create_pr_task), mock.patch.object(
+            self.hosting.mlops_service,
+            "log_copilot_pr_prompt_mlflow",
+            side_effect=fake_log_prompt_mlflow,
+        ):
+            self.hosting._attach_github_copilot_pr_task(SimpleNamespace(emit=lambda *args, **kwargs: None), request, result)
+
+        prompt_text = captured["create_pr_task"]["prompt_text"]
+        self.assertEqual(captured["create_pr_task"]["azure_studio_endpoint_url"], studio_url)
+        self.assertEqual(captured["create_pr_task"]["endpoint_url"], "https://func.azurewebsites.net/api/logs?code=function-key")
+        self.assertIn(studio_url, prompt_text)
+        self.assertIn("https://func.azurewebsites.net/api/logs?code=function-key", prompt_text)
+        self.assertNotIn("https://score.azureml.net/score", prompt_text)
+        self.assertIn("Hard-code the deployed Log Monitor endpoint URL above as the default target", prompt_text)
+        self.assertNotIn("LOG_MONITOR_ENDPOINT_URL", prompt_text)
+        self.assertEqual(captured["log_prompt_mlflow"]["tracking_uri"], "azureml://tracking")
+        self.assertEqual(captured["log_prompt_mlflow"]["metadata"]["azure_studio_endpoint_url"], studio_url)
+        self.assertEqual(result["github_pr_task"]["azure_studio_endpoint_url"], studio_url)
+        self.assertEqual(result["github_pr_task"]["copilot_prompt_mlflow_status"], "logged")
 
     def test_model_catalog_archives_dataset_and_finds_models(self):
         dataset_path = self.project_dir / "sample.csv"
@@ -159,6 +252,73 @@ class ServiceTests(unittest.TestCase):
         comparison = self.mlops.compare_prompt_versions()
         self.assertIn("-classify logs", comparison["diff"])
         self.assertIn("+classify logs by root cause", comparison["diff"])
+
+    def test_mlops_service_logs_copilot_prompt_to_mlflow(self):
+        prompt_text = "Forward logs to https://func.azurewebsites.net/api/logs?code=function-key"
+        prompt_info = self.mlops.archive_copilot_pr_prompt(prompt_text, {"repo_name": "owner/repo"})
+
+        class FakeRun:
+            def __init__(self):
+                self.info = SimpleNamespace(run_id="run-123")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeMlflow:
+            def __init__(self):
+                self.tracking_uri = ""
+                self.experiment_name = ""
+                self.params = {}
+                self.metrics = {}
+                self.artifact_path = ""
+                self.run_name = ""
+                self.tags = {}
+
+            def set_tracking_uri(self, value):
+                self.tracking_uri = value
+
+            def set_experiment(self, value):
+                self.experiment_name = value
+
+            def start_run(self, run_name="", tags=None):
+                self.run_name = run_name
+                self.tags = tags or {}
+                return FakeRun()
+
+            def log_param(self, key, value):
+                self.params[key] = value
+
+            def log_metric(self, key, value):
+                self.metrics[key] = value
+
+            def log_artifacts(self, local_dir, artifact_path=None):
+                self.artifact_path = artifact_path
+                self.artifact_names = {path.name for path in Path(local_dir).iterdir()}
+
+        fake_mlflow = FakeMlflow()
+        with mock.patch("app_core.mlops_service.mlflow", fake_mlflow):
+            result = self.mlops.log_copilot_pr_prompt_mlflow(
+                tracking_uri="azureml://tracking",
+                experiment_name="log-monitor-copilot-prompts",
+                prompt_text=prompt_text,
+                prompt_info=prompt_info,
+                metadata={
+                    "repo_name": "owner/repo",
+                    "endpoint_url": "https://func.azurewebsites.net/api/logs?code=function-key",
+                    "azure_studio_endpoint_url": "https://ml.azure.com/endpoints?wsid=abc",
+                },
+            )
+
+        self.assertEqual(result["copilot_prompt_mlflow_status"], "logged")
+        self.assertEqual(result["copilot_prompt_mlflow_run_id"], "run-123")
+        self.assertEqual(fake_mlflow.tracking_uri, "azureml://tracking")
+        self.assertEqual(fake_mlflow.experiment_name, "log-monitor-copilot-prompts")
+        self.assertEqual(fake_mlflow.params["repo_name"], "owner/repo")
+        self.assertEqual(fake_mlflow.artifact_path, "copilot_pr_prompt")
+        self.assertIn("copilot_prompt.txt", fake_mlflow.artifact_names)
 
     def test_data_prep_service_evaluates_prompt_test_cases(self):
         response = mock.Mock()

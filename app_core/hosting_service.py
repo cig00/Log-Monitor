@@ -625,7 +625,11 @@ class HostingService:
             except Exception:
                 pass
 
-        endpoint_url = clean_optional_string(result.get("api_url"))
+        endpoint_url = (
+            clean_optional_string(result.get("triage_api_url"))
+            or clean_optional_string(result.get("log_api_url"))
+            or clean_optional_string(result.get("api_url"))
+        )
         if not endpoint_url:
             result["github_pr_error"] = "Could not create the Copilot PR task because no endpoint URL was returned."
             result["summary"] = clean_optional_string(result.get("summary")) + f"\nCopilot PR task: {result['github_pr_error']}"
@@ -634,6 +638,11 @@ class HostingService:
         ctx.emit("progress", "Creating GitHub Copilot PR task...")
         prompt_info: dict[str, Any] = {}
         try:
+            azure_studio_endpoint_url = (
+                clean_optional_string(result.get("azure_endpoint_studio_url"))
+                or clean_optional_string(result.get("serverless_endpoints_studio_url"))
+                or clean_optional_string(result.get("mlops_url"))
+            )
             prompt_text = self.github_service.build_log_forwarding_copilot_prompt(
                 repo_name=request.github_repo,
                 base_branch=request.github_branch,
@@ -642,6 +651,7 @@ class HostingService:
                 endpoint_auth_mode=clean_optional_string(result.get("endpoint_auth_mode")),
                 service_kind=clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
                 hosting_mode=request.mode,
+                azure_studio_endpoint_url=azure_studio_endpoint_url,
             )
             prompt_info = self.mlops_service.archive_copilot_pr_prompt(
                 prompt_text,
@@ -650,10 +660,38 @@ class HostingService:
                     "base_branch": request.github_branch,
                     "endpoint_url": endpoint_url,
                     "endpoint_name": clean_optional_string(result.get("endpoint_name")),
+                    "azure_studio_endpoint_url": azure_studio_endpoint_url,
                     "service_kind": clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
                     "hosting_mode": request.mode,
                     "copilot_model": "github-default-best-available",
                     "copilot_assignee": "copilot-swe-agent[bot]",
+                },
+            )
+            prompt_text = self.github_service.build_log_forwarding_copilot_prompt(
+                repo_name=request.github_repo,
+                base_branch=request.github_branch,
+                endpoint_url=endpoint_url,
+                endpoint_name=clean_optional_string(result.get("endpoint_name")),
+                endpoint_auth_mode=clean_optional_string(result.get("endpoint_auth_mode")),
+                service_kind=clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
+                hosting_mode=request.mode,
+                azure_studio_endpoint_url=azure_studio_endpoint_url,
+                copilot_prompt_version_label=clean_optional_string(prompt_info.get("copilot_prompt_version_label")),
+                copilot_prompt_version_id=clean_optional_string(prompt_info.get("copilot_prompt_version_id")),
+            )
+            prompt_info = self.mlops_service.archive_copilot_pr_prompt(
+                prompt_text,
+                {
+                    "repo_name": request.github_repo,
+                    "base_branch": request.github_branch,
+                    "endpoint_url": endpoint_url,
+                    "endpoint_name": clean_optional_string(result.get("endpoint_name")),
+                    "azure_studio_endpoint_url": azure_studio_endpoint_url,
+                    "service_kind": clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
+                    "hosting_mode": request.mode,
+                    "copilot_model": "github-default-best-available",
+                    "copilot_assignee": "copilot-swe-agent[bot]",
+                    "bootstrap_copilot_prompt_version_id": clean_optional_string(prompt_info.get("copilot_prompt_version_id")),
                 },
             )
             pr_task = self.github_service.create_copilot_log_forwarding_pr_task(
@@ -667,6 +705,7 @@ class HostingService:
                 hosting_mode=request.mode,
                 copilot_model="",
                 prompt_text=prompt_text,
+                azure_studio_endpoint_url=azure_studio_endpoint_url,
             )
             prompt_info.update(
                 self.mlops_service.archive_copilot_pr_prompt(
@@ -676,6 +715,7 @@ class HostingService:
                         "base_branch": request.github_branch,
                         "endpoint_url": endpoint_url,
                         "endpoint_name": clean_optional_string(result.get("endpoint_name")),
+                        "azure_studio_endpoint_url": azure_studio_endpoint_url,
                         "service_kind": clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
                         "hosting_mode": request.mode,
                         "github_issue_number": pr_task.get("issue_number"),
@@ -685,6 +725,24 @@ class HostingService:
                     },
                 )
             )
+            prompt_mlflow_info = self.mlops_service.log_copilot_pr_prompt_mlflow(
+                tracking_uri=clean_optional_string(result.get("azure_mlflow_tracking_uri")),
+                experiment_name="log-monitor-copilot-prompts",
+                prompt_text=prompt_text,
+                prompt_info=prompt_info,
+                metadata={
+                    "repo_name": request.github_repo,
+                    "base_branch": request.github_branch,
+                    "endpoint_url": endpoint_url,
+                    "endpoint_name": clean_optional_string(result.get("endpoint_name")),
+                    "azure_studio_endpoint_url": azure_studio_endpoint_url,
+                    "service_kind": clean_optional_string(request.azure_service) or clean_optional_string(result.get("service_kind")),
+                    "hosting_mode": request.mode,
+                    "github_issue_url": clean_optional_string(pr_task.get("html_url")),
+                    "copilot_model": clean_optional_string(pr_task.get("copilot_model")),
+                },
+            )
+            prompt_info.update(prompt_mlflow_info)
             safe_pr_task = {key: value for key, value in pr_task.items() if key != "prompt_text"}
             safe_pr_task.update(prompt_info)
             result["github_pr_task"] = safe_pr_task
@@ -1129,6 +1187,7 @@ class HostingService:
         scoring_uri = clean_optional_string(deployment_meta.get("api_url"))
         endpoints_studio_url = self.azure_platform_service.build_azure_endpoints_studio_url(request.azure_sub_id, request.azure_tenant_id)
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
+        azure_mlflow_tracking_uri = clean_optional_string(self.mlops_service.resolve_azure_mlflow_tracking_uri(ml_client))
         endpoint_resource_id = self.azure_platform_service.build_serverless_endpoint_resource_id(
             request.azure_sub_id,
             clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
@@ -1193,7 +1252,10 @@ class HostingService:
                 "serverless_endpoint_resource_id": endpoint_resource_id,
                 "serverless_endpoint_portal_url": endpoint_portal_url,
                 "serverless_endpoints_studio_url": endpoints_studio_url,
+                "azure_endpoint_studio_url": endpoints_studio_url,
+                "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
                 "api_url": scoring_uri,
+                "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
                 "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
                 "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
                 "feedback_bridge": feedback_meta,
@@ -1208,10 +1270,13 @@ class HostingService:
             "operation": "hosting",
             "message": "Azure serverless endpoint is ready.",
             "api_url": scoring_uri,
+            "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
             "endpoint_name": clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": endpoints_studio_url or mlops_url,
+            "azure_endpoint_studio_url": endpoints_studio_url,
+            "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
@@ -1266,7 +1331,9 @@ class HostingService:
                 endpoint_name,
                 emit=lambda msg: ctx.emit("progress", msg),
             )
+        endpoints_studio_url = self.azure_platform_service.build_azure_endpoints_studio_url(request.azure_sub_id, request.azure_tenant_id)
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
+        azure_mlflow_tracking_uri = clean_optional_string(self.mlops_service.resolve_azure_mlflow_tracking_uri(ml_client))
         training_metadata = {}
         if clean_optional_string(request.model_dir):
             training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
@@ -1303,6 +1370,7 @@ class HostingService:
                 "instance_type": selected_instance_type,
                 "endpoint_auth_mode": "key",
                 "api_url": public_api_url,
+                "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
                 "prediction_api_url": scoring_uri,
                 "triage_enabled": bool(feedback_meta.get("triage_enabled")),
                 "triage_api_url": triage_api_url,
@@ -1313,6 +1381,8 @@ class HostingService:
                 "azure_tenant_id": request.azure_tenant_id,
                 "azure_compute": request.azure_compute,
                 "mlops_url": mlops_url,
+                "azure_endpoint_studio_url": endpoints_studio_url,
+                "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
                 "llmops_url": llmops_url,
                 "created_at": now_utc_iso(),
             }
@@ -1321,6 +1391,7 @@ class HostingService:
             "operation": "hosting",
             "message": "Azure real-time endpoint is ready.",
             "api_url": public_api_url,
+            "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
             "prediction_api_url": scoring_uri,
             "endpoint_name": endpoint_name,
             "endpoint_auth_mode": "key",
@@ -1331,6 +1402,8 @@ class HostingService:
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
+            "azure_endpoint_studio_url": endpoints_studio_url,
+            "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
@@ -1339,6 +1412,7 @@ class HostingService:
                 f"Prediction target: {scoring_uri}\nInstance Type: {selected_instance_type}\n"
                 f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
                 + (f"Triage API: {triage_api_url}\n" if triage_api_url else "")
+                + f"Studio: {endpoints_studio_url}\n"
                 + "Body: {\"errorMessage\": \"...\"}\nResponse: {\"prediction\": \"...\"}\nAuthentication: endpoint keys."
             ),
         }
@@ -1386,7 +1460,9 @@ class HostingService:
             batch_timezone=request.batch_timezone or "UTC",
             emit=lambda msg: ctx.emit("progress", msg),
         )
+        endpoints_studio_url = self.azure_platform_service.build_azure_endpoints_studio_url(request.azure_sub_id, request.azure_tenant_id)
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
+        azure_mlflow_tracking_uri = clean_optional_string(self.mlops_service.resolve_azure_mlflow_tracking_uri(ml_client))
         training_metadata = {}
         if clean_optional_string(request.model_dir):
             training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
@@ -1427,6 +1503,7 @@ class HostingService:
                 "compute_name": clean_optional_string(deployment_meta.get("compute_name")),
                 "endpoint_auth_mode": "aad_token",
                 "api_url": clean_optional_string(deployment_meta.get("api_url")),
+                "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
                 "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
                 "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
                 "feedback_bridge": feedback_meta,
@@ -1434,6 +1511,8 @@ class HostingService:
                 "azure_tenant_id": request.azure_tenant_id,
                 "azure_compute": request.azure_compute,
                 "mlops_url": mlops_url,
+                "azure_endpoint_studio_url": endpoints_studio_url,
+                "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
                 "llmops_url": llmops_url,
                 "created_at": now_utc_iso(),
             }
@@ -1442,6 +1521,7 @@ class HostingService:
             "operation": "hosting",
             "message": "Azure batch endpoint and daily schedule are ready.",
             "api_url": clean_optional_string(deployment_meta.get("api_url")),
+            "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
             "endpoint_name": endpoint_name,
             "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
             "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
@@ -1449,12 +1529,15 @@ class HostingService:
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
+            "azure_endpoint_studio_url": endpoints_studio_url,
+            "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure batch endpoint is ready.\nInvoke: {clean_optional_string(deployment_meta.get('api_url'))}\n"
                 f"Azure Model: {clean_optional_string(request.azure_model_label) or clean_optional_string(request.azure_model_name)}\n"
                 f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
+                f"Studio: {endpoints_studio_url}\n"
                 f"Cluster: {clean_optional_string(deployment_meta.get('compute_name'))} ({clean_optional_string(deployment_meta.get('instance_type'))}, min nodes 0)\n"
                 f"Schedule: every day at {request.batch_hour:02d}:{request.batch_minute:02d} {request.batch_timezone or 'UTC'}\n"
                 f"Input: {request.batch_input_uri}\nOutput: prediction rows are written to Azure Storage when each batch job finishes.\nAuthentication: Microsoft Entra ID."
@@ -1492,7 +1575,9 @@ class HostingService:
             emit=lambda msg: ctx.emit("progress", msg),
         )
         deployment_name = clean_optional_string(deployment_meta.get("deployment_name")) or "default"
+        endpoints_studio_url = self.azure_platform_service.build_azure_endpoints_studio_url(request.azure_sub_id, request.azure_tenant_id)
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
+        azure_mlflow_tracking_uri = clean_optional_string(self.mlops_service.resolve_azure_mlflow_tracking_uri(ml_client))
         training_metadata = {}
         if clean_optional_string(request.model_dir):
             training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
@@ -1527,6 +1612,7 @@ class HostingService:
                 "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
                 "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
                 "api_url": log_api_url,
+                "log_api_url": log_api_url,
                 "function_key": function_key,
                 "function_app_name": clean_optional_string(feedback_meta.get("function_app_name")),
                 "function_host_name": clean_optional_string(feedback_meta.get("function_host_name")),
@@ -1551,6 +1637,8 @@ class HostingService:
                 "azure_tenant_id": request.azure_tenant_id,
                 "azure_compute": request.azure_compute,
                 "mlops_url": mlops_url,
+                "azure_endpoint_studio_url": endpoints_studio_url,
+                "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
                 "llmops_url": llmops_url,
                 "created_at": now_utc_iso(),
             }
@@ -1559,6 +1647,7 @@ class HostingService:
             "operation": "hosting",
             "message": "Azure queued batch pipeline is ready.",
             "api_url": log_api_url,
+            "log_api_url": log_api_url,
             "endpoint_name": batch_endpoint_name,
             "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
             "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
@@ -1566,11 +1655,14 @@ class HostingService:
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
+            "azure_endpoint_studio_url": endpoints_studio_url,
+            "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure queued batch pipeline is ready.\nLog API: {log_api_url}\nFeedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
                 f"Azure Model: {clean_optional_string(request.azure_model_label) or clean_optional_string(request.azure_model_name)}\n"
+                f"Studio: {endpoints_studio_url}\n"
                 f"Queue: {clean_optional_string(feedback_meta.get('service_bus_namespace'))}/{clean_optional_string(feedback_meta.get('service_bus_queue'))}\n"
                 f"Batch Endpoint: {batch_endpoint_name}\nSchedule: every day at {request.batch_hour:02d}:{request.batch_minute:02d} {request.batch_timezone}\n"
                 f"Cluster: {clean_optional_string(deployment_meta.get('compute_name'))} ({clean_optional_string(deployment_meta.get('instance_type'))}, min nodes 0)\n"

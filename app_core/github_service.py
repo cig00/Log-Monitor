@@ -39,31 +39,44 @@ class GitHubService:
         endpoint_auth_mode: str = "",
         service_kind: str = "",
         hosting_mode: str = "",
+        azure_studio_endpoint_url: str = "",
+        copilot_prompt_version_label: str = "",
+        copilot_prompt_version_id: str = "",
     ) -> str:
         clean_repo = clean_optional_string(repo_name)
         clean_branch = clean_optional_string(base_branch)
         clean_endpoint_url = clean_optional_string(endpoint_url)
         clean_endpoint_name = clean_optional_string(endpoint_name)
-        clean_auth_mode = clean_optional_string(endpoint_auth_mode) or "configured by environment"
+        clean_auth_mode = clean_optional_string(endpoint_auth_mode) or "not specified"
         clean_service_kind = clean_optional_string(service_kind) or "hosted endpoint"
         clean_hosting_mode = clean_optional_string(hosting_mode) or "hosting"
+        clean_azure_studio_endpoint_url = clean_optional_string(azure_studio_endpoint_url)
+        clean_prompt_version_label = clean_optional_string(copilot_prompt_version_label)
+        clean_prompt_version_id = clean_optional_string(copilot_prompt_version_id)
         clean_auth_mode_key = clean_auth_mode.lower().replace("-", "_").replace(" ", "_")
-        if clean_auth_mode_key == "key":
+        endpoint_has_embedded_key = "?code=" in clean_endpoint_url.lower() or "&code=" in clean_endpoint_url.lower()
+        if endpoint_has_embedded_key:
             auth_guidance = (
-                "If this key-authenticated endpoint is used directly, read its key from "
-                "`LOG_MONITOR_ENDPOINT_KEY` and use the endpoint's documented key-based authorization. "
-                "If the key is not configured, keep forwarding disabled or fail closed locally instead of "
-                "inventing another token setting."
+                "Use the exact deployed Function URL above as the forwarding target. It already includes the required "
+                "Function access code, so do not split it into a separate key setting and do not ask operators to set "
+                "server environment variables for this endpoint."
+            )
+        elif clean_auth_mode_key == "key":
+            auth_guidance = (
+                "Use the exact deployed endpoint URL above as the committed forwarding target. If this direct "
+                "key-authenticated endpoint cannot be called without a separate key in this repository, implement "
+                "the forwarding code but leave a clear TODO for Log Monitor to provide a Function proxy URL instead "
+                "of asking users to manually edit server environment variables."
             )
         elif clean_auth_mode_key in {"aad", "aad_token", "entra", "entra_id", "managed_identity"}:
             auth_guidance = (
-                "Do not add endpoint key or token settings by default for this identity-authenticated endpoint. "
-                "Use an existing managed identity or app auth pattern only if the target repository already has one."
+                "Use the exact deployed endpoint URL above as the committed forwarding target. For identity-authenticated "
+                "endpoints, use the repository's existing managed identity or app auth pattern if one already exists."
             )
         else:
             auth_guidance = (
-                "Do not add endpoint key or token settings by default. Use endpoint auth only when this "
-                "repository already has the matching secret or config value."
+                "Use the exact deployed endpoint URL above as the committed forwarding target. Do not invent extra "
+                "operator configuration for Log Monitor unless the repository already has a matching app setting pattern."
             )
         return f"""You are GitHub Copilot coding agent working in `{clean_repo}` from base branch `{clean_branch}`.
 
@@ -76,6 +89,8 @@ Endpoint:
 - Hosting mode: {clean_hosting_mode}
 - Service kind: {clean_service_kind}
 - Authentication mode: {clean_auth_mode}
+- Azure ML Studio endpoint page: {clean_azure_studio_endpoint_url or "not provided"}
+- Copilot prompt version: {clean_prompt_version_label or "not archived yet"}{f" ({clean_prompt_version_id})" if clean_prompt_version_id else ""}
 
 Primary requirement:
 Send application logs and error events to the endpoint without degrading user experience. The application must never wait for the endpoint request to complete on the user-facing request/UI path.
@@ -83,9 +98,11 @@ Send application logs and error events to the endpoint without degrading user ex
 Implementation guidance:
 - First inspect the repository to find its language, framework, logging layer, error handlers, and app startup/configuration patterns.
 - Add the smallest idiomatic integration for that stack.
-- Use environment/config values such as `LOG_MONITOR_ENDPOINT_URL` and `LOG_MONITOR_FORWARDING_ENABLED`.
+- Hard-code the deployed Log Monitor endpoint URL above as the default target in the application code/config committed in this PR.
+- Do not require the user to access the server or set environment variables before forwarding can work.
+- Do not create documentation that says the Log Monitor endpoint URL is empty by default or must be filled manually on the server.
+- If the repository already has a normal config file or constants module, place the URL there as the default. Environment variables may be supported only as optional overrides.
 - {auth_guidance}
-- Do not hard-code secrets. Do not commit endpoint keys or tokens.
 - Forward logs asynchronously:
   - enqueue logs and drain them in a background worker, task, thread, queue, or framework-native async mechanism;
   - for browser/frontend apps, prefer `navigator.sendBeacon`, `fetch(..., {{ keepalive: true }})`, or an existing telemetry queue;
@@ -93,13 +110,14 @@ Implementation guidance:
   - swallow/log forwarding failures locally so they never break the app flow.
 - Preserve the existing user experience. No synchronous blocking, modal waits, slow startup path, or visible UI changes unless the repository already exposes telemetry settings.
 - Redact obvious secrets and sensitive values before forwarding logs.
-- Document the new environment variables and how to disable forwarding.
+- Document the committed default endpoint URL location and how to disable forwarding without requiring server environment variable setup.
 - Keep the PR focused on log forwarding only.
 
 Endpoint request contract:
 - If this repository can send plain app logs, send each log as JSON including at least `message`, `level`, `timestamp`, `source`, and optional structured metadata.
 - If the endpoint is a Log Monitor prediction API that expects `{{"errorMessage": "..."}}`, adapt the sender to that request body.
 - Follow the authentication guidance above, and do not block the user path while obtaining or sending endpoint credentials.
+- Include the Azure ML Studio endpoint page in the PR description for traceability, but application code must call the deployed endpoint URL, not the Studio page.
 
 Verification:
 - Run the existing formatter/linter/tests when they are already available and cheap.
@@ -108,11 +126,14 @@ Verification:
 Created by Log Monitor hosting at {now_utc_iso()}.
 """
 
-    def build_log_forwarding_issue_body(self, prompt_text: str, endpoint_url: str) -> str:
+    def build_log_forwarding_issue_body(self, prompt_text: str, endpoint_url: str, azure_studio_endpoint_url: str = "") -> str:
+        clean_studio_url = clean_optional_string(azure_studio_endpoint_url)
+        studio_line = f"Azure ML Studio endpoint page: `{clean_studio_url}`\n\n" if clean_studio_url else ""
         return (
             "Log Monitor created a hosted endpoint and this task asks Copilot coding agent to open a PR "
             "that forwards application logs to it asynchronously.\n\n"
             f"Endpoint URL: `{clean_optional_string(endpoint_url)}`\n\n"
+            f"{studio_line}"
             "Important: the PR must preserve user experience by never waiting for endpoint requests on the "
             "user-facing path.\n\n"
             "```text\n"
@@ -133,6 +154,7 @@ Created by Log Monitor hosting at {now_utc_iso()}.
         hosting_mode: str = "",
         copilot_model: str = "",
         prompt_text: str = "",
+        azure_studio_endpoint_url: str = "",
     ) -> dict[str, Any]:
         clean_token = clean_optional_string(token)
         clean_repo = clean_optional_string(repo_name)
@@ -156,11 +178,12 @@ Created by Log Monitor hosting at {now_utc_iso()}.
                 endpoint_auth_mode=endpoint_auth_mode,
                 service_kind=service_kind,
                 hosting_mode=hosting_mode,
+                azure_studio_endpoint_url=azure_studio_endpoint_url,
             )
         title = "Integrate async Log Monitor log forwarding"
         payload = {
             "title": title,
-            "body": self.build_log_forwarding_issue_body(prompt_text, clean_endpoint_url),
+            "body": self.build_log_forwarding_issue_body(prompt_text, clean_endpoint_url, azure_studio_endpoint_url),
             "assignees": ["copilot-swe-agent[bot]"],
             "agent_assignment": {
                 "target_repo": clean_repo,
@@ -196,6 +219,7 @@ Created by Log Monitor hosting at {now_utc_iso()}.
             "html_url": issue.get("html_url", ""),
             "endpoint_url": clean_endpoint_url,
             "endpoint_name": clean_optional_string(endpoint_name),
+            "azure_studio_endpoint_url": clean_optional_string(azure_studio_endpoint_url),
             "copilot_assignee": "copilot-swe-agent[bot]",
             "copilot_model": clean_optional_string(copilot_model) or "github-default-best-available",
             "prompt_text": prompt_text,

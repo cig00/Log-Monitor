@@ -306,6 +306,97 @@ class MlopsService:
         write_json(str(metadata_path), payload)
         return payload
 
+    def log_copilot_pr_prompt_mlflow(
+        self,
+        *,
+        tracking_uri: str,
+        experiment_name: str,
+        prompt_text: str,
+        prompt_info: dict,
+        metadata: dict | None = None,
+    ) -> dict:
+        payload = {
+            "copilot_prompt_mlflow_status": "skipped",
+            "copilot_prompt_mlflow_run_id": "",
+            "copilot_prompt_tracking_uri": clean_optional_string(tracking_uri),
+            "copilot_prompt_experiment_name": clean_optional_string(experiment_name),
+        }
+        if mlflow is None:
+            payload["copilot_prompt_mlflow_reason"] = "The mlflow package is not available."
+            return payload
+        if not payload["copilot_prompt_tracking_uri"]:
+            payload["copilot_prompt_mlflow_reason"] = "No Azure MLflow tracking URI was available."
+            return payload
+        if not payload["copilot_prompt_experiment_name"]:
+            payload["copilot_prompt_experiment_name"] = "log-monitor-copilot-prompts"
+        metadata = metadata or {}
+        try:
+            mlflow.set_tracking_uri(payload["copilot_prompt_tracking_uri"])
+            mlflow.set_experiment(payload["copilot_prompt_experiment_name"])
+            tags = {
+                "run_type": "copilot_pr_prompt",
+                "created_by": "log-monitor-hosting",
+                "copilot_prompt_version_id": clean_optional_string(prompt_info.get("copilot_prompt_version_id")),
+                "repo_name": clean_optional_string(metadata.get("repo_name")),
+                "base_branch": clean_optional_string(metadata.get("base_branch")),
+                "service_kind": clean_optional_string(metadata.get("service_kind")),
+            }
+            with mlflow.start_run(
+                run_name=f"copilot-pr-prompt-{clean_optional_string(prompt_info.get('copilot_prompt_version_label')) or now_utc_iso()}",
+                tags={key: value for key, value in tags.items() if value},
+            ) as run:
+                payload["copilot_prompt_mlflow_run_id"] = run.info.run_id
+                payload["copilot_prompt_mlflow_status"] = "logged"
+                for key in (
+                    "copilot_prompt_version_id",
+                    "copilot_prompt_version_label",
+                    "previous_copilot_prompt_version_id",
+                    "copilot_prompt_hash",
+                    "copilot_prompt_path",
+                    "copilot_prompt_comparison_path",
+                ):
+                    value = clean_optional_string(prompt_info.get(key))
+                    if value:
+                        mlflow.log_param(key, value)
+                for key in (
+                    "repo_name",
+                    "base_branch",
+                    "endpoint_url",
+                    "endpoint_name",
+                    "azure_studio_endpoint_url",
+                    "github_issue_url",
+                    "service_kind",
+                    "hosting_mode",
+                    "copilot_model",
+                ):
+                    value = clean_optional_string(metadata.get(key))
+                    if value:
+                        mlflow.log_param(key, value)
+                mlflow.log_metric("prompt_chars", int(prompt_info.get("char_count", len(prompt_text)) or 0))
+                mlflow.log_metric("prompt_lines", int(prompt_info.get("line_count", len(prompt_text.splitlines())) or 0))
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    prompt_path = os.path.join(tmp_dir, "copilot_prompt.txt")
+                    with open(prompt_path, "w", encoding="utf-8") as file_obj:
+                        file_obj.write(prompt_text)
+                    metadata_path = os.path.join(tmp_dir, "copilot_prompt_metadata.json")
+                    write_json(
+                        metadata_path,
+                        {
+                            **prompt_info,
+                            "mlflow_metadata": metadata,
+                            "logged_at": now_utc_iso(),
+                        },
+                    )
+                    comparison_source_path = clean_optional_string(prompt_info.get("copilot_prompt_comparison_path"))
+                    if comparison_source_path and os.path.exists(comparison_source_path):
+                        shutil.copy2(comparison_source_path, os.path.join(tmp_dir, "copilot_prompt_comparison.diff"))
+                    mlflow.log_artifacts(tmp_dir, artifact_path="copilot_pr_prompt")
+        except Exception as exc:
+            traceback.print_exc()
+            payload["copilot_prompt_mlflow_status"] = "error"
+            payload["copilot_prompt_mlflow_reason"] = clean_optional_string(exc)
+        return payload
+
     def resolve_azure_mlflow_tracking_uri(self, ml_client: Any | None) -> str:
         if self.azure_tracking_uri:
             return self.azure_tracking_uri

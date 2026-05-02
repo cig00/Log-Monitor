@@ -529,7 +529,10 @@ Important note about GitHub PR automation:
 - the app creates a GitHub issue assigned to `copilot-swe-agent[bot]` using GitHub's Copilot coding-agent API
 - Copilot opens or updates the implementation PR in the background when the repository/account supports Copilot coding agent
 - the Copilot task prompt focuses on non-blocking log forwarding so the target app does not wait for endpoint calls in the user-facing path
-- the generated Copilot task prompt is versioned under `./outputs/copilot_pr_prompts` for LLMOps traceability
+- the Copilot task prompt includes the deployed endpoint URL and the Azure ML Studio endpoint page for traceability
+- when Azure hosting creates a Function bridge, the Copilot task uses the triage/log Function URL first so the committed default URL already contains the Function access code
+- the prompt asks Copilot to commit the deployed endpoint URL as the default target in the app code/config, without requiring server environment variable setup by the user
+- the generated Copilot task prompt is versioned under `./outputs/copilot_pr_prompts` and, when Azure MLflow tracking is available, logged to the `log-monitor-copilot-prompts` experiment in Azure ML Studio
 
 ## Input And Output Data Contracts
 
@@ -810,6 +813,10 @@ Important limitation:
 ## MLOps And LLMOps
 
 Data-prep tracking still depends on MLflow being enabled in the UI, but Azure training metrics are always logged to Azure MLflow.
+
+### Copilot PR Prompt Tracking
+
+When Azure hosting creates a GitHub Copilot PR task, Log Monitor archives the exact prompt under `./outputs/copilot_pr_prompts`. If the Azure workspace exposes an MLflow tracking URI, the same prompt is also logged to Azure ML Studio in the `log-monitor-copilot-prompts` experiment with the prompt version ID, endpoint URL, Azure ML Studio endpoint page, target repo, branch, and GitHub issue URL.
 
 ### Data-Prep Tracking
 

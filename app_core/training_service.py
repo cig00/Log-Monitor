@@ -234,7 +234,7 @@ class TrainingService:
         model_path = os.path.abspath(os.path.join(project_dir, "outputs", "final_model"))
         training_metadata = read_json(os.path.join(project_dir, "outputs", "last_training_mlflow.json")) or {}
         archived_model_dir = clean_optional_string(training_metadata.get("model_version_model_dir"))
-        selected_model_dir = archived_model_dir or model_path
+        selected_model_dir = archived_model_dir if archived_model_dir and os.path.isdir(archived_model_dir) else model_path
         return {
             "operation": "training",
             "message": f"Local {backend} model training completed.",

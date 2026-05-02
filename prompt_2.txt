@@ -17,7 +17,15 @@ Rules:
 4. HTTP request logs are "Noise" unless they include a clear exception or root cause.
 5. SQL transaction statements like "Transaction: insert/update/delete ..." are "Noise".
 6. Lifecycle messages like "Application booted", "Transaction started", "Transaction committed", and "Transaction rolled back" are "SYSTEM".
-7. Return only valid JSON in this exact format:
+7. Specific root-cause examples:
+- Messages like `Required option not passed: "clientId"`, `"clientSecret"`, `"redirectUri"`, `"urlAuthorize"`, `"urlAccessToken"`, `"urlResourceOwnerDetails"`, or `"scopes"` are "CONFIGURATION".
+- Mail/OAuth/provider credential failures such as `invalid_client`, `invalid_grant`, `unauthorized_client`, missing refresh token, or missing MAIL_* values are "CONFIGURATION".
+- Missing Laravel/Filament views, undefined routes, invalid timezone identifiers, undefined variables, undefined properties, parse errors, type errors, and bad method calls are "Error".
+- Database connection refused, queue worker memory limits, allowed memory exhaustion, disk/no-space/permission/read-only filesystem failures are "SYSTEM".
+- Do not classify an exception as "Error" if the root cause is missing/invalid configuration or runtime infrastructure.
+- Do not classify resource/runtime failures as "Noise" even if they look like routine worker output.
+
+8. Return only valid JSON in this exact format:
 {
   "results": [
     {"class": "CONFIGURATION"},

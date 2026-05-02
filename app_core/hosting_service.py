@@ -894,6 +894,10 @@ class HostingService:
 
     def _resolve_feedback_base_dataset_path(self, training_metadata: dict[str, Any]) -> str:
         candidates: list[Path] = []
+        data_version_id = clean_optional_string(training_metadata.get("data_version_id"))
+        if data_version_id:
+            local_data_path = self.project_dir / "outputs" / "data_versions" / data_version_id / "dataset.csv"
+            candidates.append(local_data_path)
         for key in ("data_version_path", "archived_dataset_path", "source_dataset_path"):
             value = clean_optional_string(training_metadata.get(key))
             if value:

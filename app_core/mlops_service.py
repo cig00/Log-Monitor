@@ -116,6 +116,10 @@ class MlopsService:
             for match in matches
         ):
             raise ValueError(f"Prompt version prefix is ambiguous: {prompt_version_id}")
+        version_id = clean_optional_string(matches[-1].get("prompt_version_id"))
+        local_path = self.get_prompt_versions_root() / version_id / "prompt.txt"
+        if local_path.exists():
+            return local_path.read_text(encoding="utf-8")
         prompt_path = clean_optional_string(matches[-1].get("prompt_version_path"))
         if not prompt_path:
             raise FileNotFoundError(f"Prompt version has no prompt artifact path: {prompt_version_id}")
@@ -292,8 +296,12 @@ class MlopsService:
                 payload[clean_optional_string(key)] = value
 
         if previous_version_id:
-            previous_prompt_path = clean_optional_string(previous_version.get("copilot_prompt_path"))
-            previous_prompt = Path(previous_prompt_path).read_text(encoding="utf-8") if previous_prompt_path else ""
+            local_previous_path = root / previous_version_id / "copilot_prompt.txt"
+            if local_previous_path.exists():
+                previous_prompt = local_previous_path.read_text(encoding="utf-8")
+            else:
+                previous_prompt_path = clean_optional_string(previous_version.get("copilot_prompt_path"))
+                previous_prompt = Path(previous_prompt_path).read_text(encoding="utf-8") if previous_prompt_path else ""
             diff_text = self.build_prompt_diff(
                 previous_prompt,
                 prompt_text,
@@ -388,7 +396,11 @@ class MlopsService:
                         },
                     )
                     comparison_source_path = clean_optional_string(prompt_info.get("copilot_prompt_comparison_path"))
-                    if comparison_source_path and os.path.exists(comparison_source_path):
+                    copilot_version_id = clean_optional_string(prompt_info.get("copilot_prompt_version_id"))
+                    local_comparison = self.get_copilot_pr_prompts_root() / copilot_version_id / "comparison_from_previous.diff" if copilot_version_id else None
+                    if local_comparison and local_comparison.exists():
+                        shutil.copy2(str(local_comparison), os.path.join(tmp_dir, "copilot_prompt_comparison.diff"))
+                    elif comparison_source_path and os.path.exists(comparison_source_path):
                         shutil.copy2(comparison_source_path, os.path.join(tmp_dir, "copilot_prompt_comparison.diff"))
                     mlflow.log_artifacts(tmp_dir, artifact_path="copilot_pr_prompt")
         except Exception as exc:
@@ -777,7 +789,11 @@ class MlopsService:
                         local_prompt_metadata_path = os.path.join(tmp_dir, "prompt_metadata.json")
                         write_json(local_prompt_metadata_path, prompt_version_info)
                         comparison_source_path = payload["prompt_comparison_path"]
-                        if comparison_source_path and os.path.exists(comparison_source_path):
+                        prompt_vid = clean_optional_string(payload.get("prompt_version_id"))
+                        local_comparison = self.get_prompt_versions_root() / prompt_vid / "comparison_from_previous.diff" if prompt_vid else None
+                        if local_comparison and local_comparison.exists():
+                            shutil.copy2(str(local_comparison), os.path.join(tmp_dir, "prompt_comparison.diff"))
+                        elif comparison_source_path and os.path.exists(comparison_source_path):
                             shutil.copy2(comparison_source_path, os.path.join(tmp_dir, "prompt_comparison.diff"))
                         sample_path = os.path.join(tmp_dir, "output_sample.csv")
                         dataframe_sample(output_df, max_rows=100, max_cell_chars=200).to_csv(sample_path, index=False)

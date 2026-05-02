@@ -451,6 +451,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_HOSTING_SERVICE_KIND"], "serverless")
         self.assertEqual(captured["settings"]["LOGMONITOR_RETRAIN_ENABLED"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_ENABLED"], "0")
+        self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_MODE"], "sync_prediction")
         self.assertEqual(captured["settings"]["LOGMONITOR_BASE_DATASET_BLOB"], "feedback/base/123/dataset.csv")
         self.assertEqual(captured["uploaded_blob"], "feedback/base/123/dataset.csv")
 
@@ -513,11 +514,44 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(triage_result["triage_api_url"], "https://func.azurewebsites.net/api/triage?code=key")
         self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_ENABLED"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_PREDICTION_ENDPOINT_URL"], "https://score")
+        self.assertEqual(captured["settings"]["LOGMONITOR_PREDICTION_AUTH_MODE"], "key")
         self.assertEqual(captured["settings"]["LOGMONITOR_PREDICTION_KEY"], "prediction-key")
         self.assertEqual(captured["settings"]["LOGMONITOR_CONFIGURATION_EMAIL"], "email1@example.test")
         self.assertEqual(captured["settings"]["LOGMONITOR_SYSTEM_EMAIL"], "email2@example.test")
         self.assertEqual(captured["settings"]["LOGMONITOR_GITHUB_REPO"], "owner/repo")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_PROJECT_KEY"], "OPS")
+
+        batch_triage_request = HostingRequest(
+            model_dir=str(self.project_dir),
+            mode="azure",
+            azure_sub_id="sub",
+            azure_tenant_id="tenant",
+            azure_compute="cpu",
+            azure_instance_type="Standard_D2as_v4",
+            azure_service="queued_batch",
+            github_token="gh-token",
+            github_repo="owner/repo",
+            github_branch="main",
+            triage_enabled=True,
+        )
+        batch_triage_result = self.hosting._deploy_azure_feedback_bridge(
+            ctx=SimpleNamespace(emit=lambda *args, **kwargs: None),
+            credential=object(),
+            ml_client=object(),
+            request=batch_triage_request,
+            service_kind="queued_batch",
+            timestamp=126,
+            training_metadata={"data_version_path": str(dataset_path)},
+            source_endpoint_name="batch-endpoint",
+            source_api_url="https://batch",
+            batch_enabled=True,
+            batch_endpoint_name="batch-endpoint",
+            batch_deployment_name="default",
+        )
+        self.assertEqual(batch_triage_result["triage_api_url"], "https://func.azurewebsites.net/api/triage?code=key")
+        self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_ENABLED"], "1")
+        self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_MODE"], "batch_queue")
+        self.assertEqual(captured["settings"]["LOGMONITOR_PREDICTION_KEY"], "")
 
     def test_hosting_run_blocks_when_gate_fails(self):
         request = HostingRequest(model_dir=str(self.project_dir), mode="local")
@@ -930,6 +964,25 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(service.get_online_endpoint_key(ml_client, "endpoint-a"), "primary-secret")
         self.assertEqual(calls, ["endpoint-a"])
+
+    def test_azure_platform_reads_serverless_endpoint_key(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        calls = []
+
+        class FakeCredentials:
+            def as_dict(self):
+                return {"primaryKey": "serverless-secret"}
+
+        class FakeServerlessEndpoints:
+            def get_keys(self, name):
+                calls.append(name)
+                return FakeCredentials()
+
+        ml_client = SimpleNamespace(serverless_endpoints=FakeServerlessEndpoints())
+
+        self.assertEqual(service.get_serverless_endpoint_key(ml_client, "serverless-a"), "serverless-secret")
+        self.assertEqual(calls, ["serverless-a"])
 
     def test_azure_platform_lists_acs_email_senders(self):
         service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")

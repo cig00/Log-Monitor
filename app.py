@@ -1597,7 +1597,7 @@ class LogProcessorApp:
         azure_service = self.azure_host_service_var.get().strip()
         is_queued_batch = is_azure and azure_service == "queued_batch"
         is_serverless = is_azure and azure_service == "serverless"
-        is_triage_online = is_azure and azure_service == "online"
+        supports_triage = is_azure and azure_service in {"online", "serverless"}
         uses_workspace_model = is_azure and not is_serverless
         if is_serverless:
             self.ensure_azure_serverless_defaults(refresh_endpoint=False)
@@ -1687,7 +1687,7 @@ class LogProcessorApp:
             else:
                 widget.grid_remove()
 
-        if is_triage_online:
+        if supports_triage:
             self.azure_triage_frame.grid()
         else:
             self.azure_triage_frame.grid_remove()
@@ -2043,7 +2043,7 @@ class LogProcessorApp:
                     )
                     return
 
-            triage_enabled = azure_service == "online"
+            triage_enabled = azure_service in {"online", "serverless", "queued_batch"}
             triage_values = {
                 "configuration_email": clean_optional_string(self.configuration_email_var.get()),
                 "system_email": clean_optional_string(self.system_email_var.get()),
@@ -2057,7 +2057,7 @@ class LogProcessorApp:
                 "jira_priority": clean_optional_string(self.jira_priority_var.get()),
                 "jira_labels": clean_optional_string(self.jira_labels_var.get()) or "log-monitor,ml-triage",
             }
-            if triage_enabled:
+            if azure_service in {"online", "serverless"}:
                 required_triage_fields = [
                     ("GitHub PAT", github_token),
                     ("GitHub repository", github_repo),
@@ -2077,7 +2077,7 @@ class LogProcessorApp:
                     self.finish_hosting_action()
                     messagebox.showwarning(
                         "Azure Triage Automation",
-                        "Azure real-time triage needs these values:\n- " + "\n- ".join(missing_triage_fields),
+                        "Azure triage needs these values:\n- " + "\n- ".join(missing_triage_fields),
                     )
                     return
 

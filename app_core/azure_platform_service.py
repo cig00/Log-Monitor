@@ -1672,6 +1672,40 @@ class AzurePlatformService:
             "Confirm the endpoint uses key authentication or fetch credentials from Azure ML Studio."
         )
 
+    def get_serverless_endpoint_key(self, ml_client, endpoint_name: str, emit: Reporter | None = None) -> str:
+        self.ensure_azure_dependencies()
+        clean_endpoint_name = clean_optional_string(endpoint_name)
+        if not clean_endpoint_name:
+            return ""
+        if emit:
+            emit("Fetching Azure serverless endpoint key...")
+        try:
+            credentials = ml_client.serverless_endpoints.get_keys(name=clean_endpoint_name)
+        except TypeError:
+            credentials = ml_client.serverless_endpoints.get_keys(clean_endpoint_name)
+
+        if isinstance(credentials, dict):
+            for key in ("primary_key", "primaryKey", "key1", "primary", "value"):
+                value = clean_optional_string(credentials.get(key))
+                if value:
+                    return value
+        for attr in ("primary_key", "primaryKey", "key1", "primary", "value"):
+            value = clean_optional_string(getattr(credentials, attr, ""))
+            if value:
+                return value
+        as_dict = getattr(credentials, "as_dict", None)
+        if callable(as_dict):
+            payload = as_dict()
+            if isinstance(payload, dict):
+                for key in ("primary_key", "primaryKey", "key1", "primary", "value"):
+                    value = clean_optional_string(payload.get(key))
+                    if value:
+                        return value
+        raise RuntimeError(
+            f"Azure returned no access key for serverless endpoint '{clean_endpoint_name}'. "
+            "Confirm the endpoint uses key authentication or fetch credentials from Azure ML Studio."
+        )
+
     def create_interactive_credential(self, tenant_id: str):
         self.ensure_azure_dependencies()
         return InteractiveBrowserCredential(tenant_id=tenant_id)

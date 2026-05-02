@@ -20,7 +20,6 @@ from urllib.parse import urlparse
 
 import requests
 
-from inference_utils import LABEL_NAMES, load_model_bundle, predict_error_message
 from mlops_utils import clean_optional_string, compute_file_sha256, discover_model_dir, now_utc_iso, read_json, write_json
 
 from .runtime import ArtifactStore, StateStore
@@ -31,6 +30,30 @@ except Exception:
     accuracy_score = None
     confusion_matrix = None
     precision_recall_fscore_support = None
+
+LABEL_NAMES = ["Error", "CONFIGURATION", "SYSTEM", "Noise"]
+
+
+def _load_inference_helpers():
+    try:
+        from inference_utils import load_model_bundle as bundle_loader
+        from inference_utils import predict_error_message as predictor
+    except Exception as exc:
+        raise RuntimeError(
+            "Model inference dependencies could not be loaded. "
+            "Fix the local PyTorch installation before running drift checks or local inference."
+        ) from exc
+    return bundle_loader, predictor
+
+
+def load_model_bundle(model_path: str):
+    bundle_loader, _ = _load_inference_helpers()
+    return bundle_loader(model_path)
+
+
+def predict_error_message(bundle, error_message: str) -> str:
+    _, predictor = _load_inference_helpers()
+    return predictor(bundle, error_message)
 
 
 Reporter = Callable[[str], None]

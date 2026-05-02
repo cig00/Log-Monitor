@@ -2,8 +2,10 @@ import argparse
 import itertools
 import os
 import random
+import re
 import shutil
 import tempfile
+from collections import Counter
 from contextlib import nullcontext
 from typing import Any, Dict, Tuple
 
@@ -18,7 +20,11 @@ from sklearn.metrics import (
     confusion_matrix,
     precision_recall_fscore_support,
 )
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import train_test_split
+try:
+    from sklearn.model_selection import StratifiedGroupKFold
+except ImportError:
+    StratifiedGroupKFold = None
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -196,7 +202,132 @@ def unique_preserve_order(items):
     return ordered
 
 
+def normalize_template_group(text: Any) -> str:
+    cleaned = clean_optional_string(text).casefold()
+    cleaned = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:[ t]\d{2}:\d{2}:\d{2})?\b", "<datetime>", cleaned)
+    cleaned = re.sub(r"\bts=\d+(?:\.\d+)?\b", "ts=<ts>", cleaned)
+    cleaned = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", cleaned)
+    cleaned = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", cleaned)
+    cleaned = re.sub(r"\b\d+ms\b", "<duration>", cleaned)
+    cleaned = re.sub(r"\buser=\d+\b", "user=<user>", cleaned)
+    cleaned = re.sub(r"\bstatus \d{3}\b", "status <status>", cleaned)
+    cleaned = re.sub(r"\b(instance )\d+\b", r"\1<num>", cleaned)
+    cleaned = re.sub(r"\.php:\d+\b", ".php:<line>", cleaned)
+    cleaned = re.sub(r":\d+\b", ":<num>", cleaned)
+    cleaned = re.sub(r"/\d+\b", "/<id>", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or "<empty>"
+
+
+def label_distribution(labels):
+    counts = Counter(labels)
+    return {
+        LABEL_NAMES[label]: int(counts.get(label, 0))
+        for label in range(len(LABEL_NAMES))
+    }
+
+
+def group_distribution(texts):
+    return Counter(normalize_template_group(text) for text in texts)
+
+
+def grouped_split_indices(texts, labels, test_size, random_state, split_name: str):
+    groups = {}
+    for idx, (text, label) in enumerate(zip(texts, labels)):
+        group_key = normalize_template_group(text)
+        group_entry = groups.setdefault(group_key, {"indices": [], "counts": Counter()})
+        group_entry["indices"].append(idx)
+        group_entry["counts"][label] += 1
+
+    if len(groups) < 2:
+        raise ValueError(f"{split_name}: grouped split needs at least two template groups.")
+
+    total_counts = Counter(labels)
+    target_counts = {label: float(count) * float(test_size) for label, count in total_counts.items()}
+    target_total = float(len(labels)) * float(test_size)
+    label_set = sorted(total_counts)
+
+    def split_cost(counts):
+        selected_total = float(sum(counts.values()))
+        total_cost = ((selected_total - target_total) / max(target_total, 1.0)) ** 2
+        class_cost = sum(
+            ((float(counts.get(label, 0)) - target_counts[label]) / max(target_counts[label], 1.0)) ** 2
+            for label in label_set
+        )
+        return total_cost + class_cost
+
+    rng = random.Random(int(random_state))
+    remaining = list(groups.items())
+    rng.shuffle(remaining)
+
+    selected_groups = set()
+    selected_counts = Counter()
+    current_cost = split_cost(selected_counts)
+
+    while remaining:
+        best_position = None
+        best_cost = current_cost
+        best_counts = None
+        for position, (group_key, group_entry) in enumerate(remaining):
+            candidate_counts = selected_counts + group_entry["counts"]
+            candidate_cost = split_cost(candidate_counts)
+            if candidate_cost < best_cost:
+                best_position = position
+                best_cost = candidate_cost
+                best_counts = candidate_counts
+
+        if best_position is None:
+            break
+
+        group_key, _ = remaining.pop(best_position)
+        selected_groups.add(group_key)
+        selected_counts = best_counts or selected_counts
+        current_cost = best_cost
+
+    if not selected_groups or len(selected_groups) == len(groups):
+        raise ValueError(f"{split_name}: grouped split could not produce two non-empty subsets.")
+
+    heldout_indices = []
+    train_indices = []
+    for group_key, group_entry in groups.items():
+        if group_key in selected_groups:
+            heldout_indices.extend(group_entry["indices"])
+        else:
+            train_indices.extend(group_entry["indices"])
+
+    if not train_indices or not heldout_indices:
+        raise ValueError(f"{split_name}: grouped split produced an empty subset.")
+
+    train_group_set = {normalize_template_group(texts[idx]) for idx in train_indices}
+    heldout_group_set = {normalize_template_group(texts[idx]) for idx in heldout_indices}
+    overlap = train_group_set & heldout_group_set
+    if overlap:
+        raise ValueError(f"{split_name}: grouped split leaked {len(overlap)} template group(s).")
+
+    return train_indices, heldout_indices
+
+
 def split_with_optional_stratification(texts, labels, test_size, random_state, split_name: str):
+    try:
+        train_indices, heldout_indices = grouped_split_indices(texts, labels, test_size, random_state, split_name)
+        train_texts = [texts[idx] for idx in train_indices]
+        heldout_texts = [texts[idx] for idx in heldout_indices]
+        train_labels = [labels[idx] for idx in train_indices]
+        heldout_labels = [labels[idx] for idx in heldout_indices]
+        print(
+            f"{split_name}: grouped template split - "
+            f"train_rows={len(train_texts)} heldout_rows={len(heldout_texts)} "
+            f"train_groups={len(group_distribution(train_texts))} "
+            f"heldout_groups={len(group_distribution(heldout_texts))} "
+            f"heldout_labels={label_distribution(heldout_labels)}"
+        )
+        return train_texts, heldout_texts, train_labels, heldout_labels
+    except ValueError as exc:
+        print(
+            f"[WARN] {split_name}: grouped template split failed ({exc}). "
+            "Falling back to label-stratified row split."
+        )
+
     stratify_target = labels if len(set(labels)) > 1 else None
     try:
         return train_test_split(
@@ -326,7 +457,7 @@ def train_with_validation(
         train_loss = total_loss / max(len(train_loader), 1)
         eval_result = evaluate_model(model, val_loader, device)
         val_metrics = eval_result["metrics"]
-        val_score = float(val_metrics["weighted_f1"])
+        val_score = float(val_metrics["macro_f1"])
 
         epoch_entry = {
             "epoch": epoch + 1,
@@ -345,6 +476,7 @@ def train_with_validation(
             f"train_loss: {train_loss:.4f} - "
             f"val_loss: {val_metrics['loss']:.4f} - "
             f"val_accuracy: {val_metrics['accuracy']:.4f} - "
+            f"val_macro_f1: {val_metrics['macro_f1']:.4f} - "
             f"val_weighted_f1: {val_metrics['weighted_f1']:.4f}"
         )
 
@@ -359,6 +491,7 @@ def train_with_validation(
         "Best selection metrics - "
         f"epoch: {best_epoch} - "
         f"accuracy: {best_eval['metrics']['accuracy']:.4f} - "
+        f"macro_f1: {best_eval['metrics']['macro_f1']:.4f} - "
         f"weighted_f1: {best_eval['metrics']['weighted_f1']:.4f} - "
         f"loss: {best_eval['metrics']['loss']:.4f}"
     )
@@ -561,6 +694,11 @@ def main():
         "test_rows": len(test_texts),
         "test_ratio": float(args.test_ratio),
         "val_ratio": float(args.val_ratio),
+        "split_strategy": "grouped_normalized_template_with_stratified_fallback",
+        "dev_label_distribution": label_distribution(dev_labels),
+        "test_label_distribution": label_distribution(test_labels),
+        "dev_template_groups": len(group_distribution(dev_texts)),
+        "test_template_groups": len(group_distribution(test_texts)),
         "train_mode": args.train_mode,
         "cv_folds": int(args.cv_folds),
         "max_trials": int(args.max_trials),
@@ -629,6 +767,7 @@ def main():
     best_selection_metrics = {}
     best_selection_report = {}
     best_selection_confusion = []
+    selection_split_metadata = {}
 
     if args.train_mode in {"default", "tune"}:
         val_ratio_within_dev = args.val_ratio / (1.0 - args.test_ratio)
@@ -641,6 +780,15 @@ def main():
         )
         if len(train_texts) < 1 or len(val_texts) < 1:
             raise ValueError("Train/validation split produced an empty subset; adjust ratios or provide more data.")
+        selection_split_metadata = {
+            "mode": "grouped_normalized_template_holdout",
+            "train_rows": len(train_texts),
+            "validation_rows": len(val_texts),
+            "train_label_distribution": label_distribution(train_labels),
+            "validation_label_distribution": label_distribution(val_labels),
+            "train_template_groups": len(group_distribution(train_texts)),
+            "validation_template_groups": len(group_distribution(val_texts)),
+        }
 
         for trial_index, config in enumerate(candidate_configs, start=1):
             trial_run_ctx = mlflow.start_run(run_name=f"trial-{trial_index}", nested=True) if mlflow_enabled else nullcontext()
@@ -654,13 +802,14 @@ def main():
                     device=device,
                 )
                 trial_metrics = result["best_eval"]["metrics"]
-                trial_score = float(trial_metrics["weighted_f1"])
+                trial_score = float(trial_metrics["macro_f1"])
 
                 summary = {
                     "trial_index": trial_index,
                     "config": config,
                     "best_epoch": int(result["best_epoch"]),
-                    "score_weighted_f1": trial_score,
+                    "score_macro_f1": trial_score,
+                    "score_weighted_f1": float(trial_metrics["weighted_f1"]),
                     "val_metrics": trial_metrics,
                 }
                 trial_summaries.append(summary)
@@ -680,8 +829,13 @@ def main():
                 )
                 safe_mlflow_call(
                     mlflow_enabled,
-                    lambda s=trial_score: mlflow.log_metric("selection_score_weighted_f1", float(s)),
-                    "log trial selection score",
+                    lambda s=trial_score: mlflow.log_metric("selection_score_macro_f1", float(s)),
+                    "log trial macro selection score",
+                )
+                safe_mlflow_call(
+                    mlflow_enabled,
+                    lambda s=trial_metrics["weighted_f1"]: mlflow.log_metric("selection_score_weighted_f1", float(s)),
+                    "log trial weighted selection score",
                 )
                 safe_mlflow_call(
                     mlflow_enabled,
@@ -689,6 +843,12 @@ def main():
                     "log trial best epoch",
                 )
     else:
+        if StratifiedGroupKFold is None:
+            raise RuntimeError(
+                "`tune_cv` requires scikit-learn with StratifiedGroupKFold support. "
+                "Upgrade scikit-learn or use `default`/`tune` mode."
+            )
+
         class_counts = pd.Series(dev_labels).value_counts()
         if int(class_counts.min()) < int(args.cv_folds):
             raise ValueError(
@@ -696,7 +856,22 @@ def main():
                 "Reduce CV folds or provide more labeled data."
             )
 
-        splitter = StratifiedKFold(n_splits=int(args.cv_folds), shuffle=True, random_state=int(args.seed))
+        dev_group_keys = np.array([normalize_template_group(text) for text in dev_texts], dtype=object)
+        unique_dev_groups = set(dev_group_keys.tolist())
+        if len(unique_dev_groups) < int(args.cv_folds):
+            raise ValueError(
+                f"Not enough template groups in dev split for cv_folds={args.cv_folds}. "
+                "Reduce CV folds or provide more varied labeled data."
+            )
+        selection_split_metadata = {
+            "mode": "stratified_group_kfold",
+            "cv_folds": int(args.cv_folds),
+            "dev_rows": len(dev_texts),
+            "dev_label_distribution": label_distribution(dev_labels),
+            "dev_template_groups": len(unique_dev_groups),
+        }
+
+        splitter = StratifiedGroupKFold(n_splits=int(args.cv_folds), shuffle=True, random_state=int(args.seed))
         dev_texts_np = np.array(dev_texts, dtype=object)
         dev_labels_np = np.array(dev_labels, dtype=int)
 
@@ -707,7 +882,10 @@ def main():
                 fold_metrics = []
                 fold_reports = {}
                 fold_confusions = {}
-                for fold_index, (train_idx, val_idx) in enumerate(splitter.split(dev_texts_np, dev_labels_np), start=1):
+                for fold_index, (train_idx, val_idx) in enumerate(
+                    splitter.split(dev_texts_np, dev_labels_np, groups=dev_group_keys),
+                    start=1,
+                ):
                     result = train_with_validation(
                         train_texts=dev_texts_np[train_idx].tolist(),
                         train_labels=dev_labels_np[train_idx].tolist(),
@@ -717,7 +895,7 @@ def main():
                         device=device,
                     )
                     metrics = result["best_eval"]["metrics"]
-                    fold_score = float(metrics["weighted_f1"])
+                    fold_score = float(metrics["macro_f1"])
                     fold_scores.append(fold_score)
                     fold_metrics.append(metrics)
                     fold_reports[f"fold_{fold_index}"] = result["best_eval"]["classification_report"]
@@ -725,7 +903,14 @@ def main():
 
                     safe_mlflow_call(
                         mlflow_enabled,
-                        lambda idx=fold_index, score=fold_score: mlflow.log_metric(f"fold_{idx}_val_weighted_f1", score),
+                        lambda idx=fold_index, score=fold_score: mlflow.log_metric(f"fold_{idx}_val_macro_f1", score),
+                        "log fold macro_f1",
+                    )
+                    safe_mlflow_call(
+                        mlflow_enabled,
+                        lambda idx=fold_index, score=metrics["weighted_f1"]: mlflow.log_metric(
+                            f"fold_{idx}_val_weighted_f1", float(score)
+                        ),
                         "log fold weighted_f1",
                     )
 
@@ -738,9 +923,10 @@ def main():
                 summary = {
                     "trial_index": trial_index,
                     "config": config,
-                    "score_weighted_f1": avg_score,
+                    "score_macro_f1": avg_score,
+                    "score_weighted_f1": float(avg_metrics["weighted_f1"]),
                     "cv_avg_metrics": avg_metrics,
-                    "fold_weighted_f1": fold_scores,
+                    "fold_macro_f1": fold_scores,
                 }
                 trial_summaries.append(summary)
 
@@ -761,8 +947,13 @@ def main():
                 )
                 safe_mlflow_call(
                     mlflow_enabled,
-                    lambda s=avg_score: mlflow.log_metric("selection_score_weighted_f1", float(s)),
-                    "log cv selection score",
+                    lambda s=avg_score: mlflow.log_metric("selection_score_macro_f1", float(s)),
+                    "log cv macro selection score",
+                )
+                safe_mlflow_call(
+                    mlflow_enabled,
+                    lambda s=avg_metrics["weighted_f1"]: mlflow.log_metric("selection_score_weighted_f1", float(s)),
+                    "log cv weighted selection score",
                 )
 
     if best_config is None:
@@ -770,9 +961,12 @@ def main():
 
     selection_summary = {
         "train_mode": args.train_mode,
-        "best_score_weighted_f1": float(best_score),
+        "selection_metric": "macro_f1",
+        "best_score_macro_f1": float(best_score),
+        "best_score_weighted_f1": float(best_selection_metrics.get("weighted_f1", 0.0)),
         "best_config": best_config,
         "best_selection_metrics": best_selection_metrics,
+        "selection_split_metadata": selection_split_metadata,
         "trial_count": len(trial_summaries),
         "trials": trial_summaries,
     }
@@ -807,6 +1001,7 @@ def main():
         f"accuracy: {test_metrics['accuracy']:.4f} - "
         f"weighted_precision: {test_metrics['weighted_precision']:.4f} - "
         f"weighted_recall: {test_metrics['weighted_recall']:.4f} - "
+        f"macro_f1: {test_metrics['macro_f1']:.4f} - "
         f"weighted_f1: {test_metrics['weighted_f1']:.4f} - "
         f"loss: {test_metrics['loss']:.4f}"
     )
@@ -818,8 +1013,13 @@ def main():
     )
     safe_mlflow_call(
         mlflow_enabled,
-        lambda: mlflow.log_metric("selection_best_weighted_f1", float(best_score)),
-        "log best selection score",
+        lambda: mlflow.log_metric("selection_best_macro_f1", float(best_score)),
+        "log best macro selection score",
+    )
+    safe_mlflow_call(
+        mlflow_enabled,
+        lambda: mlflow.log_metric("selection_best_weighted_f1", float(best_selection_metrics.get("weighted_f1", 0.0))),
+        "log best weighted selection score",
     )
     safe_mlflow_call(
         mlflow_enabled,

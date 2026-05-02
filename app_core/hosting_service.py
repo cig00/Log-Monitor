@@ -970,6 +970,7 @@ class HostingService:
         batch_deployment_name: str = "",
         retrain_compute_name: str = "",
         prediction_key: str = "",
+        prediction_auth_mode: str = "key",
     ) -> dict[str, Any]:
         clean_service_kind = clean_optional_string(service_kind) or "azure"
         function_app_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-func-{clean_service_kind}-{timestamp}", max_length=60)
@@ -1022,9 +1023,11 @@ class HostingService:
         retrain_compute = clean_optional_string(retrain_compute_name) or "log-monitor-feedback-cpu"
         batch_timezone_iana = self.azure_platform_service.get_azure_batch_timezone_iana(request.batch_timezone)
         triage_enabled = bool(request.triage_enabled)
+        triage_mode = "batch_queue" if clean_service_kind in {"batch", "queued_batch"} else "sync_prediction"
         prediction_endpoint_key = clean_optional_string(prediction_key)
-        if triage_enabled and not prediction_endpoint_key:
-            raise RuntimeError("Azure real-time triage needs the Azure ML online endpoint key, but no key was available.")
+        clean_prediction_auth_mode = clean_optional_string(prediction_auth_mode) or "key"
+        if triage_enabled and triage_mode == "sync_prediction" and clean_prediction_auth_mode.lower() == "key" and not prediction_endpoint_key:
+            raise RuntimeError("Azure triage needs the Azure ML endpoint key, but no key was available.")
         settings = {
             "AzureWebJobsStorage__accountName": storage_account_name,
             "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
@@ -1056,8 +1059,9 @@ class HostingService:
             "LOGMONITOR_SOURCE_ENDPOINT_NAME": clean_optional_string(source_endpoint_name),
             "LOGMONITOR_SOURCE_ENDPOINT_URL": clean_optional_string(source_api_url),
             "LOGMONITOR_TRIAGE_ENABLED": "1" if triage_enabled else "0",
+            "LOGMONITOR_TRIAGE_MODE": triage_mode,
             "LOGMONITOR_PREDICTION_ENDPOINT_URL": clean_optional_string(source_api_url),
-            "LOGMONITOR_PREDICTION_AUTH_MODE": "key",
+            "LOGMONITOR_PREDICTION_AUTH_MODE": clean_prediction_auth_mode,
             "LOGMONITOR_PREDICTION_KEY": prediction_endpoint_key,
             "LOGMONITOR_CONFIGURATION_EMAIL": clean_optional_string(request.configuration_email),
             "LOGMONITOR_SYSTEM_EMAIL": clean_optional_string(request.system_email),
@@ -1185,6 +1189,14 @@ class HostingService:
             emit=lambda msg: ctx.emit("progress", msg),
         )
         scoring_uri = clean_optional_string(deployment_meta.get("api_url"))
+        deployed_endpoint_name = clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name
+        prediction_endpoint_key = ""
+        if request.triage_enabled:
+            prediction_endpoint_key = self.azure_platform_service.get_serverless_endpoint_key(
+                ml_client,
+                deployed_endpoint_name,
+                emit=lambda msg: ctx.emit("progress", msg),
+            )
         endpoints_studio_url = self.azure_platform_service.build_azure_endpoints_studio_url(request.azure_sub_id, request.azure_tenant_id)
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
         azure_mlflow_tracking_uri = clean_optional_string(self.mlops_service.resolve_azure_mlflow_tracking_uri(ml_client))
@@ -1225,17 +1237,21 @@ class HostingService:
             service_kind="serverless",
             timestamp=timestamp,
             training_metadata=training_metadata,
-            source_endpoint_name=clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+            source_endpoint_name=deployed_endpoint_name,
             source_api_url=scoring_uri,
             batch_enabled=False,
+            prediction_key=prediction_endpoint_key,
+            prediction_auth_mode="key",
         )
+        triage_api_url = clean_optional_string(feedback_meta.get("triage_api_url"))
+        public_api_url = triage_api_url or scoring_uri
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
                 "mode": "azure_serverless",
                 "service_kind": "serverless",
                 "model_dir": clean_optional_string(request.model_dir),
                 "serverless_model_id": model_id,
-                "endpoint_name": clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+                "endpoint_name": deployed_endpoint_name,
                 "endpoint_auth_mode": clean_optional_string(deployment_meta.get("endpoint_auth_mode")) or "key",
                 "provisioning_state": clean_optional_string(deployment_meta.get("provisioning_state")),
                 "creation_method": creation_method,
@@ -1254,8 +1270,11 @@ class HostingService:
                 "serverless_endpoints_studio_url": endpoints_studio_url,
                 "azure_endpoint_studio_url": endpoints_studio_url,
                 "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
-                "api_url": scoring_uri,
+                "api_url": public_api_url,
+                "prediction_api_url": scoring_uri,
                 "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
+                "triage_enabled": bool(feedback_meta.get("triage_enabled")),
+                "triage_api_url": triage_api_url,
                 "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
                 "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
                 "feedback_bridge": feedback_meta,
@@ -1269,9 +1288,12 @@ class HostingService:
         return {
             "operation": "hosting",
             "message": "Azure serverless endpoint is ready.",
-            "api_url": scoring_uri,
+            "api_url": public_api_url,
             "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
-            "endpoint_name": clean_optional_string(deployment_meta.get("endpoint_name")) or endpoint_name,
+            "prediction_api_url": scoring_uri,
+            "endpoint_name": deployed_endpoint_name,
+            "endpoint_auth_mode": clean_optional_string(deployment_meta.get("endpoint_auth_mode")) or "key",
+            "triage_api_url": triage_api_url,
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": endpoints_studio_url or mlops_url,
@@ -1280,9 +1302,11 @@ class HostingService:
             "llmops_url": llmops_url,
             "metadata_path": metadata_path,
             "summary": (
-                f"Azure serverless endpoint is ready.\nTarget URI: {scoring_uri}\n"
+                f"Azure serverless endpoint is ready.\nPOST {public_api_url}\n"
+                f"Prediction target: {scoring_uri}\n"
                 f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
-                f"Model ID: {model_id}\nEndpoint Name: {clean_optional_string(deployment_meta.get('endpoint_name')) or endpoint_name}\n"
+                + (f"Triage API: {triage_api_url}\n" if triage_api_url else "")
+                + f"Model ID: {model_id}\nEndpoint Name: {deployed_endpoint_name}\n"
                 f"Creation: {creation_method}\n"
                 f"{visibility_note}\n"
                 f"Studio: {endpoints_studio_url}\nPortal Resource: {endpoint_portal_url}\n"
@@ -1477,9 +1501,12 @@ class HostingService:
             training_metadata=training_metadata,
             source_endpoint_name=endpoint_name,
             source_api_url=clean_optional_string(deployment_meta.get("api_url")),
-            batch_enabled=False,
+            batch_enabled=True,
+            batch_endpoint_name=endpoint_name,
+            batch_deployment_name=deployment_name,
             retrain_compute_name=clean_optional_string(deployment_meta.get("compute_name")),
         )
+        triage_api_url = clean_optional_string(feedback_meta.get("triage_api_url"))
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
                 "mode": "azure_batch",
@@ -1504,6 +1531,8 @@ class HostingService:
                 "endpoint_auth_mode": "aad_token",
                 "api_url": clean_optional_string(deployment_meta.get("api_url")),
                 "log_api_url": clean_optional_string(feedback_meta.get("log_api_url")),
+                "triage_enabled": bool(feedback_meta.get("triage_enabled")),
+                "triage_api_url": triage_api_url,
                 "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
                 "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
                 "feedback_bridge": feedback_meta,
@@ -1526,6 +1555,7 @@ class HostingService:
             "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
             "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
             "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
+            "triage_api_url": triage_api_url,
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
@@ -1537,6 +1567,8 @@ class HostingService:
                 f"Azure batch endpoint is ready.\nInvoke: {clean_optional_string(deployment_meta.get('api_url'))}\n"
                 f"Azure Model: {clean_optional_string(request.azure_model_label) or clean_optional_string(request.azure_model_name)}\n"
                 f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
+                + (f"Triage API: {triage_api_url}\n" if triage_api_url else "")
+                + f"Log API: {clean_optional_string(feedback_meta.get('log_api_url'))}\n"
                 f"Studio: {endpoints_studio_url}\n"
                 f"Cluster: {clean_optional_string(deployment_meta.get('compute_name'))} ({clean_optional_string(deployment_meta.get('instance_type'))}, min nodes 0)\n"
                 f"Schedule: every day at {request.batch_hour:02d}:{request.batch_minute:02d} {request.batch_timezone or 'UTC'}\n"
@@ -1598,6 +1630,7 @@ class HostingService:
             retrain_compute_name=clean_optional_string(deployment_meta.get("compute_name")),
         )
         log_api_url = clean_optional_string(feedback_meta.get("log_api_url"))
+        triage_api_url = clean_optional_string(feedback_meta.get("triage_api_url"))
         function_key = clean_optional_string(feedback_meta.get("function_key"))
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
@@ -1623,6 +1656,8 @@ class HostingService:
                 "datastore_name": clean_optional_string(feedback_meta.get("datastore_name")),
                 "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
                 "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
+                "triage_enabled": bool(feedback_meta.get("triage_enabled")),
+                "triage_api_url": triage_api_url,
                 "feedback_bridge": feedback_meta,
                 "endpoint_name": batch_endpoint_name,
                 "deployment_name": deployment_name,
@@ -1654,6 +1689,7 @@ class HostingService:
             "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
+            "triage_api_url": triage_api_url,
             "mlops_url": mlops_url,
             "azure_endpoint_studio_url": endpoints_studio_url,
             "azure_mlflow_tracking_uri": azure_mlflow_tracking_uri,
@@ -1661,7 +1697,8 @@ class HostingService:
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure queued batch pipeline is ready.\nLog API: {log_api_url}\nFeedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
-                f"Azure Model: {clean_optional_string(request.azure_model_label) or clean_optional_string(request.azure_model_name)}\n"
+                + (f"Triage API: {triage_api_url}\n" if triage_api_url else "")
+                + f"Azure Model: {clean_optional_string(request.azure_model_label) or clean_optional_string(request.azure_model_name)}\n"
                 f"Studio: {endpoints_studio_url}\n"
                 f"Queue: {clean_optional_string(feedback_meta.get('service_bus_namespace'))}/{clean_optional_string(feedback_meta.get('service_bus_queue'))}\n"
                 f"Batch Endpoint: {batch_endpoint_name}\nSchedule: every day at {request.batch_hour:02d}:{request.batch_minute:02d} {request.batch_timezone}\n"

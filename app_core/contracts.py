@@ -60,6 +60,10 @@ class HostingRequest:
     azure_compute: str = "cpu"
     azure_instance_type: str = ""
     azure_service: str = "queued_batch"
+    azure_model_id: str = ""
+    azure_model_name: str = ""
+    azure_model_version: str = ""
+    azure_model_label: str = ""
     azure_serverless_model_id: str = ""
     azure_serverless_endpoint_name: str = ""
     batch_input_uri: str = ""
@@ -71,7 +75,6 @@ class HostingRequest:
     github_repo: str = ""
     github_branch: str = ""
     triage_enabled: bool = False
-    azure_prediction_key: str = ""
     configuration_email: str = ""
     system_email: str = ""
     acs_connection_string: str = ""

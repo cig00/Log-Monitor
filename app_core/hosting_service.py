@@ -506,6 +506,12 @@ class HostingService:
             pass
 
     def _attach_drift_monitoring_to_result(self, ctx: JobContext, request: HostingRequest, result: dict[str, Any]) -> None:
+        if request.mode == "azure" and not clean_optional_string(request.model_dir):
+            result["drift_monitoring"] = {
+                "status": "skipped",
+                "reason": "Azure hosting used a registered Azure ML model, so no local model directory was available for drift baseline evaluation.",
+            }
+            return
         drift_golden = clean_optional_string(request.drift_golden_path) or "gates/drift_golden.csv"
         drift_policy = clean_optional_string(request.drift_policy_path) or "gates/drift_policy.json"
         deployment_id = clean_optional_string(result.get("endpoint_name")) or clean_optional_string(result.get("api_url"))
@@ -591,12 +597,20 @@ class HostingService:
             pass
 
     def _run(self, ctx: JobContext, request: HostingRequest) -> dict[str, Any]:
-        gate_payload = self._enforce_deployment_gate(ctx, request)
+        gate_payload: dict[str, Any] = {}
+        if request.mode == "azure" and not clean_optional_string(request.model_dir):
+            ctx.emit(
+                "progress",
+                "Skipping local deployment gate because Azure hosting is using a registered Azure ML model.",
+            )
+        else:
+            gate_payload = self._enforce_deployment_gate(ctx, request)
         if request.mode == "azure":
             result = self._run_azure_hosting(ctx, request)
         else:
             result = self._run_local_hosting(ctx, request)
-        self._attach_deployment_gate_to_result(result, gate_payload)
+        if gate_payload:
+            self._attach_deployment_gate_to_result(result, gate_payload)
         self._attach_drift_monitoring_to_result(ctx, request, result)
         if request.create_github_pr:
             self._attach_github_copilot_pr_task(ctx, request, result)
@@ -897,6 +911,7 @@ class HostingService:
         batch_endpoint_name: str = "",
         batch_deployment_name: str = "",
         retrain_compute_name: str = "",
+        prediction_key: str = "",
     ) -> dict[str, Any]:
         clean_service_kind = clean_optional_string(service_kind) or "azure"
         function_app_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-func-{clean_service_kind}-{timestamp}", max_length=60)
@@ -949,6 +964,9 @@ class HostingService:
         retrain_compute = clean_optional_string(retrain_compute_name) or "log-monitor-feedback-cpu"
         batch_timezone_iana = self.azure_platform_service.get_azure_batch_timezone_iana(request.batch_timezone)
         triage_enabled = bool(request.triage_enabled)
+        prediction_endpoint_key = clean_optional_string(prediction_key)
+        if triage_enabled and not prediction_endpoint_key:
+            raise RuntimeError("Azure real-time triage needs the Azure ML online endpoint key, but no key was available.")
         settings = {
             "AzureWebJobsStorage__accountName": storage_account_name,
             "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
@@ -982,7 +1000,7 @@ class HostingService:
             "LOGMONITOR_TRIAGE_ENABLED": "1" if triage_enabled else "0",
             "LOGMONITOR_PREDICTION_ENDPOINT_URL": clean_optional_string(source_api_url),
             "LOGMONITOR_PREDICTION_AUTH_MODE": "key",
-            "LOGMONITOR_PREDICTION_KEY": clean_optional_string(request.azure_prediction_key),
+            "LOGMONITOR_PREDICTION_KEY": prediction_endpoint_key,
             "LOGMONITOR_CONFIGURATION_EMAIL": clean_optional_string(request.configuration_email),
             "LOGMONITOR_SYSTEM_EMAIL": clean_optional_string(request.system_email),
             "LOGMONITOR_ACS_CONNECTION_STRING": clean_optional_string(request.acs_connection_string),
@@ -1219,7 +1237,8 @@ class HostingService:
             credential=credential,
         )
         timestamp = int(time.time())
-        model_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-model-{Path(request.model_dir).name}-{timestamp}")
+        model_hint = clean_optional_string(request.azure_model_name) or clean_optional_string(request.azure_model_id) or Path(clean_optional_string(request.model_dir) or "model").name
+        model_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-model-{model_hint}-{timestamp}")
         endpoint_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-endpoint-{timestamp}")
         deployment_name = "blue"
         env_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-inference-env-{timestamp}")
@@ -1233,12 +1252,24 @@ class HostingService:
             azure_compute=request.azure_compute,
             preferred_instance_type=request.azure_instance_type,
             endpoint_auth_mode="key",
+            azure_model_id=request.azure_model_id,
+            azure_model_name=request.azure_model_name,
+            azure_model_version=request.azure_model_version,
             emit=lambda msg: ctx.emit("progress", msg),
         )
         scoring_uri = clean_optional_string(deployment_meta.get("api_url"))
         selected_instance_type = clean_optional_string(deployment_meta.get("instance_type"))
+        prediction_endpoint_key = ""
+        if request.triage_enabled:
+            prediction_endpoint_key = self.azure_platform_service.get_online_endpoint_key(
+                ml_client,
+                endpoint_name,
+                emit=lambda msg: ctx.emit("progress", msg),
+            )
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
-        training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
+        training_metadata = {}
+        if clean_optional_string(request.model_dir):
+            training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
         ctx.emit("progress", "Deploying feedback API for corrected labels and retraining...")
         feedback_meta = self._deploy_azure_feedback_bridge(
             ctx=ctx,
@@ -1251,6 +1282,7 @@ class HostingService:
             source_endpoint_name=endpoint_name,
             source_api_url=scoring_uri,
             batch_enabled=False,
+            prediction_key=prediction_endpoint_key,
         )
         triage_api_url = clean_optional_string(feedback_meta.get("triage_api_url"))
         public_api_url = triage_api_url or scoring_uri
@@ -1258,7 +1290,11 @@ class HostingService:
             {
                 "mode": "azure",
                 "service_kind": "online",
-                "model_dir": request.model_dir,
+                "model_dir": clean_optional_string(request.model_dir),
+                "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
+                "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
+                "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
+                "azure_model_label": clean_optional_string(request.azure_model_label),
                 "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
                 "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
                 "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
@@ -1288,6 +1324,9 @@ class HostingService:
             "prediction_api_url": scoring_uri,
             "endpoint_name": endpoint_name,
             "endpoint_auth_mode": "key",
+            "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
+            "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
+            "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
             "triage_api_url": triage_api_url,
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
@@ -1296,6 +1335,7 @@ class HostingService:
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure real-time endpoint is ready.\nPOST {public_api_url}\n"
+                f"Azure Model: {clean_optional_string(request.azure_model_label) or clean_optional_string(request.azure_model_name)}\n"
                 f"Prediction target: {scoring_uri}\nInstance Type: {selected_instance_type}\n"
                 f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
                 + (f"Triage API: {triage_api_url}\n" if triage_api_url else "")
@@ -1318,7 +1358,8 @@ class HostingService:
         endpoint_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batch-endpoint-{timestamp}")
         schedule_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batch-schedule-{timestamp}")
         env_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batch-env-{timestamp}")
-        model_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-model-{Path(request.model_dir).name}-{timestamp}")
+        model_hint = clean_optional_string(request.azure_model_name) or clean_optional_string(request.azure_model_id) or Path(clean_optional_string(request.model_dir) or "model").name
+        model_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-model-{model_hint}-{timestamp}")
         deployment_meta = self.azure_platform_service.deploy_azure_batch_endpoint(
             ml_client=ml_client,
             model_dir=request.model_dir,
@@ -1328,6 +1369,9 @@ class HostingService:
             environment_name=env_name,
             model_name=model_name,
             endpoint_auth_mode="aad_token",
+            azure_model_id=request.azure_model_id,
+            azure_model_name=request.azure_model_name,
+            azure_model_version=request.azure_model_version,
             emit=lambda msg: ctx.emit("progress", msg),
         )
         deployment_name = clean_optional_string(deployment_meta.get("deployment_name")) or "default"
@@ -1343,7 +1387,9 @@ class HostingService:
             emit=lambda msg: ctx.emit("progress", msg),
         )
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
-        training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
+        training_metadata = {}
+        if clean_optional_string(request.model_dir):
+            training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
         ctx.emit("progress", "Deploying feedback API for corrected labels and retraining...")
         feedback_meta = self._deploy_azure_feedback_bridge(
             ctx=ctx,
@@ -1362,7 +1408,11 @@ class HostingService:
             {
                 "mode": "azure_batch",
                 "service_kind": "batch",
-                "model_dir": request.model_dir,
+                "model_dir": clean_optional_string(request.model_dir),
+                "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
+                "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
+                "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
+                "azure_model_label": clean_optional_string(request.azure_model_label),
                 "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
                 "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
                 "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
@@ -1393,6 +1443,9 @@ class HostingService:
             "message": "Azure batch endpoint and daily schedule are ready.",
             "api_url": clean_optional_string(deployment_meta.get("api_url")),
             "endpoint_name": endpoint_name,
+            "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
+            "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
+            "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
@@ -1400,6 +1453,7 @@ class HostingService:
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure batch endpoint is ready.\nInvoke: {clean_optional_string(deployment_meta.get('api_url'))}\n"
+                f"Azure Model: {clean_optional_string(request.azure_model_label) or clean_optional_string(request.azure_model_name)}\n"
                 f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
                 f"Cluster: {clean_optional_string(deployment_meta.get('compute_name'))} ({clean_optional_string(deployment_meta.get('instance_type'))}, min nodes 0)\n"
                 f"Schedule: every day at {request.batch_hour:02d}:{request.batch_minute:02d} {request.batch_timezone or 'UTC'}\n"
@@ -1421,7 +1475,8 @@ class HostingService:
         timestamp = int(time.time())
         batch_endpoint_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batch-endpoint-{timestamp}")
         batch_env_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-batch-env-{timestamp}")
-        model_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-model-{Path(request.model_dir).name}-{timestamp}")
+        model_hint = clean_optional_string(request.azure_model_name) or clean_optional_string(request.azure_model_id) or Path(clean_optional_string(request.model_dir) or "model").name
+        model_name = self.azure_platform_service.sanitize_azure_name(f"log-monitor-model-{model_hint}-{timestamp}")
         deployment_meta = self.azure_platform_service.deploy_azure_batch_endpoint(
             ml_client=ml_client,
             model_dir=request.model_dir,
@@ -1431,11 +1486,16 @@ class HostingService:
             environment_name=batch_env_name,
             model_name=model_name,
             endpoint_auth_mode="aad_token",
+            azure_model_id=request.azure_model_id,
+            azure_model_name=request.azure_model_name,
+            azure_model_version=request.azure_model_version,
             emit=lambda msg: ctx.emit("progress", msg),
         )
         deployment_name = clean_optional_string(deployment_meta.get("deployment_name")) or "default"
         mlops_url, llmops_url = self.azure_platform_service.build_azure_dashboard_urls(request.azure_sub_id, request.azure_tenant_id)
-        training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
+        training_metadata = {}
+        if clean_optional_string(request.model_dir):
+            training_metadata = self.model_catalog_service.find_training_metadata_for_model_dir(Path(request.model_dir))
         ctx.emit("progress", "Deploying queued log API and feedback retraining API...")
         feedback_meta = self._deploy_azure_feedback_bridge(
             ctx=ctx,
@@ -1458,7 +1518,11 @@ class HostingService:
             {
                 "mode": "azure_queue_batch",
                 "service_kind": "queued_batch",
-                "model_dir": request.model_dir,
+                "model_dir": clean_optional_string(request.model_dir),
+                "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
+                "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
+                "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
+                "azure_model_label": clean_optional_string(request.azure_model_label),
                 "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
                 "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),
                 "data_version_id": clean_optional_string(training_metadata.get("data_version_id", "")),
@@ -1496,6 +1560,9 @@ class HostingService:
             "message": "Azure queued batch pipeline is ready.",
             "api_url": log_api_url,
             "endpoint_name": batch_endpoint_name,
+            "azure_model_id": clean_optional_string(deployment_meta.get("azure_model_id")) or clean_optional_string(request.azure_model_id),
+            "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
+            "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
@@ -1503,6 +1570,7 @@ class HostingService:
             "metadata_path": metadata_path,
             "summary": (
                 f"Azure queued batch pipeline is ready.\nLog API: {log_api_url}\nFeedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
+                f"Azure Model: {clean_optional_string(request.azure_model_label) or clean_optional_string(request.azure_model_name)}\n"
                 f"Queue: {clean_optional_string(feedback_meta.get('service_bus_namespace'))}/{clean_optional_string(feedback_meta.get('service_bus_queue'))}\n"
                 f"Batch Endpoint: {batch_endpoint_name}\nSchedule: every day at {request.batch_hour:02d}:{request.batch_minute:02d} {request.batch_timezone}\n"
                 f"Cluster: {clean_optional_string(deployment_meta.get('compute_name'))} ({clean_optional_string(deployment_meta.get('instance_type'))}, min nodes 0)\n"

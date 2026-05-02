@@ -325,7 +325,6 @@ class ServiceTests(unittest.TestCase):
             github_repo="owner/repo",
             github_branch="main",
             triage_enabled=True,
-            azure_prediction_key="prediction-key",
             configuration_email="email1@example.test",
             system_email="email2@example.test",
             acs_connection_string="endpoint=https://acs.example/;accesskey=secret",
@@ -349,6 +348,7 @@ class ServiceTests(unittest.TestCase):
             source_endpoint_name="online-endpoint",
             source_api_url="https://score",
             batch_enabled=False,
+            prediction_key="prediction-key",
         )
         self.assertEqual(triage_result["triage_api_url"], "https://func.azurewebsites.net/api/triage?code=key")
         self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_ENABLED"], "1")
@@ -397,6 +397,28 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("Deployment gate: PASS", result["message"])
         self.assertIn("Deployment gate: PASS", result["summary"])
         self.assertEqual(result["gate"]["sample_count"], 4)
+
+    def test_hosting_run_skips_local_gate_for_azure_registered_model(self):
+        request = HostingRequest(
+            model_dir="",
+            mode="azure",
+            azure_service="online",
+            azure_model_name="registered-log-model",
+            azure_model_version="3",
+        )
+        emitted = []
+        ctx = SimpleNamespace(emit=lambda _kind, message: emitted.append(message))
+        with mock.patch.object(self.hosting, "_enforce_deployment_gate") as gate_mock, mock.patch.object(
+            self.hosting,
+            "_run_azure_hosting",
+            return_value={"operation": "hosting", "message": "Azure endpoint is ready.", "summary": "Azure endpoint is ready."},
+        ) as azure_host_mock:
+            result = self.hosting._run(ctx, request)
+
+        gate_mock.assert_not_called()
+        azure_host_mock.assert_called_once()
+        self.assertEqual(result["drift_monitoring"]["status"], "skipped")
+        self.assertTrue(any("Skipping local deployment gate" in message for message in emitted))
 
     def test_enforce_deployment_gate_reuses_cached_pass(self):
         model_dir = self.project_dir / "outputs" / "final_model"
@@ -629,6 +651,336 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(result["operation"], "hosting")
         self.assertIn("drift failed", result.get("drift_monitoring_error", ""))
+
+    def test_azure_platform_lists_workspace_models_for_hosting_picker(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        created_at = "2026-05-01T12:30:00Z"
+        fake_models = [
+            SimpleNamespace(
+                id="azureml:log-model:2",
+                name="log-model",
+                version="2",
+                path="azureml://models/log-model/versions/2",
+                type="custom_model",
+                description="candidate",
+                creation_context=SimpleNamespace(created_at=created_at),
+            ),
+            SimpleNamespace(
+                id="azureml:log-model:2",
+                name="log-model",
+                version="2",
+                path="duplicate",
+                type="custom_model",
+                description="duplicate",
+                creation_context=SimpleNamespace(created_at=created_at),
+            ),
+        ]
+        ml_client = SimpleNamespace(models=SimpleNamespace(list=lambda: fake_models))
+
+        models = service.list_azure_workspace_models(ml_client)
+
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["id"], "azureml:log-model:2")
+        self.assertEqual(models[0]["name"], "log-model")
+        self.assertEqual(models[0]["version"], "2")
+        self.assertIn("log-model:2", models[0]["label"])
+        self.assertIn("2026-05-01 12:30:00", models[0]["label"])
+
+    def test_azure_platform_expands_model_containers_to_versions(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        container = SimpleNamespace(
+            id="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.MachineLearningServices/workspaces/ws/models/log-model",
+            name="log-model",
+            version="",
+            type="custom_model",
+        )
+        versions = [
+            SimpleNamespace(
+                id="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.MachineLearningServices/workspaces/ws/models/log-model/versions/3",
+                name="log-model",
+                version="3",
+                type="custom_model",
+            )
+        ]
+
+        class FakeModels:
+            def list(self, name=None):
+                return versions if name == "log-model" else [container]
+
+        models = service.list_azure_workspace_models(SimpleNamespace(models=FakeModels()))
+
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["name"], "log-model")
+        self.assertEqual(models[0]["version"], "3")
+        self.assertIn("log-model:3", models[0]["label"])
+
+    def test_azure_platform_parses_model_name_version_from_asset_ids(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        self.assertEqual(
+            service.parse_azure_model_name_version_from_id("azureml:log-model:7"),
+            ("log-model", "7"),
+        )
+        self.assertEqual(
+            service.parse_azure_model_name_version_from_id(
+                "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.MachineLearningServices/workspaces/ws/models/log-model/versions/8"
+            ),
+            ("log-model", "8"),
+        )
+        self.assertEqual(
+            service.parse_azure_model_name_version_from_id(
+                "azureml://registries/azureml/models/Phi-4-mini-instruct/versions/12"
+            ),
+            ("Phi-4-mini-instruct", "12"),
+        )
+
+    def test_azure_platform_resolves_model_from_full_asset_id(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        captured = {}
+
+        def fake_get(name, version):
+            captured["name"] = name
+            captured["version"] = version
+            return SimpleNamespace(name=name, version=version)
+
+        ml_client = SimpleNamespace(models=SimpleNamespace(get=fake_get))
+
+        model = service.resolve_azure_model_asset(
+            ml_client,
+            model_id="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.MachineLearningServices/workspaces/ws/models/log-model/versions/9",
+        )
+
+        self.assertEqual(model.name, "log-model")
+        self.assertEqual(model.version, "9")
+        self.assertEqual(captured, {"name": "log-model", "version": "9"})
+
+    def test_azure_platform_reads_online_endpoint_key(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        calls = []
+
+        class FakeOnlineEndpoints:
+            def get_keys(self, name):
+                calls.append(name)
+                return SimpleNamespace(primary_key="primary-secret")
+
+        ml_client = SimpleNamespace(online_endpoints=FakeOnlineEndpoints())
+
+        self.assertEqual(service.get_online_endpoint_key(ml_client, "endpoint-a"), "primary-secret")
+        self.assertEqual(calls, ["endpoint-a"])
+
+    def test_azure_platform_lists_acs_email_senders(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        requested_urls = []
+
+        def fake_management_request(credential, method, url, payload=None, expected_statuses=(200, 201, 202)):
+            requested_urls.append(url)
+            if "/providers/Microsoft.Communication/emailServices?" in url:
+                return {
+                    "value": [
+                        {
+                            "id": "/subscriptions/sub/resourceGroups/email-rg/providers/Microsoft.Communication/EmailServices/email-service",
+                            "name": "email-service",
+                        }
+                    ]
+                }
+            if "/domains?" in url:
+                return {
+                    "value": [
+                        {
+                            "name": "contoso.com",
+                            "properties": {"mailFromSenderDomain": "mail.contoso.com"},
+                        }
+                    ]
+                }
+            if "/senderUsernames?" in url:
+                return {
+                    "value": [
+                        {
+                            "name": "alerts",
+                            "properties": {"username": "alerts", "displayName": "Alerts"},
+                        },
+                        {
+                            "name": "noreply",
+                            "properties": {"username": "noreply"},
+                        },
+                    ]
+                }
+            return {"value": []}
+
+        service.azure_management_json_request = fake_management_request
+
+        senders = service.list_acs_email_senders(credential=object(), sub_id="sub")
+
+        self.assertEqual([sender["address"] for sender in senders], ["alerts@mail.contoso.com", "noreply@mail.contoso.com"])
+        self.assertEqual(senders[0]["display_name"], "Alerts")
+        self.assertEqual(senders[0]["email_service"], "email-service")
+        self.assertTrue(any("/senderUsernames?" in url for url in requested_urls))
+        self.assertTrue(all("api-version=2025-09-01" in url for url in requested_urls))
+
+    def test_azure_platform_creates_default_acs_email_sender_when_missing(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        service.ensure_resource_group = lambda credential, sub_id, resource_group="", location="eastus": resource_group or "rg"
+        calls = []
+
+        def fake_management_request(credential, method, url, payload=None, expected_statuses=(200, 201, 202)):
+            calls.append({"method": method, "url": url, "payload": payload})
+            if method == "GET" and "/emailServices?" in url:
+                return {"value": []}
+            if method == "GET" and "/communicationServices?" in url:
+                return {"value": []}
+            if method == "PUT" and "/emailServices/" in url and "/domains/" not in url:
+                return {
+                    "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Communication/emailServices/log-monitor-email",
+                    "name": "log-monitor-email",
+                }
+            if method == "PUT" and "/domains/AzureManagedDomain" in url and "/senderUsernames/" not in url:
+                return {
+                    "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Communication/emailServices/log-monitor-email/domains/AzureManagedDomain",
+                    "name": "AzureManagedDomain",
+                    "properties": {"mailFromSenderDomain": "abc.azurecomm.net"},
+                }
+            if method == "PUT" and "/senderUsernames/DoNotReply" in url:
+                return {
+                    "name": "DoNotReply",
+                    "properties": {"username": "DoNotReply", "displayName": "Log Monitor"},
+                }
+            if method == "PUT" and "/communicationServices/" in url:
+                return {
+                    "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Communication/communicationServices/log-monitor-acs",
+                    "name": "log-monitor-acs",
+                    "properties": {"linkedDomains": payload["properties"].get("linkedDomains", [])},
+                }
+            return {"value": []}
+
+        service.azure_management_json_request = fake_management_request
+
+        senders = service.list_acs_email_senders(credential=object(), sub_id="sub")
+
+        self.assertEqual(senders[0]["address"], "DoNotReply@abc.azurecomm.net")
+        self.assertTrue(any(call["method"] == "PUT" and "/emailServices/" in call["url"] for call in calls))
+        self.assertTrue(any(call["method"] == "PUT" and "/domains/AzureManagedDomain" in call["url"] for call in calls))
+        self.assertTrue(any(call["method"] == "PUT" and "/senderUsernames/DoNotReply" in call["url"] for call in calls))
+        self.assertTrue(any(call["method"] == "PUT" and "/communicationServices/" in call["url"] for call in calls))
+
+    def test_azure_platform_lists_acs_connection_strings(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        requested = []
+
+        def fake_management_request(credential, method, url, payload=None, expected_statuses=(200, 201, 202)):
+            requested.append((method, url))
+            if "/providers/Microsoft.Communication/communicationServices?" in url:
+                return {
+                    "value": [
+                        {
+                            "id": "/subscriptions/sub/resourceGroups/acs-rg/providers/Microsoft.Communication/communicationServices/acs-service",
+                            "name": "acs-service",
+                            "properties": {"hostName": "acs-service.communication.azure.com"},
+                        }
+                    ]
+                }
+            if "/listKeys?" in url:
+                return {
+                    "primaryConnectionString": "endpoint=https://acs-service.communication.azure.com/;accesskey=primary",
+                    "secondaryKey": "secondary",
+                }
+            return {"value": []}
+
+        service.azure_management_json_request = fake_management_request
+
+        connections = service.list_acs_connection_strings(credential=object(), sub_id="sub")
+
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(connections[0]["label"], "acs-rg/acs-service | Primary")
+        self.assertEqual(connections[0]["connection_string"], "endpoint=https://acs-service.communication.azure.com/;accesskey=primary")
+        self.assertEqual(connections[1]["label"], "acs-rg/acs-service | Secondary")
+        self.assertEqual(connections[1]["connection_string"], "endpoint=https://acs-service.communication.azure.com/;accesskey=secondary")
+        self.assertTrue(any(method == "POST" and "/listKeys?" in url for method, url in requested))
+
+    def test_azure_platform_creates_default_acs_connection_when_missing(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        service.ensure_resource_group = lambda credential, sub_id, resource_group="", location="eastus": resource_group or "rg"
+        calls = []
+
+        def fake_management_request(credential, method, url, payload=None, expected_statuses=(200, 201, 202)):
+            calls.append({"method": method, "url": url, "payload": payload})
+            if method == "GET" and "/communicationServices?" in url:
+                return {"value": []}
+            if method == "PUT" and "/communicationServices/" in url:
+                return {
+                    "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Communication/communicationServices/log-monitor-acs",
+                    "name": "log-monitor-acs",
+                    "properties": {"hostName": "log-monitor-acs.communication.azure.com"},
+                }
+            if method == "POST" and "/listKeys?" in url:
+                return {
+                    "primaryKey": "primary",
+                    "secondaryKey": "secondary",
+                }
+            return {"value": []}
+
+        service.azure_management_json_request = fake_management_request
+
+        connections = service.list_acs_connection_strings(credential=object(), sub_id="sub")
+
+        self.assertEqual(connections[0]["connection_string"], "endpoint=https://log-monitor-acs.communication.azure.com/;accesskey=primary")
+        self.assertTrue(any(call["method"] == "PUT" and "/communicationServices/" in call["url"] for call in calls))
+        self.assertTrue(any(call["method"] == "POST" and "/listKeys?" in call["url"] for call in calls))
+
+    def test_azure_platform_waits_for_acs_provisioning_before_keys(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        service.ensure_resource_group = lambda credential, sub_id, resource_group="", location="eastus": resource_group or "rg"
+        state_checks = {"resource": 0, "keys": 0}
+
+        def fake_management_request(credential, method, url, payload=None, expected_statuses=(200, 201, 202)):
+            if method == "GET" and "/providers/Microsoft.Communication/communicationServices?" in url:
+                return {"value": []}
+            if method == "PUT" and "/communicationServices/" in url:
+                return {
+                    "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Communication/communicationServices/log-monitor-acs",
+                    "name": "log-monitor-acs",
+                    "properties": {
+                        "hostName": "log-monitor-acs.communication.azure.com",
+                        "provisioningState": "Accepted",
+                    },
+                }
+            if method == "GET" and "/communicationServices/log-monitor-acs" in url:
+                state_checks["resource"] += 1
+                state = "Accepted" if state_checks["resource"] == 1 else "Succeeded"
+                return {
+                    "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Communication/communicationServices/log-monitor-acs",
+                    "name": "log-monitor-acs",
+                    "properties": {
+                        "hostName": "log-monitor-acs.communication.azure.com",
+                        "provisioningState": state,
+                    },
+                }
+            if method == "POST" and "/listKeys?" in url:
+                state_checks["keys"] += 1
+                if state_checks["keys"] == 1:
+                    raise RuntimeError(
+                        "Azure management request failed (409 Conflict).\n\n"
+                        "{'error': {'code': 'InvalidResourceOperation', 'message': "
+                        "\"The operation for resource is invalid as it is being provisioned with state: 'Accepted'.\"}}"
+                    )
+                return {"primaryKey": "primary"}
+            return {"value": []}
+
+        service.azure_management_json_request = fake_management_request
+
+        with mock.patch("app_core.azure_platform_service.time.sleep", lambda _seconds: None):
+            connections = service.list_acs_connection_strings(credential=object(), sub_id="sub")
+
+        self.assertEqual(connections[0]["connection_string"], "endpoint=https://log-monitor-acs.communication.azure.com/;accesskey=primary")
+        self.assertEqual(state_checks["resource"], 2)
+        self.assertEqual(state_checks["keys"], 2)
 
     def test_azure_platform_deploys_serverless_endpoint_from_catalog_model_id(self):
         service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")

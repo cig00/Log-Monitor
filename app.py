@@ -117,6 +117,10 @@ class LogProcessorApp:
         self.current_repo_job_id = ""
         self.current_branch_job_id = ""
         self.current_prompt_test_job_id = ""
+        self.current_azure_models_job_id = ""
+        self.current_acs_senders_job_id = ""
+        self.current_acs_connections_job_id = ""
+        self.current_azure_resources_job_id = ""
         self.training_state_lock = threading.Lock()
         self.training_active = False
         self.training_config_visible = False
@@ -125,6 +129,8 @@ class LogProcessorApp:
         self.hosting_process = None
         self.prometheus_process = None
         self.grafana_process = None
+        self.azure_cached_credential = None
+        self.azure_cached_credential_tenant_id = ""
         self.hosting_mode_var = tk.StringVar(value="local")
         default_model_dir = Path(self.project_dir) / "outputs" / "final_model"
         default_gate_golden = Path(self.project_dir) / "gates" / "deployment_golden.csv"
@@ -138,6 +144,8 @@ class LogProcessorApp:
         self.host_drift_policy_path_var = tk.StringVar(value=str(default_drift_policy))
         self.hosted_model_inventory = []
         self.available_model_choice_var = tk.StringVar(value="")
+        self.azure_model_inventory = []
+        self.azure_model_choice_var = tk.StringVar(value="")
         self.hosting_api_url_var = tk.StringVar(value="")
         self.feedback_api_url_var = tk.StringVar(value="")
         self.feedback_status_url_var = tk.StringVar(value="")
@@ -166,11 +174,13 @@ class LogProcessorApp:
         self.azure_hosted_endpoint_name_var = tk.StringVar(value="")
         self.create_pr_var = tk.BooleanVar(value=False)
         self.github_pr_url_var = tk.StringVar(value="")
-        self.azure_prediction_key_var = tk.StringVar(value="")
         self.configuration_email_var = tk.StringVar(value="")
         self.system_email_var = tk.StringVar(value="")
         self.acs_connection_string_var = tk.StringVar(value="")
+        self.acs_connection_choice_var = tk.StringVar(value="")
         self.acs_sender_address_var = tk.StringVar(value="")
+        self.acs_connection_inventory = []
+        self.acs_sender_inventory = []
         self.jira_site_url_var = tk.StringVar(value="")
         self.jira_account_email_var = tk.StringVar(value="")
         self.jira_api_token_var = tk.StringVar(value="")
@@ -515,13 +525,15 @@ class LogProcessorApp:
         self.branch_combo = ttk.Combobox(hosting_frame, state="readonly", width=15)
         self.branch_combo.grid(row=1, column=3, sticky="ew", padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Generated Model:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self.hosted_model_label = ttk.Label(hosting_frame, text="Generated Model:")
+        self.hosted_model_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
         self.hosted_model_entry = ttk.Entry(hosting_frame, textvariable=self.hosted_model_path_var, width=30)
         self.hosted_model_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.hosted_model_browse_btn = ttk.Button(hosting_frame, text="Browse", command=self.browse_hosted_model)
         self.hosted_model_browse_btn.grid(row=2, column=3, padx=5, pady=5)
 
-        ttk.Label(hosting_frame, text="Available Models:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        self.available_models_label = ttk.Label(hosting_frame, text="Available Models:")
+        self.available_models_label.grid(row=3, column=0, sticky="w", padx=5, pady=5)
         self.available_models_combo = ttk.Combobox(
             hosting_frame,
             textvariable=self.available_model_choice_var,
@@ -536,6 +548,23 @@ class LogProcessorApp:
             command=self.refresh_hosted_model_inventory,
         )
         self.refresh_models_btn.grid(row=3, column=3, padx=5, pady=5)
+
+        self.azure_model_label = ttk.Label(hosting_frame, text="Azure Model:")
+        self.azure_model_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self.azure_model_combo = ttk.Combobox(
+            hosting_frame,
+            textvariable=self.azure_model_choice_var,
+            state="readonly",
+            width=30,
+        )
+        self.azure_model_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.azure_model_combo.bind("<<ComboboxSelected>>", self.on_azure_model_selected)
+        self.load_azure_models_btn = ttk.Button(
+            hosting_frame,
+            text="Load Azure Resources",
+            command=self.start_azure_resources_thread,
+        )
+        self.load_azure_models_btn.grid(row=2, column=3, padx=5, pady=5)
 
         ttk.Label(hosting_frame, text="Host Target:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
         self.host_local_radio = ttk.Radiobutton(
@@ -668,7 +697,7 @@ class LogProcessorApp:
             hosting_frame,
             text=(
                 "Serverless hosting uses an auto-filled Azure ML catalog model ID and endpoint name. "
-                "You can edit either field; the selected local model is only used for gate evaluation and is not uploaded."
+                "You can edit either field; no generated local model is uploaded."
             ),
             wraplength=460,
             justify="left",
@@ -680,33 +709,40 @@ class LogProcessorApp:
         self.azure_triage_frame.columnconfigure(1, weight=1)
         self.azure_triage_frame.columnconfigure(3, weight=1)
 
-        ttk.Label(self.azure_triage_frame, text="Endpoint Key:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        self.azure_prediction_key_entry = ttk.Entry(
-            self.azure_triage_frame,
-            textvariable=self.azure_prediction_key_var,
-            show="*",
-        )
-        self.azure_prediction_key_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-
-        ttk.Label(self.azure_triage_frame, text="Configuration Email:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
+        ttk.Label(self.azure_triage_frame, text="Configuration Email:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.configuration_email_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.configuration_email_var)
-        self.configuration_email_entry.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
+        self.configuration_email_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
 
-        ttk.Label(self.azure_triage_frame, text="System Email:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(self.azure_triage_frame, text="System Email:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
         self.system_email_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.system_email_var)
-        self.system_email_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        self.system_email_entry.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
 
-        ttk.Label(self.azure_triage_frame, text="ACS Sender:").grid(row=1, column=2, sticky="w", padx=4, pady=4)
-        self.acs_sender_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.acs_sender_address_var)
-        self.acs_sender_entry.grid(row=1, column=3, sticky="ew", padx=4, pady=4)
+        ttk.Label(self.azure_triage_frame, text="ACS Sender:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        self.acs_sender_entry = ttk.Combobox(
+            self.azure_triage_frame,
+            textvariable=self.acs_sender_address_var,
+            values=[],
+        )
+        self.acs_sender_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        self.load_acs_senders_btn = ttk.Button(
+            self.azure_triage_frame,
+            text="Load ACS Senders",
+            command=self.start_acs_senders_thread,
+        )
 
         ttk.Label(self.azure_triage_frame, text="ACS Connection:").grid(row=2, column=0, sticky="w", padx=4, pady=4)
-        self.acs_connection_entry = ttk.Entry(
+        self.acs_connection_entry = ttk.Combobox(
             self.azure_triage_frame,
-            textvariable=self.acs_connection_string_var,
-            show="*",
+            textvariable=self.acs_connection_choice_var,
+            values=[],
         )
         self.acs_connection_entry.grid(row=2, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        self.acs_connection_entry.bind("<<ComboboxSelected>>", self.on_acs_connection_selected)
+        self.load_acs_connections_btn = ttk.Button(
+            self.azure_triage_frame,
+            text="Load ACS Connections",
+            command=self.start_acs_connections_thread,
+        )
 
         ttk.Label(self.azure_triage_frame, text="Jira Site URL:").grid(row=3, column=0, sticky="w", padx=4, pady=4)
         self.jira_site_url_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.jira_site_url_var)
@@ -988,6 +1024,14 @@ class LogProcessorApp:
             self._handle_branch_event(event)
         elif event.job_id == self.current_prompt_test_job_id:
             self._handle_prompt_test_event(event)
+        elif event.job_id == self.current_azure_resources_job_id:
+            self._handle_azure_resources_event(event)
+        elif event.job_id == self.current_azure_models_job_id:
+            self._handle_azure_models_event(event)
+        elif event.job_id == self.current_acs_senders_job_id:
+            self._handle_acs_senders_event(event)
+        elif event.job_id == self.current_acs_connections_job_id:
+            self._handle_acs_connections_event(event)
 
     def _handle_data_prep_event(self, event):
         if event.status not in {"succeeded", "failed", "canceled"}:
@@ -1078,6 +1122,68 @@ class LogProcessorApp:
             return
         self.show_error(event.payload.get("message", "Failed to load branches."))
 
+    def _handle_azure_models_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_azure_models_job_id = ""
+        self.load_azure_models_btn.config(state="normal")
+        if event.status == "succeeded":
+            self.refresh_azure_model_choices(event.payload.get("models", []))
+            message = clean_optional_string(event.payload.get("message")) or "Azure models loaded."
+            self.status_var.set(message)
+            return
+        if event.status == "canceled":
+            self.status_var.set("Azure model load canceled.")
+            return
+        self.show_error(event.payload.get("message", "Failed to load Azure models."))
+
+    def _handle_azure_resources_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_azure_resources_job_id = ""
+        self.load_azure_models_btn.config(state="normal")
+        if event.status == "succeeded":
+            self.refresh_azure_model_choices(event.payload.get("models", []))
+            self.refresh_acs_sender_choices(event.payload.get("senders", []))
+            self.refresh_acs_connection_choices(event.payload.get("connections", []))
+            message = clean_optional_string(event.payload.get("message")) or "Azure resources loaded."
+            self.status_var.set(message)
+            return
+        if event.status == "canceled":
+            self.status_var.set("Azure resource load canceled.")
+            return
+        self.show_error(event.payload.get("message", "Failed to load Azure resources."))
+
+    def _handle_acs_senders_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_acs_senders_job_id = ""
+        self.load_acs_senders_btn.config(state="normal")
+        if event.status == "succeeded":
+            self.refresh_acs_sender_choices(event.payload.get("senders", []))
+            message = clean_optional_string(event.payload.get("message")) or "ACS senders loaded."
+            self.status_var.set(message)
+            return
+        if event.status == "canceled":
+            self.status_var.set("ACS sender load canceled.")
+            return
+        self.show_error(event.payload.get("message", "Failed to load ACS senders."))
+
+    def _handle_acs_connections_event(self, event):
+        if event.status not in {"succeeded", "failed", "canceled"}:
+            return
+        self.current_acs_connections_job_id = ""
+        self.load_acs_connections_btn.config(state="normal")
+        if event.status == "succeeded":
+            self.refresh_acs_connection_choices(event.payload.get("connections", []))
+            message = clean_optional_string(event.payload.get("message")) or "ACS connections loaded."
+            self.status_var.set(message)
+            return
+        if event.status == "canceled":
+            self.status_var.set("ACS connection load canceled.")
+            return
+        self.show_error(event.payload.get("message", "Failed to load ACS connections."))
+
     def _handle_prompt_test_event(self, event):
         if event.status not in {"succeeded", "failed", "canceled"}:
             return
@@ -1139,6 +1245,168 @@ class LogProcessorApp:
         if branch_names:
             self.branch_combo.set(branch_names[0])
         self.status_var.set("Branches loaded.")
+
+    def get_cached_azure_credential(self, tenant_id: str):
+        clean_tenant_id = clean_optional_string(tenant_id)
+        if self.azure_cached_credential is None or self.azure_cached_credential_tenant_id != clean_tenant_id:
+            self.azure_cached_credential = self.azure_platform_service.create_interactive_credential(clean_tenant_id)
+            self.azure_cached_credential_tenant_id = clean_tenant_id
+        return self.azure_cached_credential
+
+    def get_azure_host_identity_fields(self, title: str) -> tuple[str, str] | None:
+        sub_id = clean_optional_string(self.azure_host_sub_var.get()) or clean_optional_string(self.azure_sub_entry.get())
+        tenant_id = clean_optional_string(self.azure_host_tenant_var.get()) or clean_optional_string(self.azure_tenant_entry.get())
+        self.azure_host_sub_var.set(sub_id)
+        self.azure_host_tenant_var.set(tenant_id)
+        if not sub_id:
+            messagebox.showwarning(title, "Please provide your Azure Subscription ID.")
+            return None
+        if not tenant_id:
+            messagebox.showwarning(title, "Please provide your Azure Tenant ID.")
+            return None
+        return sub_id, tenant_id
+
+    def start_azure_resources_thread(self):
+        if self.current_azure_resources_job_id:
+            messagebox.showwarning("Azure Resources", "Azure resource loading is already running.")
+            return
+        if not AZURE_AVAILABLE:
+            messagebox.showerror("Azure Dependencies Missing", "Azure SDK dependencies are not installed in this Python environment.")
+            return
+        identity = self.get_azure_host_identity_fields("Azure Resources")
+        if identity is None:
+            return
+        sub_id, tenant_id = identity
+
+        self.status_var.set("Loading Azure resources...")
+        self.load_azure_models_btn.config(state="disabled")
+        credential = self.get_cached_azure_credential(tenant_id)
+
+        def load_resources(ctx):
+            ml_client = self.azure_platform_service.ensure_azure_workspace(
+                sub_id,
+                tenant_id,
+                emit=lambda msg: ctx.emit("progress", msg),
+                credential=credential,
+            )
+            models = self.azure_platform_service.list_azure_workspace_models(ml_client)
+            senders = self.azure_platform_service.list_acs_email_senders(
+                credential=credential,
+                sub_id=sub_id,
+                emit=lambda msg: ctx.emit("progress", msg),
+            )
+            connections = self.azure_platform_service.list_acs_connection_strings(
+                credential=credential,
+                sub_id=sub_id,
+                emit=lambda msg: ctx.emit("progress", msg),
+            )
+            return {
+                "models": models,
+                "senders": senders,
+                "connections": connections,
+                "message": (
+                    f"Loaded {len(models)} Azure ML model version(s), "
+                    f"{len(senders)} ACS sender address(es), and "
+                    f"{len(connections)} ACS connection option(s)."
+                ),
+            }
+
+        job = self.job_manager.submit(
+            "azure_load_hosting_resources",
+            load_resources,
+            metadata={"operation": "azure_load_hosting_resources", "azure_subscription_id": sub_id},
+        )
+        self.current_azure_resources_job_id = job.job_id
+
+    def start_azure_models_thread(self):
+        self.start_azure_resources_thread()
+
+    def refresh_azure_model_choices(self, models: list[dict[str, Any]]):
+        self.azure_model_inventory = models
+        values = [clean_optional_string(model.get("label")) for model in models]
+        self.azure_model_combo["values"] = values
+        if values:
+            self.azure_model_combo.current(0)
+            self.on_azure_model_selected()
+        else:
+            self.azure_model_choice_var.set("")
+
+    def on_azure_model_selected(self, event=None):
+        current_index = self.azure_model_combo.current()
+        if current_index < 0 or current_index >= len(self.azure_model_inventory):
+            return
+        selected_entry = self.azure_model_inventory[current_index]
+        label = clean_optional_string(selected_entry.get("label"))
+        if label:
+            self.azure_model_choice_var.set(label)
+
+    def get_selected_azure_model_from_ui(self) -> dict[str, Any]:
+        current_index = self.azure_model_combo.current()
+        if 0 <= current_index < len(self.azure_model_inventory):
+            return self.azure_model_inventory[current_index]
+        current_label = clean_optional_string(self.azure_model_choice_var.get())
+        if current_label:
+            for model in self.azure_model_inventory:
+                if current_label == clean_optional_string(model.get("label")):
+                    return model
+        return {}
+
+    def start_acs_senders_thread(self):
+        self.start_azure_resources_thread()
+
+    def refresh_acs_sender_choices(self, senders: list[dict[str, Any]]):
+        self.acs_sender_inventory = senders
+        values = [clean_optional_string(sender.get("address")) for sender in senders if clean_optional_string(sender.get("address"))]
+        self.acs_sender_entry["values"] = values
+        current_sender = clean_optional_string(self.acs_sender_address_var.get())
+        if current_sender and current_sender in values:
+            self.acs_sender_address_var.set(current_sender)
+        elif values:
+            self.acs_sender_address_var.set(values[0])
+        else:
+            self.acs_sender_address_var.set("")
+
+    def start_acs_connections_thread(self):
+        self.start_azure_resources_thread()
+
+    def refresh_acs_connection_choices(self, connections: list[dict[str, Any]]):
+        self.acs_connection_inventory = connections
+        values = [clean_optional_string(connection.get("label")) for connection in connections if clean_optional_string(connection.get("label"))]
+        self.acs_connection_entry["values"] = values
+        current_connection = clean_optional_string(self.acs_connection_string_var.get())
+        selected_index = -1
+        if current_connection:
+            for index, connection in enumerate(connections):
+                if clean_optional_string(connection.get("connection_string")) == current_connection:
+                    selected_index = index
+                    break
+        if selected_index >= 0:
+            self.acs_connection_entry.current(selected_index)
+            self.on_acs_connection_selected()
+        elif values:
+            self.acs_connection_entry.current(0)
+            self.on_acs_connection_selected()
+        else:
+            self.acs_connection_choice_var.set("")
+            self.acs_connection_string_var.set("")
+
+    def on_acs_connection_selected(self, event=None):
+        current_index = self.acs_connection_entry.current()
+        if current_index < 0 or current_index >= len(self.acs_connection_inventory):
+            return
+        selected_entry = self.acs_connection_inventory[current_index]
+        connection_string = clean_optional_string(selected_entry.get("connection_string"))
+        if connection_string:
+            self.acs_connection_string_var.set(connection_string)
+
+    def get_acs_connection_string_from_ui(self) -> str:
+        current_index = self.acs_connection_entry.current()
+        current_label = clean_optional_string(self.acs_connection_choice_var.get())
+        if 0 <= current_index < len(self.acs_connection_inventory):
+            selected_entry = self.acs_connection_inventory[current_index]
+            if current_label == clean_optional_string(selected_entry.get("label")):
+                return clean_optional_string(selected_entry.get("connection_string"))
+        return current_label
 
     # --- Hosting Methods ---
     def browse_hosted_model(self):
@@ -1330,9 +1598,37 @@ class LogProcessorApp:
         is_queued_batch = is_azure and azure_service == "queued_batch"
         is_serverless = is_azure and azure_service == "serverless"
         is_triage_online = is_azure and azure_service == "online"
+        uses_workspace_model = is_azure and not is_serverless
         if is_serverless:
             self.ensure_azure_serverless_defaults(refresh_endpoint=False)
         show_batch_schedule = is_queued_batch
+        local_model_widgets = [
+            self.hosted_model_label,
+            self.hosted_model_entry,
+            self.hosted_model_browse_btn,
+            self.available_models_label,
+            self.available_models_combo,
+            self.refresh_models_btn,
+        ]
+        azure_model_widgets = [
+            self.azure_model_label,
+            self.azure_model_combo,
+            self.load_azure_models_btn,
+        ]
+        gate_drift_widgets = [
+            self.gate_golden_label,
+            self.gate_golden_entry,
+            self.gate_golden_browse_btn,
+            self.gate_policy_label,
+            self.gate_policy_entry,
+            self.gate_policy_browse_btn,
+            self.drift_golden_label,
+            self.drift_golden_entry,
+            self.drift_golden_browse_btn,
+            self.drift_policy_label,
+            self.drift_policy_entry,
+            self.drift_policy_browse_btn,
+        ]
         azure_widgets = [
             self.azure_host_service_label,
             self.azure_host_online_radio,
@@ -1349,6 +1645,21 @@ class LogProcessorApp:
             self.azure_host_instance_label,
             self.azure_host_instance_combo,
         ]
+        for widget in local_model_widgets:
+            if is_azure:
+                widget.grid_remove()
+            else:
+                widget.grid()
+        for widget in azure_model_widgets:
+            if uses_workspace_model:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        for widget in gate_drift_widgets:
+            if is_azure:
+                widget.grid_remove()
+            else:
+                widget.grid()
         for widget in azure_widgets:
             if is_azure:
                 widget.grid()
@@ -1509,22 +1820,17 @@ class LogProcessorApp:
     def start_hosting_thread(self):
         hosting_mode = self.hosting_mode_var.get().strip() or "local"
         azure_service = clean_optional_string(self.azure_host_service_var.get()) or "queued_batch"
+        is_azure_hosting = hosting_mode == "azure"
         model_path = clean_optional_string(self.hosted_model_path_var.get())
         gate_golden_path = clean_optional_string(self.host_gate_golden_path_var.get())
         gate_policy_path = clean_optional_string(self.host_gate_policy_path_var.get())
         drift_golden_path = clean_optional_string(self.host_drift_golden_path_var.get())
         drift_policy_path = clean_optional_string(self.host_drift_policy_path_var.get())
         resolved_model_dir = ""
-        if not model_path:
-            messagebox.showwarning("Hosting", "Please select the generated model directory first.")
-            return
-
-        if model_path:
-            try:
-                resolved_model_dir = discover_model_dir(model_path)
-            except Exception as exc:
-                messagebox.showerror("Hosting", f"Could not locate a saved model in that path.\n\n{exc}")
-                return
+        resolved_gate_golden_path = ""
+        resolved_gate_policy_path = ""
+        resolved_drift_golden_path = ""
+        resolved_drift_policy_path = ""
 
         def resolve_gate_path(raw_path: str) -> Path:
             path = Path(raw_path).expanduser()
@@ -1532,44 +1838,58 @@ class LogProcessorApp:
                 return (Path(self.project_dir) / path).resolve()
             return path.resolve()
 
-        if not gate_golden_path:
-            messagebox.showwarning("Hosting", "Please select the deployment gate golden set CSV.")
-            return
-        if not gate_policy_path:
-            messagebox.showwarning("Hosting", "Please select the deployment gate policy JSON.")
-            return
-        if not drift_golden_path:
-            messagebox.showwarning("Hosting", "Please select the drift golden set CSV.")
-            return
-        if not drift_policy_path:
-            messagebox.showwarning("Hosting", "Please select the drift policy JSON.")
-            return
+        if not is_azure_hosting:
+            if not model_path:
+                messagebox.showwarning("Hosting", "Please select the generated model directory first.")
+                return
 
-        resolved_gate_golden_path = resolve_gate_path(gate_golden_path)
-        resolved_gate_policy_path = resolve_gate_path(gate_policy_path)
-        resolved_drift_golden_path = resolve_gate_path(drift_golden_path)
-        resolved_drift_policy_path = resolve_gate_path(drift_policy_path)
-        if not resolved_gate_golden_path.exists() or not resolved_gate_golden_path.is_file():
-            messagebox.showerror("Hosting", f"Deployment gate golden set file not found.\n\n{resolved_gate_golden_path}")
-            return
-        if not resolved_gate_policy_path.exists() or not resolved_gate_policy_path.is_file():
-            messagebox.showerror("Hosting", f"Deployment gate policy file not found.\n\n{resolved_gate_policy_path}")
-            return
-        if not resolved_drift_golden_path.exists() or not resolved_drift_golden_path.is_file():
-            messagebox.showerror("Hosting", f"Drift golden set file not found.\n\n{resolved_drift_golden_path}")
-            return
-        if not resolved_drift_policy_path.exists() or not resolved_drift_policy_path.is_file():
-            messagebox.showerror("Hosting", f"Drift policy file not found.\n\n{resolved_drift_policy_path}")
-            return
+            try:
+                resolved_model_dir = discover_model_dir(model_path)
+            except Exception as exc:
+                messagebox.showerror("Hosting", f"Could not locate a saved model in that path.\n\n{exc}")
+                return
 
-        self.host_gate_golden_path_var.set(str(resolved_gate_golden_path))
-        self.host_gate_policy_path_var.set(str(resolved_gate_policy_path))
-        self.host_drift_golden_path_var.set(str(resolved_drift_golden_path))
-        self.host_drift_policy_path_var.set(str(resolved_drift_policy_path))
+            if not gate_golden_path:
+                messagebox.showwarning("Hosting", "Please select the deployment gate golden set CSV.")
+                return
+            if not gate_policy_path:
+                messagebox.showwarning("Hosting", "Please select the deployment gate policy JSON.")
+                return
+            if not drift_golden_path:
+                messagebox.showwarning("Hosting", "Please select the drift golden set CSV.")
+                return
+            if not drift_policy_path:
+                messagebox.showwarning("Hosting", "Please select the drift policy JSON.")
+                return
 
-        if resolved_model_dir:
+            gate_golden_resolved = resolve_gate_path(gate_golden_path)
+            gate_policy_resolved = resolve_gate_path(gate_policy_path)
+            drift_golden_resolved = resolve_gate_path(drift_golden_path)
+            drift_policy_resolved = resolve_gate_path(drift_policy_path)
+            if not gate_golden_resolved.exists() or not gate_golden_resolved.is_file():
+                messagebox.showerror("Hosting", f"Deployment gate golden set file not found.\n\n{gate_golden_resolved}")
+                return
+            if not gate_policy_resolved.exists() or not gate_policy_resolved.is_file():
+                messagebox.showerror("Hosting", f"Deployment gate policy file not found.\n\n{gate_policy_resolved}")
+                return
+            if not drift_golden_resolved.exists() or not drift_golden_resolved.is_file():
+                messagebox.showerror("Hosting", f"Drift golden set file not found.\n\n{drift_golden_resolved}")
+                return
+            if not drift_policy_resolved.exists() or not drift_policy_resolved.is_file():
+                messagebox.showerror("Hosting", f"Drift policy file not found.\n\n{drift_policy_resolved}")
+                return
+
+            resolved_gate_golden_path = str(gate_golden_resolved)
+            resolved_gate_policy_path = str(gate_policy_resolved)
+            resolved_drift_golden_path = str(drift_golden_resolved)
+            resolved_drift_policy_path = str(drift_policy_resolved)
+            self.host_gate_golden_path_var.set(resolved_gate_golden_path)
+            self.host_gate_policy_path_var.set(resolved_gate_policy_path)
+            self.host_drift_golden_path_var.set(resolved_drift_golden_path)
+            self.host_drift_policy_path_var.set(resolved_drift_policy_path)
             self.hosted_model_path_var.set(resolved_model_dir)
             self.refresh_hosted_model_inventory(preferred_path=resolved_model_dir)
+
         self.hosting_api_url_var.set("")
         self.feedback_api_url_var.set("")
         self.feedback_status_url_var.set("")
@@ -1583,10 +1903,10 @@ class LogProcessorApp:
         request_kwargs = {
             "model_dir": resolved_model_dir,
             "mode": hosting_mode,
-            "deployment_gate_golden_path": str(resolved_gate_golden_path),
-            "deployment_gate_policy_path": str(resolved_gate_policy_path),
-            "drift_golden_path": str(resolved_drift_golden_path),
-            "drift_policy_path": str(resolved_drift_policy_path),
+            "deployment_gate_golden_path": resolved_gate_golden_path,
+            "deployment_gate_policy_path": resolved_gate_policy_path,
+            "drift_golden_path": resolved_drift_golden_path,
+            "drift_policy_path": resolved_drift_policy_path,
         }
         create_github_pr = bool(self.create_pr_var.get())
         github_token = clean_optional_string(self.github_key_entry.get())
@@ -1695,12 +2015,39 @@ class LogProcessorApp:
                 messagebox.showwarning("Hosting", "Please select a GitHub branch before starting Azure hosting.")
                 return
 
+            selected_azure_model: dict[str, Any] = {}
+            if azure_service != "serverless":
+                selected_azure_model = self.get_selected_azure_model_from_ui()
+                if not selected_azure_model:
+                    self.finish_hosting_action()
+                    messagebox.showwarning("Hosting", "Load and select an Azure ML registered model before starting Azure hosting.")
+                    return
+                selected_model_id = clean_optional_string(selected_azure_model.get("id"))
+                selected_model_name = clean_optional_string(selected_azure_model.get("name"))
+                selected_model_version = clean_optional_string(selected_azure_model.get("version"))
+                if not (selected_model_name and selected_model_version):
+                    parsed_model_name, parsed_model_version = self.azure_platform_service.parse_azure_model_name_version_from_id(selected_model_id)
+                    selected_model_name = selected_model_name or parsed_model_name
+                    selected_model_version = selected_model_version or parsed_model_version
+                    if selected_model_name and selected_model_version:
+                        selected_azure_model = {
+                            **selected_azure_model,
+                            "name": selected_model_name,
+                            "version": selected_model_version,
+                        }
+                if not (selected_model_name and selected_model_version):
+                    self.finish_hosting_action()
+                    messagebox.showwarning(
+                        "Hosting",
+                        "The selected Azure ML model is missing a version. Click Load Azure Resources again and choose a model shown as name:version.",
+                    )
+                    return
+
             triage_enabled = azure_service == "online"
             triage_values = {
-                "azure_prediction_key": clean_optional_string(self.azure_prediction_key_var.get()),
                 "configuration_email": clean_optional_string(self.configuration_email_var.get()),
                 "system_email": clean_optional_string(self.system_email_var.get()),
-                "acs_connection_string": clean_optional_string(self.acs_connection_string_var.get()),
+                "acs_connection_string": self.get_acs_connection_string_from_ui(),
                 "acs_sender_address": clean_optional_string(self.acs_sender_address_var.get()),
                 "jira_site_url": clean_optional_string(self.jira_site_url_var.get()),
                 "jira_account_email": clean_optional_string(self.jira_account_email_var.get()),
@@ -1712,7 +2059,6 @@ class LogProcessorApp:
             }
             if triage_enabled:
                 required_triage_fields = [
-                    ("Azure endpoint key", triage_values["azure_prediction_key"]),
                     ("GitHub PAT", github_token),
                     ("GitHub repository", github_repo),
                     ("GitHub branch", github_branch),
@@ -1744,6 +2090,10 @@ class LogProcessorApp:
                     "azure_service": azure_service,
                     "azure_serverless_model_id": serverless_model_id,
                     "azure_serverless_endpoint_name": serverless_endpoint_name,
+                    "azure_model_id": clean_optional_string(selected_azure_model.get("id")),
+                    "azure_model_name": clean_optional_string(selected_azure_model.get("name")),
+                    "azure_model_version": clean_optional_string(selected_azure_model.get("version")),
+                    "azure_model_label": clean_optional_string(selected_azure_model.get("label")),
                     "batch_input_uri": batch_input_uri,
                     "batch_hour": batch_hour,
                     "batch_minute": batch_minute,

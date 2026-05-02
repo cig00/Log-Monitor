@@ -432,12 +432,11 @@ For model-based Azure hosting, the app uploads the current local labeled data ve
 
 ### 7. Azure Real-Time Triage Automation
 
-Azure real-time endpoint hosting can also expose a Function-backed triage endpoint in front of the prediction endpoint. The desktop form asks for:
+Azure real-time endpoint hosting can also expose a Function-backed triage endpoint in front of the prediction endpoint. The app fetches the Azure ML endpoint key automatically after deployment. The desktop form asks for:
 
-- Azure endpoint key
 - GitHub PAT, repository, and branch
 - Configuration email and System email
-- Azure Communication Services Email connection string and sender address
+- Azure Communication Services connection string and Email sender address. Use the single `Load Azure Resources` button in hosting to authenticate once, load Azure ML models, and fill the ACS connection/sender dropdowns. If no ACS resources exist, the app creates a default Communication Services resource, Email service, Azure-managed domain, and sender so the workflow is not blocked.
 - Jira site URL, account email, API token, project key, issue type, optional priority, and labels
 
 Triage behavior:

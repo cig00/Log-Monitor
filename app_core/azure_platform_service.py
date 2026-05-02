@@ -10,7 +10,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote as url_quote
+from urllib.parse import quote as url_quote, unquote as url_unquote
 
 import requests
 try:
@@ -72,6 +72,7 @@ from mlops_utils import clean_optional_string, read_json
 
 Reporter = Callable[[str], None]
 DEFAULT_SERVERLESS_MODEL_ID = "azureml://registries/azureml/models/Phi-4-mini-instruct"
+COMMUNICATION_API_VERSION = "2025-09-01"
 
 
 class AzurePlatformService:
@@ -515,6 +516,610 @@ class AzurePlatformService:
             except Exception:
                 return {"raw_body": body_text}
 
+    def is_transient_azure_resource_error(self, exc: Exception) -> bool:
+        message = clean_optional_string(str(exc)).lower()
+        signals = (
+            "parentresourcenotfound",
+            "invalidresourceoperation",
+            "being provisioned",
+            "provisioningstate",
+            "state: 'accepted'",
+            "state 'accepted'",
+            "409 conflict",
+        )
+        return any(signal in message for signal in signals)
+
+    def retry_azure_management_json_request(
+        self,
+        credential,
+        method: str,
+        url: str,
+        payload: dict | None = None,
+        expected_statuses: tuple[int, ...] = (200, 201, 202),
+        action: str = "Azure resource operation",
+        emit: Reporter | None = None,
+        timeout_seconds: int = 600,
+        poll_interval: int = 10,
+    ) -> dict:
+        deadline = time.time() + timeout_seconds
+        last_error: Exception | None = None
+        while True:
+            try:
+                return self.azure_management_json_request(
+                    credential,
+                    method,
+                    url,
+                    payload=payload,
+                    expected_statuses=expected_statuses,
+                )
+            except RuntimeError as exc:
+                last_error = exc
+                if not self.is_transient_azure_resource_error(exc) or time.time() >= deadline:
+                    raise
+                if emit:
+                    emit(f"{action} is waiting for Azure provisioning to finish...")
+                time.sleep(poll_interval)
+
+        if last_error is not None:
+            raise last_error
+        raise TimeoutError(f"{action} did not complete before the timeout.")
+
+    def wait_for_azure_resource_ready(
+        self,
+        credential,
+        resource_url: str,
+        resource_name: str,
+        emit: Reporter | None = None,
+        timeout_seconds: int = 600,
+        poll_interval: int = 10,
+    ) -> dict[str, Any]:
+        deadline = time.time() + timeout_seconds
+        clean_name = clean_optional_string(resource_name) or "Azure resource"
+        last_payload: dict[str, Any] = {}
+        while True:
+            try:
+                payload = self.azure_management_json_request(credential, "GET", resource_url)
+                last_payload = payload if isinstance(payload, dict) else {}
+                provisioning_state = self.get_arm_provisioning_state(last_payload).lower()
+                if provisioning_state in {"", "succeeded"}:
+                    return last_payload
+                if provisioning_state in {"failed", "canceled", "cancelled"}:
+                    raise RuntimeError(f"{clean_name} provisioning failed with state: {provisioning_state}")
+                if emit:
+                    emit(f"Waiting for {clean_name} provisioning ({provisioning_state})...")
+            except RuntimeError as exc:
+                if not self.is_transient_azure_resource_error(exc) and "not found" not in clean_optional_string(str(exc)).lower():
+                    raise
+                if emit:
+                    emit(f"Waiting for {clean_name} to become available...")
+
+            if time.time() >= deadline:
+                last_state = self.get_arm_provisioning_state(last_payload) or "unknown"
+                raise TimeoutError(f"Timed out waiting for {clean_name} provisioning. Last state: {last_state}")
+            time.sleep(poll_interval)
+
+    def azure_management_list_values(self, credential, url: str) -> list[dict[str, Any]]:
+        values: list[dict[str, Any]] = []
+        next_url = clean_optional_string(url)
+        while next_url:
+            payload = self.azure_management_json_request(credential, "GET", next_url)
+            page_values = payload.get("value", []) if isinstance(payload, dict) else []
+            if isinstance(page_values, list):
+                values.extend(item for item in page_values if isinstance(item, dict))
+            next_url = clean_optional_string(payload.get("nextLink")) if isinstance(payload, dict) else ""
+        return values
+
+    def extract_resource_group_from_arm_id(self, resource_id: str) -> str:
+        match = re.search(r"/resourceGroups/([^/]+)", clean_optional_string(resource_id), flags=re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    def ensure_resource_group(self, credential, sub_id: str, resource_group: str = "", location: str = "eastus") -> str:
+        self.ensure_azure_dependencies()
+        clean_group = clean_optional_string(resource_group) or self.resource_group
+        resource_client = ResourceManagementClient(credential, sub_id)
+        try:
+            resource_client.resource_groups.get(clean_group)
+        except Exception:
+            resource_client.resource_groups.create_or_update(clean_group, {"location": location})
+        return clean_group
+
+    def list_acs_communication_services(self, credential, sub_id: str) -> list[dict[str, Any]]:
+        clean_sub_id = clean_optional_string(sub_id)
+        url = (
+            f"https://management.azure.com/subscriptions/{url_quote(clean_sub_id, safe='')}"
+            f"/providers/Microsoft.Communication/communicationServices?api-version={COMMUNICATION_API_VERSION}"
+        )
+        return self.azure_management_list_values(credential, url)
+
+    def create_or_update_acs_communication_service(
+        self,
+        credential,
+        sub_id: str,
+        service_name: str,
+        resource_group: str,
+        linked_domain_id: str = "",
+        emit: Reporter | None = None,
+    ) -> dict[str, Any]:
+        clean_sub_id = clean_optional_string(sub_id)
+        clean_group = self.ensure_resource_group(credential, clean_sub_id, resource_group)
+        clean_name = self.sanitize_azure_name(service_name, max_length=63)
+        linked_domains = []
+        clean_domain_id = clean_optional_string(linked_domain_id)
+        if clean_domain_id:
+            linked_domains.append(clean_domain_id)
+        if emit:
+            emit(f"Creating Azure Communication Services resource {clean_name}...")
+        url = (
+            f"https://management.azure.com/subscriptions/{url_quote(clean_sub_id, safe='')}"
+            f"/resourceGroups/{url_quote(clean_group, safe='')}"
+            f"/providers/Microsoft.Communication/communicationServices/{url_quote(clean_name, safe='')}"
+            f"?api-version={COMMUNICATION_API_VERSION}"
+        )
+        properties: dict[str, Any] = {"dataLocation": "United States"}
+        if linked_domains:
+            properties["linkedDomains"] = linked_domains
+        resource = self.azure_management_json_request(
+            credential,
+            "PUT",
+            url,
+            payload={"location": "Global", "properties": properties},
+        )
+        resource["id"] = clean_optional_string(resource.get("id")) or (
+            f"/subscriptions/{clean_sub_id}/resourceGroups/{clean_group}"
+            f"/providers/Microsoft.Communication/communicationServices/{clean_name}"
+        )
+        resource["name"] = clean_optional_string(resource.get("name")) or clean_name
+        resource_properties = resource.get("properties") if isinstance(resource.get("properties"), dict) else {}
+        resource_properties.setdefault("dataLocation", "United States")
+        resource_properties.setdefault("hostName", f"{clean_name}.communication.azure.com")
+        if linked_domains:
+            resource_properties.setdefault("linkedDomains", linked_domains)
+        resource["properties"] = resource_properties
+        resource["location"] = clean_optional_string(resource.get("location")) or "Global"
+        self.wait_for_azure_resource_ready(
+            credential,
+            url,
+            f"Communication Services resource {clean_name}",
+            emit=emit,
+        )
+        return resource
+
+    def link_acs_domain_to_communication_service(
+        self,
+        credential,
+        sub_id: str,
+        communication_service: dict[str, Any],
+        domain_id: str,
+        emit: Reporter | None = None,
+    ) -> dict[str, Any]:
+        clean_domain_id = clean_optional_string(domain_id)
+        service_name = clean_optional_string(communication_service.get("name"))
+        resource_group = self.extract_resource_group_from_arm_id(clean_optional_string(communication_service.get("id")))
+        if not clean_domain_id or not service_name or not resource_group:
+            return communication_service
+        properties = communication_service.get("properties") if isinstance(communication_service.get("properties"), dict) else {}
+        linked_domains = [
+            clean_optional_string(domain)
+            for domain in properties.get("linkedDomains", [])
+            if clean_optional_string(domain)
+        ]
+        if clean_domain_id not in linked_domains:
+            linked_domains.append(clean_domain_id)
+        if emit:
+            emit(f"Linking ACS email domain to {service_name}...")
+        payload_properties = {
+            "dataLocation": clean_optional_string(properties.get("dataLocation")) or "United States",
+            "linkedDomains": linked_domains,
+        }
+        for optional_key in ("disableLocalAuth", "publicNetworkAccess"):
+            if optional_key in properties:
+                payload_properties[optional_key] = properties[optional_key]
+        url = (
+            f"https://management.azure.com/subscriptions/{url_quote(clean_optional_string(sub_id), safe='')}"
+            f"/resourceGroups/{url_quote(resource_group, safe='')}"
+            f"/providers/Microsoft.Communication/communicationServices/{url_quote(service_name, safe='')}"
+            f"?api-version={COMMUNICATION_API_VERSION}"
+        )
+        resource = self.retry_azure_management_json_request(
+            credential,
+            "PUT",
+            url,
+            payload={
+                "location": clean_optional_string(communication_service.get("location")) or "Global",
+                "properties": payload_properties,
+            },
+            action=f"Linking ACS email domain to {service_name}",
+            emit=emit,
+        )
+        resource["id"] = clean_optional_string(resource.get("id")) or clean_optional_string(communication_service.get("id"))
+        resource["name"] = clean_optional_string(resource.get("name")) or service_name
+        resource_properties = resource.get("properties") if isinstance(resource.get("properties"), dict) else {}
+        resource_properties.update(payload_properties)
+        resource_properties.setdefault("hostName", clean_optional_string(properties.get("hostName")) or f"{service_name}.communication.azure.com")
+        resource["properties"] = resource_properties
+        resource["location"] = clean_optional_string(resource.get("location")) or clean_optional_string(communication_service.get("location")) or "Global"
+        self.wait_for_azure_resource_ready(
+            credential,
+            url,
+            f"Communication Services resource {service_name}",
+            emit=emit,
+        )
+        return resource
+
+    def ensure_default_acs_communication_service(
+        self,
+        credential,
+        sub_id: str,
+        linked_domain_id: str = "",
+        emit: Reporter | None = None,
+    ) -> dict[str, Any]:
+        resources = self.list_acs_communication_services(credential, sub_id)
+        if resources:
+            selected = resources[0]
+            if clean_optional_string(linked_domain_id):
+                return self.link_acs_domain_to_communication_service(credential, sub_id, selected, linked_domain_id, emit=emit)
+            return selected
+        suffix = str(int(time.time()))[-8:]
+        service_name = self.sanitize_azure_name(f"log-monitor-acs-{suffix}", max_length=63)
+        return self.create_or_update_acs_communication_service(
+            credential=credential,
+            sub_id=sub_id,
+            service_name=service_name,
+            resource_group=self.resource_group,
+            linked_domain_id=linked_domain_id,
+            emit=emit,
+        )
+
+    def list_acs_email_services(self, credential, sub_id: str) -> list[dict[str, Any]]:
+        clean_sub_id = clean_optional_string(sub_id)
+        url = (
+            f"https://management.azure.com/subscriptions/{url_quote(clean_sub_id, safe='')}"
+            f"/providers/Microsoft.Communication/emailServices?api-version={COMMUNICATION_API_VERSION}"
+        )
+        return self.azure_management_list_values(credential, url)
+
+    def create_or_update_acs_email_service(
+        self,
+        credential,
+        sub_id: str,
+        email_service_name: str,
+        resource_group: str,
+        emit: Reporter | None = None,
+    ) -> dict[str, Any]:
+        clean_sub_id = clean_optional_string(sub_id)
+        clean_group = self.ensure_resource_group(credential, clean_sub_id, resource_group)
+        clean_name = self.sanitize_azure_name(email_service_name, max_length=63)
+        if emit:
+            emit(f"Creating ACS Email service {clean_name}...")
+        url = (
+            f"https://management.azure.com/subscriptions/{url_quote(clean_sub_id, safe='')}"
+            f"/resourceGroups/{url_quote(clean_group, safe='')}"
+            f"/providers/Microsoft.Communication/emailServices/{url_quote(clean_name, safe='')}"
+            f"?api-version={COMMUNICATION_API_VERSION}"
+        )
+        resource = self.azure_management_json_request(
+            credential,
+            "PUT",
+            url,
+            payload={"location": "Global", "properties": {"dataLocation": "United States"}},
+        )
+        resource["id"] = clean_optional_string(resource.get("id")) or (
+            f"/subscriptions/{clean_sub_id}/resourceGroups/{clean_group}"
+            f"/providers/Microsoft.Communication/emailServices/{clean_name}"
+        )
+        resource["name"] = clean_optional_string(resource.get("name")) or clean_name
+        resource_properties = resource.get("properties") if isinstance(resource.get("properties"), dict) else {}
+        resource_properties.setdefault("dataLocation", "United States")
+        resource["properties"] = resource_properties
+        resource["location"] = clean_optional_string(resource.get("location")) or "Global"
+        self.wait_for_azure_resource_ready(
+            credential,
+            url,
+            f"ACS Email service {clean_name}",
+            emit=emit,
+        )
+        return resource
+
+    def create_or_update_acs_email_domain(
+        self,
+        credential,
+        sub_id: str,
+        email_service_name: str,
+        resource_group: str,
+        domain_name: str = "AzureManagedDomain",
+        emit: Reporter | None = None,
+    ) -> dict[str, Any]:
+        clean_sub_id = clean_optional_string(sub_id)
+        clean_domain = clean_optional_string(domain_name) or "AzureManagedDomain"
+        if emit:
+            emit(f"Creating ACS Email domain {clean_domain}...")
+        url = (
+            f"https://management.azure.com/subscriptions/{url_quote(clean_sub_id, safe='')}"
+            f"/resourceGroups/{url_quote(resource_group, safe='')}"
+            f"/providers/Microsoft.Communication/emailServices/{url_quote(email_service_name, safe='')}"
+            f"/domains/{url_quote(clean_domain, safe='')}"
+            f"?api-version={COMMUNICATION_API_VERSION}"
+        )
+        resource = self.retry_azure_management_json_request(
+            credential,
+            "PUT",
+            url,
+            payload={"location": "Global", "properties": {"domainManagement": "AzureManaged"}},
+            action=f"Creating ACS Email domain {clean_domain}",
+            emit=emit,
+        )
+        resource["id"] = clean_optional_string(resource.get("id")) or (
+            f"/subscriptions/{clean_sub_id}/resourceGroups/{resource_group}"
+            f"/providers/Microsoft.Communication/emailServices/{email_service_name}/domains/{clean_domain}"
+        )
+        resource["name"] = clean_optional_string(resource.get("name")) or clean_domain
+        resource_properties = resource.get("properties") if isinstance(resource.get("properties"), dict) else {}
+        resource_properties.setdefault("domainManagement", "AzureManaged")
+        resource["properties"] = resource_properties
+        resource["location"] = clean_optional_string(resource.get("location")) or "Global"
+        self.wait_for_azure_resource_ready(
+            credential,
+            url,
+            f"ACS Email domain {clean_domain}",
+            emit=emit,
+        )
+        return resource
+
+    def create_or_update_acs_sender_username(
+        self,
+        credential,
+        sub_id: str,
+        email_service_name: str,
+        resource_group: str,
+        domain_name: str,
+        username: str = "DoNotReply",
+        display_name: str = "Log Monitor",
+        emit: Reporter | None = None,
+    ) -> dict[str, Any]:
+        clean_username = clean_optional_string(username) or "DoNotReply"
+        if emit:
+            emit(f"Creating ACS sender {clean_username}...")
+        url = (
+            f"https://management.azure.com/subscriptions/{url_quote(clean_optional_string(sub_id), safe='')}"
+            f"/resourceGroups/{url_quote(resource_group, safe='')}"
+            f"/providers/Microsoft.Communication/emailServices/{url_quote(email_service_name, safe='')}"
+            f"/domains/{url_quote(domain_name, safe='')}"
+            f"/senderUsernames/{url_quote(clean_username, safe='')}"
+            f"?api-version={COMMUNICATION_API_VERSION}"
+        )
+        resource = self.retry_azure_management_json_request(
+            credential,
+            "PUT",
+            url,
+            payload={"properties": {"username": clean_username, "displayName": display_name}},
+            action=f"Creating ACS sender {clean_username}",
+            emit=emit,
+        )
+        resource["name"] = clean_optional_string(resource.get("name")) or clean_username
+        resource_properties = resource.get("properties") if isinstance(resource.get("properties"), dict) else {}
+        resource_properties.setdefault("username", clean_username)
+        resource_properties.setdefault("displayName", display_name)
+        resource["properties"] = resource_properties
+        self.wait_for_azure_resource_ready(
+            credential,
+            url,
+            f"ACS sender {clean_username}",
+            emit=emit,
+        )
+        return resource
+
+    def ensure_default_acs_email_sender(self, credential, sub_id: str, emit: Reporter | None = None) -> dict[str, str]:
+        suffix = str(int(time.time()))[-8:]
+        email_service_name = self.sanitize_azure_name(f"log-monitor-email-{suffix}", max_length=63)
+        resource_group = self.resource_group
+        email_service = self.create_or_update_acs_email_service(
+            credential=credential,
+            sub_id=sub_id,
+            email_service_name=email_service_name,
+            resource_group=resource_group,
+            emit=emit,
+        )
+        email_service_name = clean_optional_string(email_service.get("name")) or email_service_name
+        resource_group = self.extract_resource_group_from_arm_id(clean_optional_string(email_service.get("id"))) or resource_group
+        domain = self.create_or_update_acs_email_domain(
+            credential=credential,
+            sub_id=sub_id,
+            email_service_name=email_service_name,
+            resource_group=resource_group,
+            domain_name="AzureManagedDomain",
+            emit=emit,
+        )
+        domain_name = clean_optional_string(domain.get("name")) or "AzureManagedDomain"
+        domain_properties = domain.get("properties") if isinstance(domain.get("properties"), dict) else {}
+        mail_from_domain = clean_optional_string(domain_properties.get("mailFromSenderDomain")) or domain_name
+        sender = self.create_or_update_acs_sender_username(
+            credential=credential,
+            sub_id=sub_id,
+            email_service_name=email_service_name,
+            resource_group=resource_group,
+            domain_name=domain_name,
+            username="DoNotReply",
+            display_name="Log Monitor",
+            emit=emit,
+        )
+        sender_properties = sender.get("properties") if isinstance(sender.get("properties"), dict) else {}
+        username = clean_optional_string(sender_properties.get("username")) or clean_optional_string(sender.get("name")) or "DoNotReply"
+        address = username if "@" in username else f"{username}@{mail_from_domain}"
+        domain_id = clean_optional_string(domain.get("id"))
+        if domain_id:
+            self.ensure_default_acs_communication_service(credential, sub_id, linked_domain_id=domain_id, emit=emit)
+        return {
+            "address": address,
+            "label": address,
+            "display_name": clean_optional_string(sender_properties.get("displayName")) or "Log Monitor",
+            "email_service": email_service_name,
+            "resource_group": resource_group,
+            "domain": domain_name,
+            "mail_from_domain": mail_from_domain,
+            "created": "1",
+        }
+
+    def list_acs_email_senders(
+        self,
+        credential,
+        sub_id: str,
+        emit: Reporter | None = None,
+        limit: int = 200,
+        create_if_missing: bool = True,
+    ) -> list[dict[str, str]]:
+        self.ensure_azure_dependencies()
+        clean_sub_id = clean_optional_string(sub_id)
+        if not clean_sub_id:
+            raise ValueError("Azure Subscription ID is required to load ACS sender addresses.")
+        if emit:
+            emit("Loading Azure Communication Services email resources...")
+        email_services = self.list_acs_email_services(credential, clean_sub_id)
+        senders: list[dict[str, str]] = []
+        seen_addresses: set[str] = set()
+
+        for email_service in email_services:
+            email_service_name = clean_optional_string(email_service.get("name"))
+            resource_group = self.extract_resource_group_from_arm_id(clean_optional_string(email_service.get("id")))
+            if not email_service_name or not resource_group:
+                continue
+            if emit:
+                emit(f"Loading ACS email domains for {email_service_name}...")
+            domains_url = (
+                f"https://management.azure.com/subscriptions/{url_quote(clean_sub_id, safe='')}"
+                f"/resourceGroups/{url_quote(resource_group, safe='')}"
+                f"/providers/Microsoft.Communication/emailServices/{url_quote(email_service_name, safe='')}"
+                f"/domains?api-version={COMMUNICATION_API_VERSION}"
+            )
+            domains = self.azure_management_list_values(credential, domains_url)
+            for domain in domains:
+                domain_name = clean_optional_string(domain.get("name"))
+                domain_properties = domain.get("properties") if isinstance(domain.get("properties"), dict) else {}
+                mail_from_domain = clean_optional_string(domain_properties.get("mailFromSenderDomain")) or domain_name
+                if not domain_name or not mail_from_domain:
+                    continue
+                if emit:
+                    emit(f"Loading ACS senders for {mail_from_domain}...")
+                sender_url = (
+                    f"https://management.azure.com/subscriptions/{url_quote(clean_sub_id, safe='')}"
+                    f"/resourceGroups/{url_quote(resource_group, safe='')}"
+                    f"/providers/Microsoft.Communication/emailServices/{url_quote(email_service_name, safe='')}"
+                    f"/domains/{url_quote(domain_name, safe='')}"
+                    f"/senderUsernames?api-version={COMMUNICATION_API_VERSION}"
+                )
+                sender_resources = self.azure_management_list_values(credential, sender_url)
+                for sender in sender_resources:
+                    sender_properties = sender.get("properties") if isinstance(sender.get("properties"), dict) else {}
+                    username = clean_optional_string(sender_properties.get("username")) or clean_optional_string(sender.get("name"))
+                    if not username:
+                        continue
+                    address = username if "@" in username else f"{username}@{mail_from_domain}"
+                    address_key = address.casefold()
+                    if address_key in seen_addresses:
+                        continue
+                    seen_addresses.add(address_key)
+                    display_name = clean_optional_string(sender_properties.get("displayName"))
+                    label = address
+                    if display_name:
+                        label = f"{address} | {display_name}"
+                    senders.append(
+                        {
+                            "address": address,
+                            "label": label,
+                            "display_name": display_name,
+                            "email_service": email_service_name,
+                            "resource_group": resource_group,
+                            "domain": domain_name,
+                            "mail_from_domain": mail_from_domain,
+                        }
+                    )
+                    if len(senders) >= limit:
+                        return sorted(senders, key=lambda item: item["address"].casefold())
+        if not senders and create_if_missing:
+            if emit:
+                emit("No ACS email sender was found. Creating a default ACS Email setup...")
+            senders.append(self.ensure_default_acs_email_sender(credential, clean_sub_id, emit=emit))
+        return sorted(senders, key=lambda item: item["address"].casefold())
+
+    def build_acs_connection_string(self, host_name: str, access_key: str) -> str:
+        clean_host = clean_optional_string(host_name)
+        clean_key = clean_optional_string(access_key)
+        if not clean_host or not clean_key:
+            return ""
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", clean_host):
+            clean_host = f"https://{clean_host}"
+        clean_host = clean_host.rstrip("/") + "/"
+        return f"endpoint={clean_host};accesskey={clean_key}"
+
+    def list_acs_connection_strings(
+        self,
+        credential,
+        sub_id: str,
+        emit: Reporter | None = None,
+        limit: int = 200,
+        create_if_missing: bool = True,
+    ) -> list[dict[str, str]]:
+        self.ensure_azure_dependencies()
+        clean_sub_id = clean_optional_string(sub_id)
+        if not clean_sub_id:
+            raise ValueError("Azure Subscription ID is required to load ACS connection strings.")
+        if emit:
+            emit("Loading Azure Communication Services resources...")
+        resources = self.list_acs_communication_services(credential, clean_sub_id)
+        if not resources and create_if_missing:
+            if emit:
+                emit("No Azure Communication Services resource was found. Creating one automatically...")
+            resources = [self.ensure_default_acs_communication_service(credential, clean_sub_id, emit=emit)]
+        connections: list[dict[str, str]] = []
+
+        for resource in resources:
+            service_name = clean_optional_string(resource.get("name"))
+            resource_group = self.extract_resource_group_from_arm_id(clean_optional_string(resource.get("id")))
+            properties = resource.get("properties") if isinstance(resource.get("properties"), dict) else {}
+            host_name = clean_optional_string(properties.get("hostName")) or f"{service_name}.communication.azure.com"
+            if not service_name or not resource_group:
+                continue
+            if emit:
+                emit(f"Fetching ACS keys for {service_name}...")
+            keys_url = (
+                f"https://management.azure.com/subscriptions/{url_quote(clean_sub_id, safe='')}"
+                f"/resourceGroups/{url_quote(resource_group, safe='')}"
+                f"/providers/Microsoft.Communication/communicationServices/{url_quote(service_name, safe='')}"
+                f"/listKeys?api-version={COMMUNICATION_API_VERSION}"
+            )
+            keys = self.retry_azure_management_json_request(
+                credential,
+                "POST",
+                keys_url,
+                action=f"Fetching ACS keys for {service_name}",
+                emit=emit,
+            )
+            key_options = [
+                ("Primary", "primaryConnectionString", "primaryKey"),
+                ("Secondary", "secondaryConnectionString", "secondaryKey"),
+            ]
+            for key_label, connection_key, access_key_name in key_options:
+                connection_string = clean_optional_string(keys.get(connection_key)) if isinstance(keys, dict) else ""
+                if not connection_string:
+                    access_key = clean_optional_string(keys.get(access_key_name)) if isinstance(keys, dict) else ""
+                    connection_string = self.build_acs_connection_string(host_name, access_key)
+                if not connection_string:
+                    continue
+                label = f"{service_name} | {key_label}"
+                if resource_group:
+                    label = f"{resource_group}/{label}"
+                connections.append(
+                    {
+                        "label": label,
+                        "connection_string": connection_string,
+                        "service_name": service_name,
+                        "resource_group": resource_group,
+                        "key_name": key_label.lower(),
+                    }
+                )
+                if len(connections) >= limit:
+                    return sorted(connections, key=lambda item: item["label"].casefold())
+        return sorted(connections, key=lambda item: item["label"].casefold())
+
     def get_azure_workspace_location(self, ml_client) -> str:
         try:
             workspace = ml_client.workspaces.get(self.workspace_name)
@@ -907,6 +1512,166 @@ class AzurePlatformService:
             ml_client.workspaces.begin_create(workspace).result()
         return ml_client
 
+    def build_azure_model_label(self, model_info: dict[str, Any]) -> str:
+        name = clean_optional_string(model_info.get("name"))
+        version = clean_optional_string(model_info.get("version"))
+        asset_type = clean_optional_string(model_info.get("type"))
+        created_at = clean_optional_string(model_info.get("created_at"))
+        label = name
+        if version:
+            label += f":{version}"
+        if asset_type:
+            label += f" | {asset_type}"
+        if created_at:
+            label += f" | {created_at.replace('T', ' ')[:19]}"
+        return label or clean_optional_string(model_info.get("id")) or "Azure model"
+
+    def parse_azure_model_name_version_from_id(self, raw_value: str) -> tuple[str, str]:
+        clean_value = clean_optional_string(raw_value)
+        if not clean_value:
+            return "", ""
+        if clean_value.startswith("azureml:") and not clean_value.startswith("azureml://"):
+            parts = clean_value.split(":")
+            if len(parts) >= 3:
+                return clean_optional_string(parts[-2]), clean_optional_string(parts[-1])
+
+        match = re.search(r"/models/([^/?#]+)/versions/([^/?#]+)", clean_value, flags=re.IGNORECASE)
+        if match:
+            return url_unquote(match.group(1)), url_unquote(match.group(2))
+
+        match = re.search(r"models/([^/?#]+)/versions/([^/?#]+)", clean_value, flags=re.IGNORECASE)
+        if match:
+            return url_unquote(match.group(1)), url_unquote(match.group(2))
+        return "", ""
+
+    def build_azure_model_payload_from_entity(self, model: Any) -> dict[str, Any]:
+        name = clean_optional_string(getattr(model, "name", ""))
+        version = clean_optional_string(getattr(model, "version", ""))
+        model_id = clean_optional_string(getattr(model, "id", ""))
+        path = clean_optional_string(getattr(model, "path", ""))
+        if not (name and version):
+            parsed_name, parsed_version = self.parse_azure_model_name_version_from_id(model_id or path)
+            name = name or parsed_name
+            version = version or parsed_version
+        creation_context = getattr(model, "creation_context", None)
+        payload = {
+            "id": model_id,
+            "name": name,
+            "version": version,
+            "path": path,
+            "type": clean_optional_string(getattr(model, "type", "")),
+            "description": clean_optional_string(getattr(model, "description", "")),
+            "created_at": clean_optional_string(getattr(creation_context, "created_at", "")) if creation_context is not None else "",
+        }
+        payload["label"] = self.build_azure_model_label(payload)
+        return payload
+
+    def list_azure_workspace_models(self, ml_client, limit: int = 200) -> list[dict[str, Any]]:
+        self.ensure_azure_dependencies()
+        models: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add_model_payload(payload: dict[str, Any]) -> bool:
+            name = clean_optional_string(payload.get("name"))
+            version = clean_optional_string(payload.get("version"))
+            if not name or not version:
+                return False
+            model_id = clean_optional_string(payload.get("id"))
+            key = model_id or f"{name}:{version}"
+            if key in seen:
+                return False
+            seen.add(key)
+            models.append(payload)
+            return len(models) >= limit
+
+        try:
+            iterable = ml_client.models.list()
+        except TypeError:
+            iterable = ml_client.models.list(name=None)
+        for model in iterable:
+            payload = self.build_azure_model_payload_from_entity(model)
+            name = clean_optional_string(payload.get("name"))
+            version = clean_optional_string(payload.get("version"))
+            if name and not version:
+                try:
+                    versioned_iterable = ml_client.models.list(name=name)
+                except Exception:
+                    versioned_iterable = []
+                for versioned_model in versioned_iterable:
+                    if add_model_payload(self.build_azure_model_payload_from_entity(versioned_model)):
+                        break
+            else:
+                add_model_payload(payload)
+            if len(models) >= limit:
+                break
+        return sorted(
+            models,
+            key=lambda item: (
+                clean_optional_string(item.get("name")),
+                clean_optional_string(item.get("version")),
+                clean_optional_string(item.get("id")),
+            ),
+            reverse=True,
+        )
+
+    def resolve_azure_model_asset(self, ml_client, *, model_id: str = "", model_name: str = "", model_version: str = ""):
+        self.ensure_azure_dependencies()
+        clean_id = clean_optional_string(model_id)
+        clean_name = clean_optional_string(model_name)
+        clean_version = clean_optional_string(model_version)
+
+        if not (clean_name and clean_version):
+            parsed_name, parsed_version = self.parse_azure_model_name_version_from_id(clean_id)
+            clean_name = clean_name or parsed_name
+            clean_version = clean_version or parsed_version
+
+        if clean_name and clean_version:
+            return ml_client.models.get(name=clean_name, version=clean_version)
+
+        if clean_id:
+            for model in self.list_azure_workspace_models(ml_client):
+                if clean_optional_string(model.get("id")) == clean_id:
+                    name = clean_optional_string(model.get("name"))
+                    version = clean_optional_string(model.get("version"))
+                    if name and version:
+                        return ml_client.models.get(name=name, version=version)
+
+        raise ValueError("Select an Azure ML registered model version before hosting.")
+
+    def get_online_endpoint_key(self, ml_client, endpoint_name: str, emit: Reporter | None = None) -> str:
+        self.ensure_azure_dependencies()
+        clean_endpoint_name = clean_optional_string(endpoint_name)
+        if not clean_endpoint_name:
+            return ""
+        if emit:
+            emit("Fetching Azure online endpoint key...")
+        try:
+            credentials = ml_client.online_endpoints.get_keys(name=clean_endpoint_name)
+        except TypeError:
+            credentials = ml_client.online_endpoints.get_keys(clean_endpoint_name)
+
+        if isinstance(credentials, dict):
+            for key in ("primary_key", "primaryKey", "key1", "primary", "value"):
+                value = clean_optional_string(credentials.get(key))
+                if value:
+                    return value
+        for attr in ("primary_key", "primaryKey", "key1", "primary", "value"):
+            value = clean_optional_string(getattr(credentials, attr, ""))
+            if value:
+                return value
+        as_dict = getattr(credentials, "as_dict", None)
+        if callable(as_dict):
+            payload = as_dict()
+            if isinstance(payload, dict):
+                for key in ("primary_key", "primaryKey", "key1", "primary", "value"):
+                    value = clean_optional_string(payload.get(key))
+                    if value:
+                        return value
+        raise RuntimeError(
+            f"Azure returned no access key for online endpoint '{clean_endpoint_name}'. "
+            "Confirm the endpoint uses key authentication or fetch credentials from Azure ML Studio."
+        )
+
     def create_interactive_credential(self, tenant_id: str):
         self.ensure_azure_dependencies()
         return InteractiveBrowserCredential(tenant_id=tenant_id)
@@ -1046,6 +1811,9 @@ class AzurePlatformService:
         azure_compute: str,
         preferred_instance_type: str,
         endpoint_auth_mode: str = "key",
+        azure_model_id: str = "",
+        azure_model_name: str = "",
+        azure_model_version: str = "",
         emit: Reporter | None = None,
     ) -> dict:
         self.ensure_azure_dependencies()
@@ -1054,11 +1822,21 @@ class AzurePlatformService:
             self.get_azure_host_instance_candidates(azure_compute),
             preferred_instance_type,
         )
-        if emit:
-            emit("Registering model in Azure ML...")
-        registered_model = ml_client.models.create_or_update(
-            Model(path=model_dir.replace("\\", "/"), name=model_name, type=AssetTypes.CUSTOM_MODEL, description="Log Monitor generated DeBERTa model")
-        )
+        if clean_optional_string(azure_model_id) or clean_optional_string(azure_model_name):
+            if emit:
+                emit("Using selected Azure ML registered model...")
+            registered_model = self.resolve_azure_model_asset(
+                ml_client,
+                model_id=azure_model_id,
+                model_name=azure_model_name,
+                model_version=azure_model_version,
+            )
+        else:
+            if emit:
+                emit("Registering model in Azure ML...")
+            registered_model = ml_client.models.create_or_update(
+                Model(path=model_dir.replace("\\", "/"), name=model_name, type=AssetTypes.CUSTOM_MODEL, description="Log Monitor generated DeBERTa model")
+            )
         if emit:
             emit("Creating Azure inference environment...")
         environment = ml_client.environments.create_or_update(
@@ -1157,6 +1935,9 @@ class AzurePlatformService:
             "deployment_name": deployment_name,
             "instance_type": selected_instance_type,
             "api_url": scoring_uri,
+            "azure_model_id": clean_optional_string(getattr(registered_model, "id", "")) or clean_optional_string(azure_model_id),
+            "azure_model_name": clean_optional_string(getattr(registered_model, "name", "")) or clean_optional_string(azure_model_name),
+            "azure_model_version": clean_optional_string(getattr(registered_model, "version", "")) or clean_optional_string(azure_model_version),
             "attempted_instance_types": attempted_instance_types,
         }
 
@@ -1369,6 +2150,9 @@ class AzurePlatformService:
         environment_name: str,
         model_name: str,
         endpoint_auth_mode: str = "aad_token",
+        azure_model_id: str = "",
+        azure_model_name: str = "",
+        azure_model_version: str = "",
         emit: Reporter | None = None,
     ) -> dict:
         self.ensure_azure_dependencies()
@@ -1378,11 +2162,21 @@ class AzurePlatformService:
         instance_candidates = self.prioritize_instance_candidates(self.get_azure_host_instance_candidates(azure_compute), preferred_instance_type)
         selected_instance_type = ""
 
-        if emit:
-            emit("Registering model in Azure ML...")
-        registered_model = ml_client.models.create_or_update(
-            Model(path=model_dir.replace("\\", "/"), name=model_name, type=AssetTypes.CUSTOM_MODEL, description="Log Monitor generated DeBERTa model")
-        )
+        if clean_optional_string(azure_model_id) or clean_optional_string(azure_model_name):
+            if emit:
+                emit("Using selected Azure ML registered model...")
+            registered_model = self.resolve_azure_model_asset(
+                ml_client,
+                model_id=azure_model_id,
+                model_name=azure_model_name,
+                model_version=azure_model_version,
+            )
+        else:
+            if emit:
+                emit("Registering model in Azure ML...")
+            registered_model = ml_client.models.create_or_update(
+                Model(path=model_dir.replace("\\", "/"), name=model_name, type=AssetTypes.CUSTOM_MODEL, description="Log Monitor generated DeBERTa model")
+            )
         if emit:
             emit("Creating Azure batch inference environment...")
         environment = ml_client.environments.create_or_update(
@@ -1452,5 +2246,8 @@ class AzurePlatformService:
             "instance_type": selected_instance_type,
             "compute_name": compute_name,
             "api_url": scoring_uri,
+            "azure_model_id": clean_optional_string(getattr(registered_model, "id", "")) or clean_optional_string(azure_model_id),
+            "azure_model_name": clean_optional_string(getattr(registered_model, "name", "")) or clean_optional_string(azure_model_name),
+            "azure_model_version": clean_optional_string(getattr(registered_model, "version", "")) or clean_optional_string(azure_model_version),
             "attempted_instance_types": attempted_instance_types,
         }

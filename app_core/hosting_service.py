@@ -1047,6 +1047,7 @@ class HostingService:
             "LOGMONITOR_INPUT_PREFIX": "queue-batches",
             "LOGMONITOR_STATE_BLOB": "queue-state/scheduler-state.json",
             "LOGMONITOR_FEEDBACK_STATE_BLOB": "feedback/state.json",
+            "LOGMONITOR_MONITORING_STATE_BLOB": "monitoring/prediction-summary-state.json",
             "LOGMONITOR_FEEDBACK_DATASET_PREFIX": "feedback/datasets",
             "LOGMONITOR_FEEDBACK_EVENTS_PREFIX": "feedback/events",
             "LOGMONITOR_FEEDBACK_DATA_ASSET_NAME": "log-monitor-feedback-labeled-data",
@@ -1077,6 +1078,9 @@ class HostingService:
             "LOGMONITOR_JIRA_ISSUE_TYPE": clean_optional_string(request.jira_issue_type) or "Bug",
             "LOGMONITOR_JIRA_PRIORITY": clean_optional_string(request.jira_priority),
             "LOGMONITOR_JIRA_LABELS": clean_optional_string(request.jira_labels) or "log-monitor,ml-triage",
+            "LOGMONITOR_JIRA_MONITORING_ENABLED": "1" if triage_enabled else "0",
+            "LOGMONITOR_JIRA_MONITORING_ISSUE_TYPE": "Task",
+            "LOGMONITOR_JIRA_MONITORING_LABELS": "log-monitor,ml-monitoring,prediction-summary",
         }
         ctx.emit("progress", "Updating Azure Function feedback settings...")
         self.azure_platform_service.set_function_app_settings(

@@ -248,7 +248,15 @@ class AzurePlatformService:
         if clean_optional_string(azure_compute).lower() == "gpu":
             return self.dedupe_instance_candidates(["Standard_NC4as_T4_v3", "Standard_NC6s_v3"])
         return self.dedupe_instance_candidates(
-            ["Standard_DS3_v2", "Standard_E4s_v3"]
+            [
+                "Standard_D2as_v4",
+                "Standard_DS2_v2",
+                "Standard_DS1_v2",
+                "Standard_F2s_v2",
+                "Standard_E2s_v3",
+                "Standard_DS3_v2",
+                "Standard_E4s_v3",
+            ]
         )
 
     def get_azure_batch_timezone_options(self) -> list[str]:
@@ -1900,10 +1908,16 @@ class AzurePlatformService:
             except Exception as exc:
                 last_error = exc
                 if self.is_azure_quota_error(exc) and instance_type != instance_candidates[-1]:
+                    if emit:
+                        emit(f"Azure quota was not available for {instance_type}; trying the next VM size...")
                     continue
+                if self.is_azure_quota_error(exc):
+                    raise RuntimeError(self.format_azure_hosting_error(exc, attempted_instance_types)) from exc
                 raise
         if not selected_instance_type:
             if last_error is not None:
+                if self.is_azure_quota_error(last_error):
+                    raise RuntimeError(self.format_azure_hosting_error(last_error, attempted_instance_types)) from last_error
                 raise last_error
             raise RuntimeError("Azure deployment did not complete and no scoring instance was selected.")
         endpoint = ml_client.online_endpoints.get(endpoint_name) or ManagedOnlineEndpoint(
@@ -2200,10 +2214,16 @@ class AzurePlatformService:
             except Exception as exc:
                 last_deployment_error = exc
                 if self.is_azure_quota_error(exc) and instance_type != instance_candidates[-1]:
+                    if emit:
+                        emit(f"Azure quota was not available for {instance_type}; trying the next VM size...")
                     continue
+                if self.is_azure_quota_error(exc):
+                    raise RuntimeError(self.format_azure_hosting_error(exc, attempted_instance_types)) from exc
                 raise
         if not selected_instance_type:
             if last_deployment_error is not None:
+                if self.is_azure_quota_error(last_deployment_error):
+                    raise RuntimeError(self.format_azure_hosting_error(last_deployment_error, attempted_instance_types)) from last_deployment_error
                 raise last_deployment_error
             raise RuntimeError("Azure hosting could not provision any batch compute cluster.")
 

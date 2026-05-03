@@ -9,6 +9,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import azure.functions as func
@@ -87,6 +88,10 @@ def _get_state_blob_name() -> str:
 
 def _get_feedback_state_blob_name() -> str:
     return _get_env("LOGMONITOR_FEEDBACK_STATE_BLOB", "feedback/state.json")
+
+
+def _get_monitoring_state_blob_name() -> str:
+    return _get_env("LOGMONITOR_MONITORING_STATE_BLOB", "monitoring/prediction-summary-state.json")
 
 
 def _build_blob_name(local_now: datetime) -> str:
@@ -403,6 +408,96 @@ def _parse_jira_labels(raw_labels: str) -> list[str]:
     return labels
 
 
+def _looks_like_jira_priority_error(response_text: str) -> bool:
+    text = str(response_text or "").casefold()
+    return "priority" in text and any(
+        token in text for token in ("valid", "allowed", "field", "cannot", "could not", "does not exist")
+    )
+
+
+def _looks_like_jira_issue_type_error(response_text: str) -> bool:
+    text = str(response_text or "").casefold()
+    return any(token in text for token in ("issuetype", "issue type")) and any(
+        token in text for token in ("valid", "allowed", "field", "cannot", "could not", "does not exist")
+    )
+
+
+def _normalize_jira_site_url(raw_url: str) -> str:
+    clean_url = str(raw_url or "").strip().rstrip("/")
+    if not clean_url:
+        return ""
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", clean_url):
+        clean_url = "https://" + clean_url
+    parsed = urlparse(clean_url)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return clean_url
+
+
+def _jira_config_status() -> dict:
+    return {
+        "site_url": _normalize_jira_site_url(_get_env("LOGMONITOR_JIRA_SITE_URL")),
+        "account_email_configured": bool(_get_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL")),
+        "api_token_configured": bool(_get_env("LOGMONITOR_JIRA_API_TOKEN")),
+        "project_key": _get_env("LOGMONITOR_JIRA_PROJECT_KEY"),
+        "issue_type": _get_env("LOGMONITOR_JIRA_ISSUE_TYPE", "Bug") or "Bug",
+        "priority_configured": bool(_get_env("LOGMONITOR_JIRA_PRIORITY")),
+        "labels": _parse_jira_labels(_get_env("LOGMONITOR_JIRA_LABELS", "log-monitor,ml-triage")),
+    }
+
+
+def _jira_auth_headers(account_email: str, api_token: str) -> dict:
+    auth_token = base64.b64encode(f"{account_email}:{api_token}".encode("utf-8")).decode("ascii")
+    return {
+        "Authorization": f"Basic {auth_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def _post_jira_issue_with_fallbacks(
+    site_url: str,
+    headers: dict,
+    fields: dict,
+    issue_type: str,
+    priority: str,
+    issue_type_fallbacks: list[str] | None = None,
+) -> tuple[dict, list[str]]:
+    issue_url = f"{site_url}/rest/api/3/issue"
+    jira_warnings: list[str] = []
+
+    def post_issue() -> requests.Response:
+        return requests.post(issue_url, headers=headers, json={"fields": fields}, timeout=30)
+
+    response = post_issue()
+    if response.status_code >= 400 and priority and _looks_like_jira_priority_error(response.text):
+        LOGGER.warning("Jira rejected priority '%s'. Retrying issue creation without priority.", priority)
+        fields.pop("priority", None)
+        jira_warnings.append(f"Jira rejected configured priority '{priority}', so the issue was created without an explicit priority.")
+        response = post_issue()
+    if response.status_code >= 400 and _looks_like_jira_issue_type_error(response.text):
+        fallback_types = issue_type_fallbacks if issue_type_fallbacks is not None else ["Task"]
+        used_issue_types = {issue_type.casefold()}
+        for fallback_type in fallback_types:
+            clean_fallback = str(fallback_type or "").strip()
+            if not clean_fallback or clean_fallback.casefold() in used_issue_types:
+                continue
+            used_issue_types.add(clean_fallback.casefold())
+            LOGGER.warning("Jira rejected issue type '%s'. Retrying issue creation as %s.", issue_type, clean_fallback)
+            fields["issuetype"] = {"name": clean_fallback}
+            jira_warnings.append(
+                f"Jira rejected issue type '{issue_type}', so Log Monitor retried issue creation as '{clean_fallback}'."
+            )
+            response = post_issue()
+            if response.status_code < 400 or not _looks_like_jira_issue_type_error(response.text):
+                break
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(f"Jira issue creation failed ({response.status_code}). {_truncate(response.text, 2000)}") from exc
+    return response.json(), jira_warnings
+
+
 def _build_jira_description(payload: dict, prediction_result: dict, github_context: dict) -> str:
     message = _extract_message(payload)
     lines = [
@@ -432,7 +527,7 @@ def _build_jira_description(payload: dict, prediction_result: dict, github_conte
 
 
 def _create_jira_issue(payload: dict, prediction_result: dict, github_context: dict) -> dict:
-    site_url = _require_env("LOGMONITOR_JIRA_SITE_URL").rstrip("/")
+    site_url = _normalize_jira_site_url(_require_env("LOGMONITOR_JIRA_SITE_URL"))
     account_email = _require_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL")
     api_token = _require_env("LOGMONITOR_JIRA_API_TOKEN")
     project_key = _require_env("LOGMONITOR_JIRA_PROJECT_KEY")
@@ -442,7 +537,6 @@ def _create_jira_issue(payload: dict, prediction_result: dict, github_context: d
     message = _extract_message(payload)
     summary = _truncate("Log Monitor Error: " + (message.splitlines()[0] if message else "unclassified runtime error"), 240)
     description_text = _build_jira_description(payload, prediction_result, github_context)
-    auth_token = base64.b64encode(f"{account_email}:{api_token}".encode("utf-8")).decode("ascii")
     fields = {
         "project": {"key": project_key},
         "summary": summary,
@@ -454,26 +548,221 @@ def _create_jira_issue(payload: dict, prediction_result: dict, github_context: d
     if priority:
         fields["priority"] = {"name": priority}
 
-    response = requests.post(
-        f"{site_url}/rest/api/3/issue",
-        headers={
-            "Authorization": f"Basic {auth_token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-        json={"fields": fields},
-        timeout=30,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        raise RuntimeError(f"Jira issue creation failed ({response.status_code}). {_truncate(response.text, 2000)}") from exc
-    result = response.json()
+    headers = _jira_auth_headers(account_email, api_token)
+    result, jira_warnings = _post_jira_issue_with_fallbacks(site_url, headers, fields, issue_type, priority, ["Task"])
     issue_key = str(result.get("key") or "")
     return {
         "issue_key": issue_key,
         "issue_url": f"{site_url}/browse/{issue_key}" if issue_key else "",
         "jira_response": result,
+        "jira_warnings": jira_warnings,
+    }
+
+
+def _monitoring_enabled() -> bool:
+    return _get_env("LOGMONITOR_JIRA_MONITORING_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+
+
+def _prediction_monitoring_day(received_at: object) -> str:
+    text = str(received_at or "").strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        return text[:10]
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _new_monitoring_day(day_key: str) -> dict:
+    return {
+        "date": day_key,
+        "total": 0,
+        "counts": {label: 0 for label in LABEL_NAMES},
+        "unknown_predictions": {},
+        "action_status_counts": {"ok": 0, "partial_failure": 0},
+        "jira_created": 0,
+        "jira_failed": 0,
+        "actions_by_type": {},
+        "first_seen_at": _now_utc_iso(),
+        "updated_at": _now_utc_iso(),
+    }
+
+
+def _increment_count(container: dict, key: str, amount: int = 1) -> None:
+    clean_key = str(key or "unknown")
+    container[clean_key] = int(container.get(clean_key, 0) or 0) + int(amount)
+
+
+def _build_monitoring_summary_text(day: dict) -> str:
+    counts = day.get("counts") if isinstance(day.get("counts"), dict) else {}
+    action_counts = day.get("action_status_counts") if isinstance(day.get("action_status_counts"), dict) else {}
+    actions_by_type = day.get("actions_by_type") if isinstance(day.get("actions_by_type"), dict) else {}
+    unknown_predictions = day.get("unknown_predictions") if isinstance(day.get("unknown_predictions"), dict) else {}
+    lines = [
+        f"Log Monitor Prediction Summary - {day.get('date', '')}",
+        "",
+        f"Endpoint: {_get_env('LOGMONITOR_SOURCE_ENDPOINT_NAME')}",
+        f"Service kind: {_get_env('LOGMONITOR_HOSTING_SERVICE_KIND')}",
+        f"Updated at: {day.get('updated_at', '')}",
+        "",
+        "Prediction counts:",
+    ]
+    for label in LABEL_NAMES:
+        lines.append(f"- {label}: {int(counts.get(label, 0) or 0)}")
+    if unknown_predictions:
+        lines.append("- Unknown: " + json.dumps(unknown_predictions, ensure_ascii=True, sort_keys=True))
+    lines.extend(
+        [
+            "",
+            f"Total predictions: {int(day.get('total', 0) or 0)}",
+            f"Jira incident issues created from Error predictions: {int(day.get('jira_created', 0) or 0)}",
+            f"Error predictions where Jira incident creation failed: {int(day.get('jira_failed', 0) or 0)}",
+            "",
+            "Action status counts:",
+        ]
+    )
+    for key in sorted(action_counts):
+        lines.append(f"- {key}: {int(action_counts.get(key, 0) or 0)}")
+    lines.append("")
+    lines.append("Actions by type:")
+    if actions_by_type:
+        for key in sorted(actions_by_type):
+            lines.append(f"- {key}: {int(actions_by_type.get(key, 0) or 0)}")
+    else:
+        lines.append("- none: 0")
+    last_prediction = day.get("last_prediction") if isinstance(day.get("last_prediction"), dict) else {}
+    if last_prediction:
+        lines.extend(
+            [
+                "",
+                "Last prediction:",
+                json.dumps(last_prediction, ensure_ascii=True, indent=2)[:5000],
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _upsert_jira_monitoring_issue(day: dict) -> dict:
+    site_url = _normalize_jira_site_url(_require_env("LOGMONITOR_JIRA_SITE_URL"))
+    account_email = _require_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL")
+    api_token = _require_env("LOGMONITOR_JIRA_API_TOKEN")
+    project_key = _require_env("LOGMONITOR_JIRA_PROJECT_KEY")
+    issue_type = _get_env("LOGMONITOR_JIRA_MONITORING_ISSUE_TYPE", "Task") or "Task"
+    configured_issue_type = _get_env("LOGMONITOR_JIRA_ISSUE_TYPE", "Bug") or "Bug"
+    labels = _parse_jira_labels(
+        _get_env("LOGMONITOR_JIRA_MONITORING_LABELS", "log-monitor,ml-monitoring,prediction-summary")
+    )
+    summary = _truncate(f"Log Monitor Prediction Summary - {day.get('date', '')}", 240)
+    description = _jira_adf_from_text(_build_monitoring_summary_text(day))
+    headers = _jira_auth_headers(account_email, api_token)
+    issue_key = str(day.get("jira_summary_issue_key") or "").strip()
+
+    if issue_key:
+        response = requests.put(
+            f"{site_url}/rest/api/3/issue/{issue_key}",
+            headers=headers,
+            json={"fields": {"summary": summary, "description": description}},
+            timeout=30,
+        )
+        if response.status_code != 404:
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                raise RuntimeError(f"Jira summary update failed ({response.status_code}). {_truncate(response.text, 2000)}") from exc
+            return {
+                "issue_key": issue_key,
+                "issue_url": f"{site_url}/browse/{issue_key}",
+                "operation": "updated",
+            }
+
+    fields = {
+        "project": {"key": project_key},
+        "summary": summary,
+        "description": description,
+        "issuetype": {"name": issue_type},
+    }
+    if labels:
+        fields["labels"] = labels
+    result, jira_warnings = _post_jira_issue_with_fallbacks(
+        site_url,
+        headers,
+        fields,
+        issue_type,
+        "",
+        [configured_issue_type, "Bug", "Task"],
+    )
+    issue_key = str(result.get("key") or "")
+    return {
+        "issue_key": issue_key,
+        "issue_url": f"{site_url}/browse/{issue_key}" if issue_key else "",
+        "operation": "created",
+        "jira_warnings": jira_warnings,
+    }
+
+
+def _record_prediction_monitoring(
+    payload: dict,
+    prediction_result: dict,
+    prediction: str,
+    actions: list[dict],
+    action_errors: list[dict],
+    jira_issue: dict,
+) -> dict:
+    if not _monitoring_enabled():
+        return {"enabled": False, "reason": "Jira prediction monitoring is disabled."}
+
+    state = _load_monitoring_state()
+    days = state.setdefault("days", {})
+    day_key = _prediction_monitoring_day(payload.get("received_at") if isinstance(payload, dict) else "")
+    day = days.setdefault(day_key, _new_monitoring_day(day_key))
+    counts = day.setdefault("counts", {label: 0 for label in LABEL_NAMES})
+    action_status_counts = day.setdefault("action_status_counts", {"ok": 0, "partial_failure": 0})
+    actions_by_type = day.setdefault("actions_by_type", {})
+    unknown_predictions = day.setdefault("unknown_predictions", {})
+
+    normalized_prediction = LABEL_ALIASES.get(str(prediction or "").casefold(), str(prediction or "Unknown"))
+    day["total"] = int(day.get("total", 0) or 0) + 1
+    if normalized_prediction in LABEL_NAMES:
+        _increment_count(counts, normalized_prediction)
+    else:
+        _increment_count(unknown_predictions, normalized_prediction)
+
+    action_status = "partial_failure" if action_errors else "ok"
+    _increment_count(action_status_counts, action_status)
+    for action in actions:
+        if isinstance(action, dict):
+            _increment_count(actions_by_type, str(action.get("type") or "unknown"))
+    if normalized_prediction == "Error":
+        if jira_issue.get("issue_key"):
+            day["jira_created"] = int(day.get("jira_created", 0) or 0) + 1
+        else:
+            day["jira_failed"] = int(day.get("jira_failed", 0) or 0) + 1
+
+    day["last_prediction"] = {
+        "prediction": normalized_prediction,
+        "received_at": payload.get("received_at") if isinstance(payload, dict) else "",
+        "action_status": action_status,
+        "jira_created": bool(jira_issue.get("issue_key")),
+        "jira_issue_key": str(jira_issue.get("issue_key") or ""),
+        "raw_prediction": prediction_result.get("raw_response", ""),
+    }
+    day["updated_at"] = _now_utc_iso()
+    state["latest_day"] = day_key
+    state["updated_at"] = day["updated_at"]
+    _write_monitoring_state(state)
+
+    summary_issue = _upsert_jira_monitoring_issue(day)
+    day["jira_summary_issue_key"] = str(summary_issue.get("issue_key") or "")
+    day["jira_summary_issue_url"] = str(summary_issue.get("issue_url") or "")
+    day["jira_summary_updated_at"] = _now_utc_iso()
+    day["jira_summary_operation"] = str(summary_issue.get("operation") or "")
+    state["updated_at"] = day["jira_summary_updated_at"]
+    _write_monitoring_state(state)
+    return {
+        "enabled": True,
+        "date": day_key,
+        "counts": day.get("counts", {}),
+        "total": day.get("total", 0),
+        "jira_summary_issue_key": day.get("jira_summary_issue_key", ""),
+        "jira_summary_issue_url": day.get("jira_summary_issue_url", ""),
+        "jira_summary_operation": day.get("jira_summary_operation", ""),
     }
 
 
@@ -590,6 +879,32 @@ def _load_feedback_state() -> dict:
 
 def _write_feedback_state(state: dict) -> None:
     blob_client = _get_container_client().get_blob_client(_get_feedback_state_blob_name())
+    payload = json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True)
+    blob_client.upload_blob(
+        payload.encode("utf-8"),
+        overwrite=True,
+        content_settings=ContentSettings(content_type="application/json"),
+    )
+
+
+def _load_monitoring_state() -> dict:
+    blob_client = _get_container_client().get_blob_client(_get_monitoring_state_blob_name())
+    try:
+        body = blob_client.download_blob().readall()
+    except ResourceNotFoundError:
+        return {}
+    except Exception:
+        LOGGER.exception("Failed to read prediction monitoring state blob.")
+        return {}
+    try:
+        return json.loads(body.decode("utf-8"))
+    except Exception:
+        LOGGER.exception("Failed to parse prediction monitoring state blob.")
+        return {}
+
+
+def _write_monitoring_state(state: dict) -> None:
+    blob_client = _get_container_client().get_blob_client(_get_monitoring_state_blob_name())
     payload = json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True)
     blob_client.upload_blob(
         payload.encode("utf-8"),
@@ -1018,7 +1333,16 @@ def submit_feedback(req: func.HttpRequest) -> func.HttpResponse:
 def feedback_status(req: func.HttpRequest) -> func.HttpResponse:
     del req
     state = _load_feedback_state()
-    return _to_json_response({"feedback_state": state}, 200)
+    monitoring_state = _load_monitoring_state()
+    return _to_json_response(
+        {
+            "feedback_state": state,
+            "prediction_monitoring_state": monitoring_state,
+            "triage_enabled": _get_env("LOGMONITOR_TRIAGE_ENABLED", "0").lower() in {"1", "true", "yes", "on"},
+            "jira_config": _jira_config_status(),
+        },
+        200,
+    )
 
 
 @app.function_name(name="triage_log")
@@ -1067,8 +1391,11 @@ def triage_log(req: func.HttpRequest) -> func.HttpResponse:
     prediction = LABEL_ALIASES.get(str(prediction_result.get("prediction", "")).casefold(), prediction_result.get("prediction", ""))
     actions: list[dict] = []
     action_errors: list[dict] = []
+    monitoring_errors: list[dict] = []
     github_context: dict = {}
     jira_issue: dict = {}
+    monitoring_summary: dict = {}
+    jira_config = _jira_config_status()
 
     if prediction == "Noise":
         actions.append({"type": "ignore", "reason": "Prediction was Noise."})
@@ -1101,22 +1428,45 @@ def triage_log(req: func.HttpRequest) -> func.HttpResponse:
             actions.append({"type": "jira", **jira_issue})
         except Exception as exc:
             LOGGER.exception("Failed to create Jira issue.")
-            action_errors.append({"type": "jira", "error": str(exc), "github_context": github_context})
+            action_errors.append({"type": "jira", "error": str(exc), "github_context": github_context, "jira_config": jira_config})
     else:
         actions.append({"type": "none", "reason": f"No triage rule is configured for prediction '{prediction}'."})
 
+    try:
+        monitoring_summary = _record_prediction_monitoring(
+            normalized,
+            prediction_result,
+            prediction,
+            actions,
+            action_errors,
+            jira_issue,
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to update Jira prediction monitoring summary.")
+        monitoring_errors.append({"type": "jira_monitoring", "error": str(exc), "jira_config": jira_config})
+
+    jira_created = bool(jira_issue.get("issue_key"))
+    status_code = 200
+    if prediction == "Error" and not jira_created:
+        status_code = 502
+
     return _to_json_response(
         {
-            "accepted": True,
+            "accepted": status_code == 200,
             "prediction": prediction,
+            "action_status": "partial_failure" if action_errors or monitoring_errors else "ok",
             "actions": actions,
             "action_errors": action_errors,
+            "monitoring": monitoring_summary,
+            "monitoring_errors": monitoring_errors,
             "github_context": github_context,
+            "jira_config": jira_config,
             "jira_issue": jira_issue,
+            "jira_created": jira_created,
             "received_at": normalized.get("received_at"),
             "caveat": (
                 "GitHub history is an investigation aid only. A matching or recent commit does not prove developer impact."
             ),
         },
-        200,
+        status_code,
     )

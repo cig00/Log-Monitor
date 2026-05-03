@@ -438,6 +438,9 @@ Azure real-time endpoint hosting can also expose a Function-backed triage endpoi
 - Configuration email and System email
 - Azure Communication Services connection string and Email sender address. Use the single `Load Azure Resources` button in hosting to authenticate once, load Azure ML models, and fill the ACS connection/sender dropdowns. If no ACS resources exist, the app creates a default Communication Services resource, Email service, Azure-managed domain, and sender so the workflow is not blocked.
 - Jira site URL, account email, API token, project key, issue type, optional priority, and labels
+- Jira priority must be a Jira priority name such as `Highest`, `High`, `Medium`, or `Low`; if Jira rejects the optional priority, the Function retries issue creation without that field
+- Jira site URL can be either the base Atlassian URL or a copied project/board URL; the Function normalizes it to the site root before calling Jira
+- If Jira rejects the configured issue type, the Function retries the issue as `Task`
 
 Triage behavior:
 
@@ -445,6 +448,8 @@ Triage behavior:
 - `CONFIGURATION`: sends email to the configured configuration recipient
 - `SYSTEM`: sends email to the configured system recipient
 - `Error`: creates a Jira issue with the log payload, prediction response, endpoint metadata, and GitHub commit context
+- if Jira issue creation fails for an `Error` prediction, the triage endpoint returns `action_status: partial_failure`, `jira_created: false`, and the Jira error/config summary in `action_errors`
+- every triage prediction updates a daily Jira `Log Monitor Prediction Summary - YYYY-MM-DD` issue with counts for `Error`, `CONFIGURATION`, `SYSTEM`, and `Noise`, plus Jira incident success/failure counts
 
 GitHub history is included only as a non-conclusive investigation signal. A recent or matching commit is not treated as proof that a developer caused the error.
 
@@ -794,6 +799,11 @@ Azure scoring notes:
 Azure hosting instance selection:
 
 - CPU tries these sizes in order:
+  - `Standard_D2as_v4`
+  - `Standard_DS2_v2`
+  - `Standard_DS1_v2`
+  - `Standard_F2s_v2`
+  - `Standard_E2s_v3`
   - `Standard_DS3_v2`
   - `Standard_E4s_v3`
 - GPU tries:

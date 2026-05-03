@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 import tempfile
+import types
 import unittest
 import zipfile
 from pathlib import Path
@@ -51,6 +54,100 @@ class ServiceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def load_function_bridge_module(self):
+        class FakeFunctionApp:
+            def function_name(self, **_kwargs):
+                return lambda func: func
+
+            def route(self, **_kwargs):
+                return lambda func: func
+
+            def schedule(self, **_kwargs):
+                return lambda func: func
+
+        class FakeHttpResponse:
+            def __init__(self, body=None, status_code=200, mimetype=None):
+                self.body = body
+                self.status_code = status_code
+                self.mimetype = mimetype
+
+        class FakeResourceNotFoundError(Exception):
+            pass
+
+        class FakeContentSettings:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        azure = types.ModuleType("azure")
+        azure.__path__ = []
+        azure_functions = types.ModuleType("azure.functions")
+        azure_functions.FunctionApp = FakeFunctionApp
+        azure_functions.HttpRequest = object
+        azure_functions.HttpResponse = FakeHttpResponse
+        azure_functions.TimerRequest = object
+        azure_functions.AuthLevel = SimpleNamespace(FUNCTION="FUNCTION")
+        azure.functions = azure_functions
+
+        azure_ai = types.ModuleType("azure.ai")
+        azure_ai.__path__ = []
+        azure_ai_ml = types.ModuleType("azure.ai.ml")
+        azure_ai_ml.__path__ = []
+        azure_ai_ml.Input = lambda **kwargs: SimpleNamespace(**kwargs)
+        azure_ai_ml.MLClient = object
+        azure_ai_ml.command = lambda **kwargs: SimpleNamespace(**kwargs)
+        azure_ai_ml_constants = types.ModuleType("azure.ai.ml.constants")
+        azure_ai_ml_constants.AssetTypes = SimpleNamespace(URI_FILE="uri_file")
+        azure_ai_ml_entities = types.ModuleType("azure.ai.ml.entities")
+        azure_ai_ml_entities.AmlCompute = object
+        azure_ai_ml_entities.Data = object
+        azure.ai = azure_ai
+        azure_ai.ml = azure_ai_ml
+        azure_ai_ml.constants = azure_ai_ml_constants
+        azure_ai_ml.entities = azure_ai_ml_entities
+
+        azure_core = types.ModuleType("azure.core")
+        azure_core.__path__ = []
+        azure_core_exceptions = types.ModuleType("azure.core.exceptions")
+        azure_core_exceptions.ResourceNotFoundError = FakeResourceNotFoundError
+        azure.core = azure_core
+        azure_core.exceptions = azure_core_exceptions
+
+        azure_identity = types.ModuleType("azure.identity")
+        azure_identity.DefaultAzureCredential = object
+        azure_servicebus = types.ModuleType("azure.servicebus")
+        azure_servicebus.ServiceBusClient = object
+        azure_servicebus.ServiceBusMessage = object
+        azure_storage = types.ModuleType("azure.storage")
+        azure_storage.__path__ = []
+        azure_storage_blob = types.ModuleType("azure.storage.blob")
+        azure_storage_blob.BlobServiceClient = object
+        azure_storage_blob.ContentSettings = FakeContentSettings
+        azure.identity = azure_identity
+        azure.servicebus = azure_servicebus
+        azure.storage = azure_storage
+        azure_storage.blob = azure_storage_blob
+
+        stubs = {
+            "azure": azure,
+            "azure.functions": azure_functions,
+            "azure.ai": azure_ai,
+            "azure.ai.ml": azure_ai_ml,
+            "azure.ai.ml.constants": azure_ai_ml_constants,
+            "azure.ai.ml.entities": azure_ai_ml_entities,
+            "azure.core": azure_core,
+            "azure.core.exceptions": azure_core_exceptions,
+            "azure.identity": azure_identity,
+            "azure.servicebus": azure_servicebus,
+            "azure.storage": azure_storage,
+            "azure.storage.blob": azure_storage_blob,
+        }
+        bridge_path = Path(__file__).resolve().parents[1] / "azure_function_bridge" / "function_app.py"
+        spec = importlib.util.spec_from_file_location("bridge_function_app_under_test", bridge_path)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, stubs):
+            spec.loader.exec_module(module)
+        return module
 
     def test_github_service_fetches_repo_and_branch_names(self):
         service = GitHubService()
@@ -384,6 +481,32 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(fake_client.data.created.tags, {"pipeline_id": "abc"})
         self.assertEqual(len(service.sanitize_azure_asset_version("a" * 64)), 30)
 
+    def test_azure_host_instance_candidates_start_with_smaller_cpu_sizes(self):
+        candidates = self.azure_platform.get_azure_host_instance_candidates("cpu")
+
+        self.assertEqual(candidates[0], "Standard_D2as_v4")
+        self.assertIn("Standard_DS2_v2", candidates)
+        self.assertIn("Standard_DS3_v2", candidates)
+        self.assertIn("Standard_E4s_v3", candidates)
+        self.assertLess(candidates.index("Standard_D2as_v4"), candidates.index("Standard_E4s_v3"))
+
+    def test_azure_quota_error_is_formatted_with_attempted_host_sizes(self):
+        raw_error = (
+            "BadRequest: Not enough quota available for Standard_E4s_v3 in Subscription. "
+            "Additional needed: 8"
+        )
+
+        message = self.azure_platform.format_azure_hosting_error(
+            RuntimeError(raw_error),
+            ["Standard_D2as_v4", "Standard_DS2_v2", "Standard_E4s_v3"],
+        )
+
+        self.assertIn("does not have enough quota", message)
+        self.assertIn("Standard_D2as_v4", message)
+        self.assertIn("Standard_E4s_v3", message)
+        self.assertIn("Request a quota increase", message)
+        self.assertNotIn("BadRequest", message)
+
     def test_function_bridge_package_includes_feedback_retraining_code(self):
         bridge_root = self.project_dir / "azure_function_bridge"
         bridge_root.mkdir(parents=True, exist_ok=True)
@@ -402,6 +525,104 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("train.py", names)
         self.assertIn("mlops_utils.py", names)
         self.assertIn("requirements.train.txt", names)
+
+    def test_function_bridge_normalizes_copied_jira_project_url(self):
+        bridge = self.load_function_bridge_module()
+
+        site_url = bridge._normalize_jira_site_url("https://eece00.atlassian.net/jira/software/projects/KAN/boards/1")
+
+        self.assertEqual(site_url, "https://eece00.atlassian.net")
+
+    def test_function_bridge_jira_issue_retries_without_invalid_priority(self):
+        bridge = self.load_function_bridge_module()
+
+        class FakeResponse:
+            def __init__(self, status_code, text, payload=None):
+                self.status_code = status_code
+                self.text = text
+                self._payload = payload or {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise bridge.requests.HTTPError(self.text)
+
+            def json(self):
+                return self._payload
+
+        fields = {
+            "project": {"key": "KAN"},
+            "summary": "summary",
+            "description": {},
+            "issuetype": {"name": "Bug"},
+            "priority": {"name": "200"},
+        }
+        responses = [
+            FakeResponse(400, '{"errors":{"priority":"Priority is not valid"}}'),
+            FakeResponse(201, "{}", {"key": "KAN-12"}),
+        ]
+        posted_fields = []
+
+        def fake_post(_url, headers=None, json=None, timeout=None):
+            del headers, timeout
+            posted_fields.append(dict(json["fields"]))
+            return responses.pop(0)
+
+        with mock.patch.object(bridge.requests, "post", side_effect=fake_post):
+            result, warnings = bridge._post_jira_issue_with_fallbacks(
+                "https://eece00.atlassian.net",
+                {"Authorization": "Basic token"},
+                fields,
+                "Bug",
+                "200",
+            )
+
+        self.assertEqual(result["key"], "KAN-12")
+        self.assertIn("priority", posted_fields[0])
+        self.assertNotIn("priority", posted_fields[1])
+        self.assertTrue(warnings)
+
+    def test_function_bridge_prediction_monitoring_counts_and_links_daily_jira_summary(self):
+        bridge = self.load_function_bridge_module()
+        state_writes = []
+
+        def capture_state_write(state):
+            state_writes.append(json.loads(json.dumps(state)))
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_JIRA_MONITORING_ENABLED": "1",
+                "LOGMONITOR_SOURCE_ENDPOINT_NAME": "log-monitor-endpoint",
+                "LOGMONITOR_HOSTING_SERVICE_KIND": "real-time endpoint",
+            },
+            clear=False,
+        ), mock.patch.object(bridge, "_load_monitoring_state", return_value={}), mock.patch.object(
+            bridge,
+            "_write_monitoring_state",
+            side_effect=capture_state_write,
+        ), mock.patch.object(
+            bridge,
+            "_upsert_jira_monitoring_issue",
+            return_value={
+                "issue_key": "KAN-55",
+                "issue_url": "https://eece00.atlassian.net/browse/KAN-55",
+                "operation": "created",
+            },
+        ):
+            summary = bridge._record_prediction_monitoring(
+                {"received_at": "2026-05-03T10:15:00Z", "message": "handled"},
+                {"prediction": "Noise", "raw_response": {"prediction": "Noise"}},
+                "Noise",
+                [{"type": "ignore"}],
+                [],
+                {},
+            )
+
+        self.assertEqual(summary["date"], "2026-05-03")
+        self.assertEqual(summary["counts"]["Noise"], 1)
+        self.assertEqual(summary["total"], 1)
+        self.assertEqual(summary["jira_summary_issue_key"], "KAN-55")
+        self.assertEqual(state_writes[-1]["days"]["2026-05-03"]["actions_by_type"]["ignore"], 1)
 
     def test_hosting_feedback_bridge_configures_mode_agnostic_feedback_endpoint(self):
         dataset_path = self.project_dir / "base.csv"
@@ -518,6 +739,9 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_SYSTEM_EMAIL"], "email2@example.test")
         self.assertEqual(captured["settings"]["LOGMONITOR_GITHUB_REPO"], "owner/repo")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_PROJECT_KEY"], "OPS")
+        self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_MONITORING_ENABLED"], "1")
+        self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_MONITORING_ISSUE_TYPE"], "Task")
+        self.assertEqual(captured["settings"]["LOGMONITOR_MONITORING_STATE_BLOB"], "monitoring/prediction-summary-state.json")
 
     def test_hosting_run_blocks_when_gate_fails(self):
         request = HostingRequest(model_dir=str(self.project_dir), mode="local")

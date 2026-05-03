@@ -643,6 +643,7 @@ class HostingService:
                 or clean_optional_string(result.get("serverless_endpoints_studio_url"))
                 or clean_optional_string(result.get("mlops_url"))
             )
+            prompt_template_info = self.github_service.get_log_forwarding_prompt_template_info()
             prompt_text = self.github_service.build_log_forwarding_copilot_prompt(
                 repo_name=request.github_repo,
                 base_branch=request.github_branch,
@@ -665,6 +666,7 @@ class HostingService:
                     "hosting_mode": request.mode,
                     "copilot_model": "github-default-best-available",
                     "copilot_assignee": "copilot-swe-agent[bot]",
+                    **prompt_template_info,
                 },
             )
             prompt_text = self.github_service.build_log_forwarding_copilot_prompt(
@@ -692,6 +694,7 @@ class HostingService:
                     "copilot_model": "github-default-best-available",
                     "copilot_assignee": "copilot-swe-agent[bot]",
                     "bootstrap_copilot_prompt_version_id": clean_optional_string(prompt_info.get("copilot_prompt_version_id")),
+                    **prompt_template_info,
                 },
             )
             pr_task = self.github_service.create_copilot_log_forwarding_pr_task(
@@ -722,6 +725,7 @@ class HostingService:
                         "github_issue_url": clean_optional_string(pr_task.get("html_url")),
                         "copilot_model": clean_optional_string(pr_task.get("copilot_model")),
                         "copilot_assignee": clean_optional_string(pr_task.get("copilot_assignee")),
+                        **prompt_template_info,
                     },
                 )
             )
@@ -740,6 +744,7 @@ class HostingService:
                     "hosting_mode": request.mode,
                     "github_issue_url": clean_optional_string(pr_task.get("html_url")),
                     "copilot_model": clean_optional_string(pr_task.get("copilot_model")),
+                    **prompt_template_info,
                 },
             )
             prompt_info.update(prompt_mlflow_info)

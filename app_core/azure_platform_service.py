@@ -1461,6 +1461,13 @@ class AzurePlatformService:
         )
         self.azure_management_json_request(credential, "POST", url, payload={}, expected_statuses=(200, 202, 204))
 
+    def restart_function_app(self, credential, sub_id: str, function_app_name: str) -> None:
+        url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.resource_group}"
+            f"/providers/Microsoft.Web/sites/{function_app_name}/restart?api-version=2025-03-01"
+        )
+        self.azure_management_json_request(credential, "POST", url, payload={}, expected_statuses=(200, 202, 204))
+
     def update_online_deployment_environment_variables(
         self,
         ml_client,
@@ -1521,9 +1528,13 @@ class AzurePlatformService:
         )
         deadline = time.time() + max(int(timeout_seconds), 1)
         poll_interval = max(int(poll_interval_seconds), 1)
+        sync_interval = max(poll_interval * 6, 60)
+        restart_after_seconds = min(max(int(timeout_seconds) // 3, 120), 300)
+        started_at = time.time()
         last_error = ""
         last_function_names: list[str] = []
-        sync_attempted = False
+        last_sync_at = 0.0
+        restart_attempted = False
         while time.time() < deadline:
             try:
                 last_function_names = self.list_function_app_function_names(credential, sub_id, function_app_name)
@@ -1556,17 +1567,29 @@ class AzurePlatformService:
                         return f"https://{function_host_name}/api/{route_path.strip('/')}?code={function_key}", function_key
                 except Exception as exc:
                     last_error = str(exc)
-            elif not sync_attempted:
-                try:
-                    self.sync_function_app_triggers(credential, sub_id, function_app_name)
-                except Exception as exc:
-                    last_error = str(exc)
-                sync_attempted = True
+            else:
+                now = time.time()
+                if now - last_sync_at >= sync_interval:
+                    try:
+                        self.sync_function_app_triggers(credential, sub_id, function_app_name)
+                    except Exception as exc:
+                        last_error = str(exc)
+                    last_sync_at = now
+                if not restart_attempted and now - started_at >= restart_after_seconds:
+                    try:
+                        self.restart_function_app(credential, sub_id, function_app_name)
+                    except Exception as exc:
+                        last_error = str(exc)
+                    restart_attempted = True
+                    last_sync_at = 0.0
             time.sleep(poll_interval)
         visible_functions = ", ".join(last_function_names) if last_function_names else "none"
         raise RuntimeError(
             f"The Azure Function API package was deployed, but Azure did not index `{function_name}` in time.\n"
             f"Visible functions: {visible_functions}.\n\n"
+            "This happens before the GitHub Copilot prompt is used; the prompt template is not part of the "
+            "Azure Function API package. Common causes are Azure Flex Consumption deployment/indexing delays, "
+            "Python dependency build failures, or a Python import error in the Function app.\n\n"
             "Open the Function App > Log stream or Diagnose and solve problems > Flex Consumption Deployment "
             "to see Python import/build errors from the deployment.\n\n"
             f"Last error:\n{last_error}"

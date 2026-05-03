@@ -362,6 +362,9 @@ class MlopsService:
                     "copilot_prompt_hash",
                     "copilot_prompt_path",
                     "copilot_prompt_comparison_path",
+                    "copilot_prompt_template_path",
+                    "copilot_prompt_template_version_id",
+                    "copilot_prompt_template_version_label",
                 ):
                     value = clean_optional_string(prompt_info.get(key))
                     if value:
@@ -376,6 +379,9 @@ class MlopsService:
                     "service_kind",
                     "hosting_mode",
                     "copilot_model",
+                    "copilot_prompt_template_path",
+                    "copilot_prompt_template_version_id",
+                    "copilot_prompt_template_version_label",
                 ):
                     value = clean_optional_string(metadata.get(key))
                     if value:

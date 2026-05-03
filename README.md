@@ -453,7 +453,7 @@ Triage behavior:
 - every triage response includes sanitized `diagnostics` showing the payload, prediction, selected action, Jira creation, monitoring update, and response stages without returning tokens or connection strings
 - Azure real-time scoring also receives a fire-and-forget `triage/action` Function URL. When callers hit the Azure ML scoring URI directly, `azure_score.py` returns the prediction immediately and starts a background POST to `triage/action` so Jira/email/monitoring can run without blocking the prediction response. The action route uses the already computed prediction and does not call the model again.
 
-GitHub history is included only as a non-conclusive investigation signal. A recent or matching commit is not treated as proof that a developer caused the error.
+GitHub history is included only as a non-conclusive investigation signal. Jira issues show a developer-impact verdict such as `possible_developer_impact`, `message_only_developer_candidate`, `no_direct_developer_evidence`, or `no_developer_candidate_found`, then list candidate commits for manual review. The lookup checks exact commit metadata, commit ranges, source paths, commit-message search, and then hydrates candidates with the GitHub commit diff so the changed files and patch text are scored against the log evidence. If no direct diff candidate is found, the report states that no developer may be responsible while still keeping the raw GitHub evidence visible.
 
 GitHub PAT, repository, and branch are required for Azure hosting so the Function app has enough repository context for incident triage.
 

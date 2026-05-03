@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -130,6 +130,86 @@ _ML_CLIENT = None
 SOURCE_PATH_PATTERN = re.compile(
     r"(?P<path>(?:[A-Za-z]:)?(?:[\w ._-]+[\\/])*[\w.-]+\.(?:py|js|jsx|ts|tsx|java|cs|go|rb|php|c|cc|cpp|h|hpp|rs|kt|swift))"
 )
+COMMIT_SHA_PATTERN = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+COMMIT_SHA_KEYS = (
+    "commitSha",
+    "commit_sha",
+    "commitId",
+    "commit_id",
+    "gitSha",
+    "git_sha",
+    "githubSha",
+    "github_sha",
+    "headSha",
+    "head_sha",
+    "sourceVersion",
+    "source_version",
+    "buildSourceVersion",
+    "build_source_version",
+    "revision",
+    "commit",
+    "GITHUB_SHA",
+    "sha",
+)
+PREVIOUS_COMMIT_SHA_KEYS = (
+    "previousSha",
+    "previous_sha",
+    "baseSha",
+    "base_sha",
+    "beforeSha",
+    "before_sha",
+    "before",
+    "baseCommit",
+    "base_commit",
+    "GITHUB_BASE_SHA",
+)
+BRANCH_KEYS = (
+    "branch",
+    "gitBranch",
+    "git_branch",
+    "githubBranch",
+    "github_branch",
+    "sourceBranch",
+    "source_branch",
+    "GITHUB_REF",
+    "github_ref",
+    "ref",
+)
+GITHUB_SEARCH_STOP_WORDS = {
+    "after",
+    "azure",
+    "because",
+    "before",
+    "called",
+    "class",
+    "code",
+    "configuration",
+    "could",
+    "error",
+    "failed",
+    "failure",
+    "from",
+    "function",
+    "github",
+    "http",
+    "jira",
+    "log",
+    "message",
+    "monitor",
+    "noise",
+    "none",
+    "null",
+    "prediction",
+    "request",
+    "response",
+    "runtime",
+    "server",
+    "service",
+    "system",
+    "trace",
+    "true",
+    "with",
+}
 
 
 def _now_utc_iso() -> str:
@@ -301,16 +381,136 @@ def _get_payload_value(payload: dict, keys: tuple[str, ...]) -> str:
         return ""
     for key in keys:
         value = payload.get(key)
-        if value not in (None, ""):
-            return str(value).strip()
+        clean_value = _payload_scalar(value)
+        if clean_value:
+            return clean_value
     for container_key in ("metadata", "context", "deployment", "git", "github"):
         nested = payload.get(container_key)
         if isinstance(nested, dict):
             for key in keys:
                 value = nested.get(key)
-                if value not in (None, ""):
-                    return str(value).strip()
+                clean_value = _payload_scalar(value)
+                if clean_value:
+                    return clean_value
     return ""
+
+
+def _payload_scalar(value: object) -> str:
+    if value in (None, "") or isinstance(value, (dict, list, tuple, set)):
+        return ""
+    return str(value).strip()
+
+
+def _normalize_payload_key(key: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(key or "").casefold())
+
+
+def _get_nested_payload_value(payload: dict, keys: tuple[str, ...], max_depth: int = 5) -> str:
+    direct = _get_payload_value(payload, keys)
+    if direct:
+        return direct
+    if not isinstance(payload, dict):
+        return ""
+
+    target_keys = {_normalize_payload_key(key) for key in keys if str(key or "").strip()}
+    seen: set[int] = set()
+    stack: list[tuple[object, int]] = [(payload, 0)]
+    while stack:
+        current, depth = stack.pop(0)
+        if depth > max_depth or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, dict):
+            for key, value in current.items():
+                clean_value = _payload_scalar(value)
+                if _normalize_payload_key(key) in target_keys and clean_value:
+                    return clean_value
+                if isinstance(value, (dict, list, tuple)):
+                    stack.append((value, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            for value in current:
+                if isinstance(value, (dict, list, tuple)):
+                    stack.append((value, depth + 1))
+    return ""
+
+
+def _clean_github_branch(raw_branch: object) -> str:
+    branch = str(raw_branch or "").strip()
+    if not branch:
+        return ""
+    for prefix in ("refs/heads/", "origin/"):
+        if branch.startswith(prefix):
+            return branch[len(prefix) :].strip()
+    return branch
+
+
+def _extract_commit_sha(raw_value: object) -> str:
+    text = _payload_scalar(raw_value)
+    if not text:
+        return ""
+    matches = COMMIT_SHA_PATTERN.findall(text)
+    if not matches:
+        return ""
+    return max(matches, key=len)[:40]
+
+
+def _parse_utc_datetime(raw_value: object) -> datetime | None:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _github_lookback_since(payload: dict) -> str:
+    try:
+        lookback_days = max(int(_get_env("LOGMONITOR_GITHUB_LOOKBACK_DAYS", "14") or "14"), 1)
+    except Exception:
+        lookback_days = 14
+    received_at = _parse_utc_datetime(
+        _get_nested_payload_value(payload, ("received_at", "timestamp", "time", "eventTime", "created_at", "createdAt"))
+    ) or datetime.now(timezone.utc)
+    return (received_at - timedelta(days=lookback_days)).date().isoformat()
+
+
+def _extract_github_search_terms(payload: dict, message: str, source_paths: list[str]) -> list[str]:
+    text_parts = [message]
+    if isinstance(payload, dict):
+        text_parts.append(json.dumps(payload, ensure_ascii=True)[:8000])
+    for path in source_paths:
+        text_parts.extend(Path(path).parts)
+    text = "\n".join(part for part in text_parts if part)
+
+    terms: list[str] = []
+
+    def add_term(raw_term: object) -> None:
+        term = re.sub(r"[^A-Za-z0-9_.-]+", "", str(raw_term or "").strip()).strip("._-")
+        if len(term) < 4 or len(term) > 80:
+            return
+        if term.casefold() in GITHUB_SEARCH_STOP_WORDS:
+            return
+        if term.casefold() in {label.casefold() for label in LABEL_NAMES}:
+            return
+        if term not in terms:
+            terms.append(term)
+
+    for match in re.finditer(
+        r"\b([A-Za-z_][A-Za-z0-9_.]*(?:Exception|Error|Failure|Fault|Timeout|Denied|NotFound|Conflict|BadRequest|Unauthorized|Forbidden|Crash))\b",
+        text,
+    ):
+        add_term(match.group(1))
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_.-]{3,})\b", text):
+        add_term(match.group(1))
+        if len(terms) >= 12:
+            break
+    return terms[:12]
 
 
 def _label_from_prediction_text(raw_prediction: object) -> str:
@@ -477,10 +677,32 @@ def _github_request(path: str, params: dict | None = None) -> object:
     return response.json()
 
 
+def _github_search_commits(repo: str, terms: list[str], since_date: str) -> list[dict]:
+    search_terms = [term for term in terms if term][:6]
+    if not repo or not search_terms:
+        return []
+    term_groups = [search_terms[:4], search_terms[:2], search_terms[:1]]
+    for term_group in term_groups:
+        if not term_group:
+            continue
+        query_parts = [f"repo:{repo}", f"committer-date:>={since_date}", *term_group]
+        response = requests.get(
+            "https://api.github.com/search/commits",
+            headers=_github_headers(),
+            params={"q": " ".join(query_parts), "per_page": 5},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict) and isinstance(payload.get("items"), list) and payload["items"]:
+            return [item for item in payload["items"] if isinstance(item, dict)]
+    return []
+
+
 def _extract_source_paths(payload: dict, message: str) -> list[str]:
     candidates: list[str] = []
     for value in (
-        _get_payload_value(payload, ("sourcePath", "source_path", "file", "filename", "path")),
+        _get_nested_payload_value(payload, ("sourcePath", "source_path", "file", "filename", "path")),
         message,
         json.dumps(payload, ensure_ascii=True) if isinstance(payload, dict) else "",
     ):
@@ -488,6 +710,7 @@ def _extract_source_paths(payload: dict, message: str) -> list[str]:
             continue
         for match in SOURCE_PATH_PATTERN.finditer(value):
             path = match.group("path").replace("\\", "/").strip("/")
+            path = re.sub(r"^.*\b(?:in|at|from|file)\s+(?=[^\s]+/)", "", path, flags=re.IGNORECASE).strip("/")
             if path and path not in candidates:
                 candidates.append(path)
     return candidates[:8]
@@ -497,6 +720,7 @@ def _summarize_github_commit(commit: dict, source: str, confidence: str) -> dict
     payload = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
     author = payload.get("author") if isinstance(payload.get("author"), dict) else {}
     github_author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+    committer = payload.get("committer") if isinstance(payload.get("committer"), dict) else {}
     files = commit.get("files") if isinstance(commit.get("files"), list) else []
     return {
         "sha": str(commit.get("sha") or "")[:40],
@@ -506,73 +730,333 @@ def _summarize_github_commit(commit: dict, source: str, confidence: str) -> dict
         "author_email": str(author.get("email") or ""),
         "author_login": str(github_author.get("login") or ""),
         "authored_at": str(author.get("date") or ""),
+        "committed_at": str(committer.get("date") or author.get("date") or ""),
         "source": source,
         "confidence": confidence,
         "files": [str(file_info.get("filename") or "") for file_info in files[:20] if isinstance(file_info, dict)],
     }
 
 
+def _source_path_match(filename: str, source_path: str) -> str:
+    clean_filename = filename.replace("\\", "/").strip("/")
+    clean_source = source_path.replace("\\", "/").strip("/")
+    if not clean_filename or not clean_source:
+        return ""
+    if clean_filename == clean_source:
+        return "exact"
+    if clean_filename.endswith("/" + clean_source) or clean_source.endswith("/" + clean_filename):
+        return "suffix"
+    if Path(clean_filename).name == Path(clean_source).name:
+        return "basename"
+    return ""
+
+
+def _diff_snippet_for_term(filename: str, patch_text: str, term: str) -> str:
+    term_folded = term.casefold()
+    for line in patch_text.splitlines():
+        if term_folded in line.casefold():
+            return _truncate(f"{filename}: {line.strip()}", 240)
+    return ""
+
+
+def _github_diff_evidence(commit: dict, source_paths: list[str], evidence_terms: list[str]) -> dict:
+    files = commit.get("files") if isinstance(commit.get("files"), list) else []
+    changed_files = [str(file_info.get("filename") or "") for file_info in files if isinstance(file_info, dict)]
+    matched_source_paths: list[str] = []
+    matched_files: list[str] = []
+    matched_terms_in_diff: list[str] = []
+    matched_terms_in_changed_files: list[str] = []
+    diff_snippets: list[str] = []
+    score = 0
+
+    for file_info in files:
+        if not isinstance(file_info, dict):
+            continue
+        filename = str(file_info.get("filename") or "")
+        patch_text = str(file_info.get("patch") or "")
+        filename_folded = filename.casefold()
+        patch_folded = patch_text.casefold()
+
+        for source_path in source_paths:
+            match_kind = _source_path_match(filename, source_path)
+            if not match_kind:
+                continue
+            if source_path not in matched_source_paths:
+                matched_source_paths.append(source_path)
+            if filename not in matched_files:
+                matched_files.append(filename)
+            score += 70 if match_kind in {"exact", "suffix"} else 25
+
+        for term in evidence_terms:
+            term_folded = term.casefold()
+            if term_folded in patch_folded:
+                if term not in matched_terms_in_diff:
+                    matched_terms_in_diff.append(term)
+                    snippet = _diff_snippet_for_term(filename, patch_text, term)
+                    if snippet and snippet not in diff_snippets:
+                        diff_snippets.append(snippet)
+                score += 15
+            elif term_folded in filename_folded:
+                if term not in matched_terms_in_changed_files:
+                    matched_terms_in_changed_files.append(term)
+                score += 8
+
+    return {
+        "changed_files": changed_files[:20],
+        "matched_source_paths": matched_source_paths[:8],
+        "matched_files": matched_files[:8],
+        "matched_terms_in_diff": matched_terms_in_diff[:12],
+        "matched_terms_in_changed_files": matched_terms_in_changed_files[:12],
+        "diff_snippets": diff_snippets[:5],
+        "score": min(score, 160),
+    }
+
+
+def _merge_unique(left: object, right: object, limit: int) -> list[str]:
+    merged: list[str] = []
+    for values in (left, right):
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            text = str(value or "")
+            if text and text not in merged:
+                merged.append(text)
+    return merged[:limit]
+
+
+def _merge_github_diff_evidence(existing: object, new: dict) -> dict:
+    old = existing if isinstance(existing, dict) else {}
+    return {
+        "changed_files": _merge_unique(old.get("changed_files"), new.get("changed_files"), 20),
+        "matched_source_paths": _merge_unique(old.get("matched_source_paths"), new.get("matched_source_paths"), 8),
+        "matched_files": _merge_unique(old.get("matched_files"), new.get("matched_files"), 8),
+        "matched_terms_in_diff": _merge_unique(old.get("matched_terms_in_diff"), new.get("matched_terms_in_diff"), 12),
+        "matched_terms_in_changed_files": _merge_unique(
+            old.get("matched_terms_in_changed_files"), new.get("matched_terms_in_changed_files"), 12
+        ),
+        "diff_snippets": _merge_unique(old.get("diff_snippets"), new.get("diff_snippets"), 5),
+        "score": min(int(old.get("score") or 0) + int(new.get("score") or 0), 160),
+    }
+
+
+def _github_confidence_from_score(score: int) -> str:
+    if score >= 80:
+        return "high"
+    if score >= 35:
+        return "medium"
+    return "low"
+
+
+def _github_impact_assessment(candidates: list[dict], lookup_warnings: list[dict]) -> tuple[str, str]:
+    if any(candidate.get("diff_match") or candidate.get("deployment_sha_match") for candidate in candidates):
+        return (
+            "possible_developer_impact",
+            (
+                "Candidate commits have deployment SHA evidence or their actual changed files/patch text match the log. "
+                "A developer change may be related, but this is not proof."
+            ),
+        )
+    if any(candidate.get("source") == "commit_message_search" for candidate in candidates):
+        return (
+            "message_only_developer_candidate",
+            (
+                "Commit-message search found candidates, but their changed files/patch text did not match the extracted log evidence. "
+                "No developer may be responsible; review the diff evidence before assigning ownership."
+            ),
+        )
+    if candidates:
+        return (
+            "no_direct_developer_evidence",
+            (
+                "No deployment SHA, changed-file, or patch-text match was found. Recent commits are included only for context; "
+                "no developer may be responsible."
+            ),
+        )
+    if lookup_warnings:
+        return (
+            "lookup_incomplete",
+            (
+                "GitHub lookup did not return candidate commits because one or more lookup steps failed. "
+                "No developer may be responsible, but the lookup was incomplete."
+            ),
+        )
+    return (
+        "no_developer_candidate_found",
+        (
+            "No developer commit candidate was found by the automatic search. "
+            "This can mean no developer is responsible, or that the relevant code change was not visible in the provided GitHub history."
+        ),
+    )
+
+
 def _find_github_impact_context(payload: dict, message: str) -> dict:
     caveat = (
         "GitHub commit data is a non-conclusive signal only. "
-        "The error may be caused by configuration, infrastructure, external services, data, or runtime state."
+        "Log Monitor never decides that a developer did or did not cause the error automatically. "
+        "The error may be caused by code, configuration, infrastructure, external services, data, or runtime state."
     )
     repo = _get_env("LOGMONITOR_GITHUB_REPO")
-    branch = _get_env("LOGMONITOR_GITHUB_BRANCH")
+    branch = _clean_github_branch(
+        _get_nested_payload_value(payload, BRANCH_KEYS) or _get_env("LOGMONITOR_GITHUB_BRANCH")
+    )
     if not _get_env("LOGMONITOR_GITHUB_TOKEN") or not repo:
-        return {"status": "skipped", "caveat": caveat, "reason": "GitHub token or repository is not configured.", "candidates": []}
+        return {
+            "status": "skipped",
+            "developer_impact_verdict": "lookup_skipped",
+            "conclusion": (
+                "GitHub lookup was skipped because the token or repository was not configured. "
+                "No developer may be responsible, but Log Monitor could not inspect commit history."
+            ),
+            "caveat": caveat,
+            "reason": "GitHub token or repository is not configured.",
+            "candidates": [],
+        }
 
-    candidates: list[dict] = []
-    seen: set[str] = set()
+    candidate_map: dict[str, dict] = {}
+    lookup_warnings: list[dict] = []
+    source_paths = _extract_source_paths(payload, message)
+    evidence_terms = _extract_github_search_terms(payload, message, source_paths)
 
-    def add_candidate(commit: dict, source: str, confidence: str) -> None:
+    def commit_with_diff(commit: dict, source: str) -> dict:
+        files = commit.get("files") if isinstance(commit.get("files"), list) else []
+        if files:
+            return commit
         sha = str(commit.get("sha") or "")
-        if not sha or sha in seen:
+        if not sha:
+            return commit
+        detail = request_or_warn(f"commits/{sha}", lookup=f"{source}_diff")
+        return detail if isinstance(detail, dict) else commit
+
+    def add_candidate(commit: dict, source: str, score: int, matched_terms: list[str] | None = None) -> None:
+        sha = str(commit.get("sha") or "")
+        if not sha:
             return
-        seen.add(sha)
-        candidates.append(_summarize_github_commit(commit, source, confidence))
+        detailed_commit = commit_with_diff(commit, source)
+        diff_evidence = _github_diff_evidence(detailed_commit, source_paths, evidence_terms)
+        diff_score = int(diff_evidence.get("score") or 0)
+        adjusted_score = score + diff_score
+        summary = _summarize_github_commit(detailed_commit, source, _github_confidence_from_score(adjusted_score))
+        diff_match = bool(diff_evidence.get("matched_source_paths") or diff_evidence.get("matched_terms_in_diff"))
+        deployment_sha_match = source in {"payload_commit_sha", "payload_sha_range"}
+        signal = {"source": source, "score": score, "diff_score": diff_score}
+        if matched_terms:
+            signal["matched_terms"] = matched_terms[:6]
+        if sha in candidate_map:
+            existing = candidate_map[sha]
+            existing["score"] = int(existing.get("score") or 0) + adjusted_score
+            existing["confidence"] = _github_confidence_from_score(int(existing["score"]))
+            existing["diff_score"] = int(existing.get("diff_score") or 0) + diff_score
+            existing["diff_match"] = bool(existing.get("diff_match") or diff_match)
+            existing["deployment_sha_match"] = bool(existing.get("deployment_sha_match") or deployment_sha_match)
+            if source not in existing.get("sources", []):
+                existing.setdefault("sources", []).append(source)
+            existing.setdefault("signals", []).append(signal)
+            existing["diff_evidence"] = _merge_github_diff_evidence(existing.get("diff_evidence", {}), diff_evidence)
+            if matched_terms:
+                existing_terms = existing.setdefault("matched_terms", [])
+                for term in matched_terms:
+                    if term not in existing_terms:
+                        existing_terms.append(term)
+            return
+        summary["score"] = adjusted_score
+        summary["diff_score"] = diff_score
+        summary["diff_match"] = diff_match
+        summary["deployment_sha_match"] = deployment_sha_match
+        summary["diff_evidence"] = diff_evidence
+        summary["sources"] = [source]
+        summary["signals"] = [signal]
+        summary["matched_terms"] = matched_terms[:] if matched_terms else []
+        candidate_map[sha] = summary
 
-    try:
-        commit_sha = _get_payload_value(payload, ("commitSha", "commit_sha", "gitSha", "git_sha", "sha"))
-        previous_sha = _get_payload_value(payload, ("previousSha", "previous_sha", "baseSha", "base_sha", "beforeSha", "before"))
-        if commit_sha:
-            commit = _github_request(f"commits/{commit_sha}")
-            if isinstance(commit, dict):
-                add_candidate(commit, "payload.commitSha", "medium")
-        if previous_sha and commit_sha:
-            comparison = _github_request(f"compare/{previous_sha}...{commit_sha}")
-            if isinstance(comparison, dict):
-                for commit in comparison.get("commits", [])[-5:]:
-                    if isinstance(commit, dict):
-                        add_candidate(commit, "payload.sha_range", "medium")
+    def request_or_warn(path: str, params: dict | None = None, lookup: str = "") -> object:
+        try:
+            return _github_request(path, params=params)
+        except Exception as exc:
+            LOGGER.warning("GitHub impact lookup step failed for %s: %s", lookup or path, exc)
+            lookup_warnings.append({"lookup": lookup or path, "error": str(exc)})
+            return None
 
-        source_paths = _extract_source_paths(payload, message)
-        for path in source_paths[:5]:
-            path_commits = _github_request(
-                "commits",
-                params={"sha": branch, "path": path, "per_page": 3} if branch else {"path": path, "per_page": 3},
-            )
-            if isinstance(path_commits, list):
-                for commit in path_commits:
-                    if isinstance(commit, dict):
-                        add_candidate(commit, f"path:{path}", "low")
+    commit_sha = _extract_commit_sha(_get_nested_payload_value(payload, COMMIT_SHA_KEYS))
+    previous_sha = _extract_commit_sha(_get_nested_payload_value(payload, PREVIOUS_COMMIT_SHA_KEYS))
 
-        if not candidates:
-            recent = _github_request("commits", params={"sha": branch, "per_page": 5} if branch else {"per_page": 5})
-            if isinstance(recent, list):
-                for commit in recent:
-                    if isinstance(commit, dict):
-                        add_candidate(commit, "recent_branch_history", "low")
-    except Exception as exc:
-        LOGGER.exception("GitHub impact lookup failed.")
-        return {"status": "error", "caveat": caveat, "error": str(exc), "repo": repo, "branch": branch, "candidates": candidates[:5]}
+    if commit_sha:
+        commit = request_or_warn(f"commits/{commit_sha}", lookup="payload_commit_sha")
+        if isinstance(commit, dict):
+            add_candidate(commit, "payload_commit_sha", 100)
+    if previous_sha and commit_sha:
+        comparison = request_or_warn(f"compare/{previous_sha}...{commit_sha}", lookup="payload_sha_range")
+        if isinstance(comparison, dict):
+            for commit in comparison.get("commits", [])[-5:]:
+                if isinstance(commit, dict):
+                    add_candidate(commit, "payload_sha_range", 75)
+
+    for path in source_paths[:5]:
+        path_commits = request_or_warn(
+            "commits",
+            params={"sha": branch, "path": path, "per_page": 3} if branch else {"path": path, "per_page": 3},
+            lookup=f"path:{path}",
+        )
+        if isinstance(path_commits, list):
+            for commit in path_commits:
+                if isinstance(commit, dict):
+                    add_candidate(commit, f"path:{path}", 45)
+
+    if not candidate_map:
+        if evidence_terms:
+            try:
+                search_commits = _github_search_commits(repo, evidence_terms, _github_lookback_since(payload))
+            except Exception as exc:
+                LOGGER.warning("GitHub commit search failed: %s", exc)
+                lookup_warnings.append({"lookup": "commit_search", "error": str(exc)})
+                search_commits = []
+            for commit in search_commits:
+                commit_text = json.dumps(commit.get("commit", commit), ensure_ascii=True).casefold()
+                matched_terms = [term for term in evidence_terms if term.casefold() in commit_text]
+                add_candidate(commit, "commit_message_search", 35, matched_terms=matched_terms)
+
+    if not candidate_map:
+        recent = request_or_warn(
+            "commits",
+            params={"sha": branch, "per_page": 10, "since": f"{_github_lookback_since(payload)}T00:00:00Z"}
+            if branch
+            else {"per_page": 10, "since": f"{_github_lookback_since(payload)}T00:00:00Z"},
+            lookup="recent_branch_history",
+        )
+        if isinstance(recent, list):
+            for commit in recent:
+                if isinstance(commit, dict):
+                    add_candidate(commit, "recent_branch_history", 10)
+
+    candidates = sorted(
+        candidate_map.values(),
+        key=lambda candidate: (int(candidate.get("score") or 0), candidate.get("committed_at") or candidate.get("authored_at") or ""),
+        reverse=True,
+    )
+    developer_impact_verdict, conclusion = _github_impact_assessment(candidates, lookup_warnings)
+    if candidates:
+        status = (
+            "recent_history_only"
+            if all(candidate.get("source") == "recent_branch_history" for candidate in candidates)
+            else "candidates_found"
+        )
+    elif lookup_warnings:
+        status = "lookup_failed"
+    else:
+        status = "no_candidates_found"
 
     return {
-        "status": "ok" if candidates else "empty",
+        "status": status,
+        "developer_impact_verdict": developer_impact_verdict,
+        "conclusion": conclusion,
         "caveat": caveat,
         "repo": repo,
         "branch": branch,
-        "source_paths": _extract_source_paths(payload, message),
+        "commit_sha": commit_sha,
+        "previous_sha": previous_sha,
+        "source_paths": source_paths,
+        "search_terms": evidence_terms,
+        "non_developer_cause_possible": True,
+        "lookup_warnings": lookup_warnings[:5],
         "candidates": candidates[:5],
     }
 
@@ -692,10 +1176,61 @@ def _post_jira_issue_with_fallbacks(
 
 def _build_jira_description(payload: dict, prediction_result: dict, github_context: dict) -> str:
     message = _extract_message(payload)
+    github_candidates = github_context.get("candidates", []) if isinstance(github_context, dict) else []
+    if not isinstance(github_candidates, list):
+        github_candidates = []
+    developer_verdict = (
+        str(github_context.get("developer_impact_verdict") or "undetermined")
+        if isinstance(github_context, dict)
+        else "undetermined"
+    )
+    github_conclusion = (
+        str(github_context.get("conclusion") or "Developer impact remains undetermined.")
+        if isinstance(github_context, dict)
+        else "Developer impact remains undetermined."
+    )
+    candidate_lines = []
+    for candidate in github_candidates[:5]:
+        if not isinstance(candidate, dict):
+            continue
+        sha = str(candidate.get("sha") or "")[:12]
+        author = str(candidate.get("author_login") or candidate.get("author_name") or candidate.get("author_email") or "unknown")
+        source = str(candidate.get("source") or "unknown")
+        confidence = str(candidate.get("confidence") or "unknown")
+        authored_at = str(candidate.get("authored_at") or "")
+        commit_message = str(candidate.get("message") or "")
+        url = str(candidate.get("html_url") or "")
+        diff_evidence = candidate.get("diff_evidence", {}) if isinstance(candidate.get("diff_evidence"), dict) else {}
+        diff_bits = []
+        if diff_evidence.get("matched_source_paths"):
+            diff_bits.append("matched source paths: " + ", ".join(str(path) for path in diff_evidence["matched_source_paths"][:4]))
+        if diff_evidence.get("matched_terms_in_diff"):
+            diff_bits.append("matched patch terms: " + ", ".join(str(term) for term in diff_evidence["matched_terms_in_diff"][:6]))
+        if diff_evidence.get("matched_terms_in_changed_files"):
+            diff_bits.append(
+                "matched changed-file terms: " + ", ".join(str(term) for term in diff_evidence["matched_terms_in_changed_files"][:6])
+            )
+        if diff_evidence.get("changed_files"):
+            diff_bits.append("changed files: " + ", ".join(str(path) for path in diff_evidence["changed_files"][:5]))
+        diff_summary = " | ".join(diff_bits) if diff_bits else "no changed-file or patch-text match found"
+        candidate_lines.append(
+            f"- {sha} by {author} at {authored_at} [{confidence}, {source}] {commit_message} {url}\n"
+            f"  Diff evidence: {diff_summary}".strip()
+        )
+        for snippet in diff_evidence.get("diff_snippets", [])[:2] if isinstance(diff_evidence.get("diff_snippets"), list) else []:
+            candidate_lines.append(f"  Patch snippet: {snippet}")
+    if not candidate_lines:
+        candidate_lines.append(
+            "- No candidate commit was identified by the automatic lookup. No developer may be responsible, "
+            "or the relevant commit evidence may be missing from the payload/history."
+        )
     lines = [
         "Log Monitor classified this event as Error.",
         "",
-        "Important: GitHub history is included only as investigation context. It is not proof that a developer change caused the error.",
+        "Important: GitHub history is included only as investigation context. It can suggest possible developer impact, but it is not proof.",
+        f"Developer Impact Verdict: {developer_verdict}",
+        f"GitHub Lookup Conclusion: {github_conclusion}",
+        "Non-Developer Cause Possible: yes",
         "",
         f"Received At: {payload.get('received_at', _now_utc_iso()) if isinstance(payload, dict) else _now_utc_iso()}",
         f"Prediction: {prediction_result.get('prediction', '')}",
@@ -706,7 +1241,10 @@ def _build_jira_description(payload: dict, prediction_result: dict, github_conte
         "Log Message:",
         _truncate(message, 5000),
         "",
-        "GitHub Impact Context (non-conclusive):",
+        "Candidate Commits For Manual Review:",
+        "\n".join(candidate_lines),
+        "",
+        "GitHub Impact Context JSON:",
         json.dumps(github_context, ensure_ascii=True, indent=2)[:10000],
         "",
         "Raw Payload:",
@@ -1719,7 +2257,8 @@ def _to_triage_action_response(normalized: dict, result: dict, diagnostics: list
             "jira_created": bool(result.get("jira_created")),
             "received_at": normalized.get("received_at"),
             "caveat": (
-                "GitHub history is an investigation aid only. A matching or recent commit does not prove developer impact."
+                "GitHub history is an investigation aid only. A matching or recent commit does not prove developer impact, "
+                "and no match can mean no developer is responsible or that evidence was unavailable."
             ),
             "diagnostics": diagnostics,
         },

@@ -907,6 +907,178 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(prediction_events[-1]["details"]["source"], "already_predicted")
         self.assertEqual(state_writes[-1]["days"][body["monitoring"]["date"]]["jira_created"], 1)
 
+    def test_function_bridge_github_lookup_reads_nested_commit_metadata(self):
+        bridge = self.load_function_bridge_module()
+        calls = []
+
+        def fake_github_request(path, params=None):
+            calls.append((path, params or {}))
+            if path == "commits/abc123def456":
+                return {
+                    "sha": "abc123def456",
+                    "html_url": "https://github.com/owner/repo/commit/abc123def456",
+                    "commit": {
+                        "message": "Fix deployment crash\n\nDetailed body",
+                        "author": {"name": "Dev One", "email": "dev@example.com", "date": "2026-05-02T17:00:00Z"},
+                    },
+                    "author": {"login": "dev-one"},
+                    "files": [{"filename": "src/app.py", "patch": '+raise RuntimeError("runtime crash")'}],
+                }
+            if path == "commits":
+                return []
+            if path.startswith("compare/"):
+                return {"commits": []}
+            return []
+
+        payload = {
+            "message": "runtime crash in src/app.py",
+            "original_payload": {
+                "commit": {"id": "not-a-scalar-sha"},
+                "metadata": {"sourceVersion": "abc123def456", "sourcePath": "src/app.py"},
+                "git": {"branch": "refs/heads/fix/deployment-crash"},
+            },
+        }
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_GITHUB_TOKEN": "gh-token",
+                "LOGMONITOR_GITHUB_REPO": "owner/repo",
+                "LOGMONITOR_GITHUB_BRANCH": "main",
+            },
+            clear=False,
+        ), mock.patch.object(bridge, "_github_request", side_effect=fake_github_request):
+            context = bridge._find_github_impact_context(payload, payload["message"])
+
+        self.assertIn(("commits/abc123def456", {}), calls)
+        self.assertEqual(context["branch"], "fix/deployment-crash")
+        self.assertEqual(context["status"], "candidates_found")
+        self.assertEqual(context["developer_impact_verdict"], "possible_developer_impact")
+        self.assertTrue(context["non_developer_cause_possible"])
+        self.assertEqual(context["candidates"][0]["author_login"], "dev-one")
+        self.assertEqual(context["candidates"][0]["confidence"], "high")
+        self.assertGreaterEqual(context["candidates"][0]["score"], 170)
+        self.assertEqual(context["candidates"][0]["diff_evidence"]["matched_source_paths"], ["src/app.py"])
+        self.assertTrue(context["candidates"][0]["diff_match"])
+
+    def test_function_bridge_github_lookup_falls_back_after_bad_commit_sha(self):
+        bridge = self.load_function_bridge_module()
+
+        def fake_github_request(path, params=None):
+            if path == "commits/badfeed":
+                raise RuntimeError("404 Not Found")
+            if path == "commits":
+                return [
+                    {
+                        "sha": "recent123",
+                        "html_url": "https://github.com/owner/repo/commit/recent123",
+                        "commit": {
+                            "message": "Recent change",
+                            "author": {"name": "Dev Two", "email": "dev2@example.com", "date": "2026-05-02T18:00:00Z"},
+                        },
+                        "author": {"login": "dev-two"},
+                    }
+                ]
+            return []
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_GITHUB_TOKEN": "gh-token",
+                "LOGMONITOR_GITHUB_REPO": "owner/repo",
+                "LOGMONITOR_GITHUB_BRANCH": "main",
+            },
+            clear=False,
+        ), mock.patch.object(bridge, "_github_request", side_effect=fake_github_request), mock.patch.object(
+            bridge, "_github_search_commits", return_value=[]
+        ):
+            context = bridge._find_github_impact_context({"commitSha": "badfeed"}, "runtime crash")
+
+        self.assertEqual(context["status"], "recent_history_only")
+        self.assertEqual(context["developer_impact_verdict"], "no_direct_developer_evidence")
+        self.assertIn("no developer may be responsible", context["conclusion"])
+        self.assertEqual(context["candidates"][0]["source"], "recent_branch_history")
+        self.assertEqual(context["lookup_warnings"][0]["lookup"], "payload_commit_sha")
+
+    def test_function_bridge_github_lookup_uses_error_terms_for_commit_search(self):
+        bridge = self.load_function_bridge_module()
+
+        def fake_github_request(path, params=None):
+            if path == "commits/search123":
+                return {
+                    "sha": "search123",
+                    "html_url": "https://github.com/owner/repo/commit/search123",
+                    "commit": {
+                        "message": "Fix KeyError in settings loader",
+                        "author": {"name": "Dev Search", "email": "search@example.com", "date": "2026-05-02T18:30:00Z"},
+                    },
+                    "author": {"login": "dev-search"},
+                    "files": [{"filename": "settings.py", "patch": '+value = profile["tenant"]  # KeyError fix'}],
+                }
+            if path == "commits":
+                return []
+            return []
+
+        searched = []
+
+        def fake_search(repo, terms, since_date):
+            searched.append({"repo": repo, "terms": terms, "since_date": since_date})
+            return [
+                {
+                    "sha": "search123",
+                    "html_url": "https://github.com/owner/repo/commit/search123",
+                    "commit": {
+                        "message": "Fix KeyError in settings loader",
+                        "author": {"name": "Dev Search", "email": "search@example.com", "date": "2026-05-02T18:30:00Z"},
+                    },
+                    "author": {"login": "dev-search"},
+                }
+            ]
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_GITHUB_TOKEN": "gh-token",
+                "LOGMONITOR_GITHUB_REPO": "owner/repo",
+                "LOGMONITOR_GITHUB_BRANCH": "main",
+            },
+            clear=False,
+        ), mock.patch.object(bridge, "_github_request", side_effect=fake_github_request), mock.patch.object(
+            bridge, "_github_search_commits", side_effect=fake_search
+        ):
+            context = bridge._find_github_impact_context(
+                {"received_at": "2026-05-03T10:00:00Z"},
+                "KeyError in settings loader while reading tenant profile",
+            )
+
+        self.assertTrue(searched)
+        self.assertIn("KeyError", searched[0]["terms"])
+        self.assertEqual(context["status"], "candidates_found")
+        self.assertEqual(context["developer_impact_verdict"], "possible_developer_impact")
+        self.assertEqual(context["candidates"][0]["source"], "commit_message_search")
+        self.assertIn("KeyError", context["candidates"][0]["matched_terms"])
+        self.assertIn("KeyError", context["candidates"][0]["diff_evidence"]["matched_terms_in_diff"])
+        self.assertTrue(context["candidates"][0]["diff_match"])
+
+    def test_function_bridge_jira_description_keeps_developer_impact_nuanced(self):
+        bridge = self.load_function_bridge_module()
+        description = bridge._build_jira_description(
+            {"message": "database crash"},
+            {"prediction": "Error", "endpoint_url": "https://endpoint.test/score", "raw_response": {"prediction": "Error"}},
+            {
+                "status": "no_candidates_found",
+                "developer_impact_verdict": "no_developer_candidate_found",
+                "conclusion": "No developer commit candidate was found by the automatic search. This can mean no developer is responsible.",
+                "candidates": [],
+            },
+        )
+
+        self.assertIn("Developer Impact Verdict: no_developer_candidate_found", description)
+        self.assertIn("Non-Developer Cause Possible: yes", description)
+        self.assertIn("Candidate Commits For Manual Review:", description)
+        self.assertIn("no developer is responsible", description)
+        self.assertNotIn("no developer caused", description.casefold())
+
     def test_function_bridge_triage_returns_diagnostics_when_prediction_call_fails(self):
         bridge = self.load_function_bridge_module()
 

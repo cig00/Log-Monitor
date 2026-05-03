@@ -638,6 +638,16 @@ def _invoke_batch_endpoint(blob_name: str) -> str:
     return getattr(job, "name", "") or ""
 
 
+def _enqueue_log_payload(payload) -> dict:
+    normalized = _normalize_payload(payload)
+    queue_name = _require_env("LOGMONITOR_QUEUE_NAME")
+    message_body = json.dumps(normalized, ensure_ascii=True)
+    service_bus_client = _get_service_bus_client()
+    with service_bus_client.get_queue_sender(queue_name=queue_name) as sender:
+        sender.send_messages(ServiceBusMessage(message_body, content_type="application/json"))
+    return normalized
+
+
 def _read_labeled_csv_rows(csv_text: str) -> list[dict]:
     if not csv_text.strip():
         return []
@@ -913,14 +923,8 @@ def ingest_log(req: func.HttpRequest) -> func.HttpResponse:
             )
         payload = raw_text
 
-    normalized = _normalize_payload(payload)
-    queue_name = _require_env("LOGMONITOR_QUEUE_NAME")
-    message_body = json.dumps(normalized, ensure_ascii=True)
-
     try:
-        service_bus_client = _get_service_bus_client()
-        with service_bus_client.get_queue_sender(queue_name=queue_name) as sender:
-            sender.send_messages(ServiceBusMessage(message_body, content_type="application/json"))
+        normalized = _enqueue_log_payload(payload)
     except Exception as exc:
         LOGGER.exception("Failed to enqueue log record.")
         return _to_json_response(
@@ -1056,6 +1060,31 @@ def triage_log(req: func.HttpRequest) -> func.HttpResponse:
                 "error": "Triage payload needs a log message in errorMessage, LogMessage, message, log, msg, or text.",
             },
             400,
+        )
+
+    if _get_env("LOGMONITOR_TRIAGE_MODE", "sync_prediction").lower() in {"batch_queue", "queued_batch", "batch"}:
+        try:
+            queued_payload = _enqueue_log_payload(normalized)
+        except Exception as exc:
+            LOGGER.exception("Failed to enqueue log record during batch triage.")
+            return _to_json_response({"accepted": False, "queued": False, "error": str(exc)}, 500)
+        return _to_json_response(
+            {
+                "accepted": True,
+                "queued": True,
+                "prediction": "",
+                "actions": [
+                    {
+                        "type": "batch_queue",
+                        "reason": "Batch endpoints are asynchronous; the log was queued for the scheduled batch pipeline.",
+                    }
+                ],
+                "action_errors": [],
+                "github_context": {},
+                "jira_issue": {},
+                "received_at": queued_payload.get("received_at"),
+            },
+            202,
         )
 
     try:

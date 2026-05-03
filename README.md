@@ -430,9 +430,9 @@ The hosting summary includes:
 
 For model-based Azure hosting, the app uploads the current local labeled data version as the feedback base dataset when it can find it from training metadata. If no base dataset is available, the feedback pipeline still creates data versions from submitted corrections, but retraining may need enough feedback rows to satisfy the training split and label distribution requirements.
 
-### 7. Azure Real-Time Triage Automation
+### 7. Azure Triage Automation
 
-Azure real-time endpoint hosting can also expose a Function-backed triage endpoint in front of the prediction endpoint. The app fetches the Azure ML endpoint key automatically after deployment. The desktop form asks for:
+Azure real-time and serverless endpoint hosting can also expose a Function-backed triage endpoint in front of the prediction endpoint. The app fetches the Azure ML endpoint key automatically after deployment. Queued-batch hosting exposes the same Function route shape, but because Azure ML batch endpoints are asynchronous, its triage route queues the log for the scheduled batch pipeline instead of returning an immediate prediction. The desktop form asks for:
 
 - GitHub PAT, repository, and branch
 - Configuration email and System email

@@ -450,10 +450,14 @@ Triage behavior:
 - `Error`: creates a Jira issue with the log payload, prediction response, endpoint metadata, and GitHub commit context
 - if Jira issue creation fails for an `Error` prediction, the triage endpoint returns `action_status: partial_failure`, `jira_created: false`, and the Jira error/config summary in `action_errors`
 - every triage prediction updates a daily Jira `Log Monitor Prediction Summary - YYYY-MM-DD` issue with counts for `Error`, `CONFIGURATION`, `SYSTEM`, and `Noise`, plus Jira incident success/failure counts
+- every triage response includes sanitized `diagnostics` showing the payload, prediction, selected action, Jira creation, monitoring update, and response stages without returning tokens or connection strings
+- Azure real-time scoring also receives a fire-and-forget `triage/action` Function URL. When callers hit the Azure ML scoring URI directly, `azure_score.py` returns the prediction immediately and starts a background POST to `triage/action` so Jira/email/monitoring can run without blocking the prediction response. The action route uses the already computed prediction and does not call the model again.
 
 GitHub history is included only as a non-conclusive investigation signal. A recent or matching commit is not treated as proof that a developer caused the error.
 
 GitHub PAT, repository, and branch are required for Azure hosting so the Function app has enough repository context for incident triage.
+
+If the Azure Function App exists but the Portal shows no functions, the bridge package did not finish indexing. Hosting now waits for the named Function trigger to appear before returning URLs; if indexing fails, the error points to Function App Log stream and the Flex Consumption Deployment diagnostic blade.
 
 ### 8. Inspect Dashboards
 

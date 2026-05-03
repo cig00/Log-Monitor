@@ -21,7 +21,7 @@ from mlops_utils import (
     write_json,
 )
 
-from .azure_platform_service import AZURE_AVAILABLE, AzurePlatformService
+from .azure_platform_service import AZURE_AVAILABLE, FUNCTION_BRIDGE_WORKER_SETTINGS, AzurePlatformService
 from .contracts import HostingRequest
 from .github_service import GitHubService
 from .mlops_service import MlopsService
@@ -1030,6 +1030,7 @@ class HostingService:
         if triage_enabled and not prediction_endpoint_key:
             raise RuntimeError("Azure real-time triage needs the Azure ML online endpoint key, but no key was available.")
         settings = {
+            **FUNCTION_BRIDGE_WORKER_SETTINGS,
             "AzureWebJobsStorage__accountName": storage_account_name,
             "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
             "LOGMONITOR_BLOB_CONTAINER": blob_container_name,
@@ -1122,6 +1123,7 @@ class HostingService:
             route_path="feedback",
         )
         triage_api_url = ""
+        triage_action_api_url = ""
         if triage_enabled:
             triage_api_url, _ = self.azure_platform_service.wait_for_function_bridge_endpoint(
                 credential=credential,
@@ -1131,6 +1133,14 @@ class HostingService:
                 function_name="triage_log",
                 route_path="triage",
             )
+            triage_action_api_url, _ = self.azure_platform_service.wait_for_function_bridge_endpoint(
+                credential=credential,
+                sub_id=request.azure_sub_id,
+                function_app_name=function_app_name,
+                function_host_name=function_host_name,
+                function_name="triage_action",
+                route_path="triage/action",
+            )
         feedback_status_url = f"https://{function_host_name}/api/feedback/status?code={function_key}" if function_key else ""
         return {
             "function_app_name": function_app_name,
@@ -1139,6 +1149,7 @@ class HostingService:
             "log_api_url": log_api_url,
             "triage_enabled": triage_enabled,
             "triage_api_url": triage_api_url,
+            "triage_action_api_url": triage_action_api_url,
             "feedback_api_url": feedback_api_url,
             "feedback_status_url": feedback_status_url,
             "service_bus_namespace": service_bus_namespace_name,
@@ -1360,6 +1371,22 @@ class HostingService:
             prediction_key=prediction_endpoint_key,
         )
         triage_api_url = clean_optional_string(feedback_meta.get("triage_api_url"))
+        triage_action_api_url = clean_optional_string(feedback_meta.get("triage_action_api_url"))
+        if request.triage_enabled and triage_action_api_url:
+            ctx.emit("progress", "Configuring Azure endpoint fire-and-forget triage actions...")
+            self.azure_platform_service.update_online_deployment_environment_variables(
+                ml_client=ml_client,
+                endpoint_name=endpoint_name,
+                deployment_name=deployment_name,
+                variables={
+                    "LOGMONITOR_TRIAGE_ACTION_URL": triage_action_api_url,
+                    "LOGMONITOR_TRIAGE_ACTION_ENABLED": "1",
+                    "LOGMONITOR_TRIAGE_ACTION_TIMEOUT": "2",
+                    "LOGMONITOR_SOURCE_ENDPOINT_NAME": endpoint_name,
+                    "LOGMONITOR_SOURCE_ENDPOINT_URL": scoring_uri,
+                },
+                emit=lambda msg: ctx.emit("progress", msg),
+            )
         public_api_url = triage_api_url or scoring_uri
         metadata_path = self.model_catalog_service.save_last_hosting_metadata(
             {
@@ -1382,6 +1409,7 @@ class HostingService:
                 "prediction_api_url": scoring_uri,
                 "triage_enabled": bool(feedback_meta.get("triage_enabled")),
                 "triage_api_url": triage_api_url,
+                "triage_action_api_url": triage_action_api_url,
                 "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
                 "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
                 "feedback_bridge": feedback_meta,
@@ -1407,6 +1435,7 @@ class HostingService:
             "azure_model_name": clean_optional_string(deployment_meta.get("azure_model_name")) or clean_optional_string(request.azure_model_name),
             "azure_model_version": clean_optional_string(deployment_meta.get("azure_model_version")) or clean_optional_string(request.azure_model_version),
             "triage_api_url": triage_api_url,
+            "triage_action_api_url": triage_action_api_url,
             "feedback_api_url": clean_optional_string(feedback_meta.get("feedback_api_url")),
             "feedback_status_url": clean_optional_string(feedback_meta.get("feedback_status_url")),
             "mlops_url": mlops_url,
@@ -1420,6 +1449,7 @@ class HostingService:
                 f"Prediction target: {scoring_uri}\nInstance Type: {selected_instance_type}\n"
                 f"Feedback API: {clean_optional_string(feedback_meta.get('feedback_api_url'))}\n"
                 + (f"Triage API: {triage_api_url}\n" if triage_api_url else "")
+                + (f"Async triage action API: {triage_action_api_url}\n" if triage_action_api_url else "")
                 + f"Studio: {endpoints_studio_url}\n"
                 + "Body: {\"errorMessage\": \"...\"}\nResponse: {\"prediction\": \"...\"}\nAuthentication: endpoint keys."
             ),

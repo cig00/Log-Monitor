@@ -149,6 +149,17 @@ class ServiceTests(unittest.TestCase):
             spec.loader.exec_module(module)
         return module
 
+    def load_azure_score_module(self):
+        fake_inference = types.ModuleType("inference_utils")
+        fake_inference.load_model_bundle = lambda _model_path: {"loaded": True}
+        fake_inference.predict_error_message = lambda _bundle, _message: "Error"
+        score_path = Path(__file__).resolve().parents[1] / "azure_score.py"
+        spec = importlib.util.spec_from_file_location("azure_score_under_test", score_path)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {"inference_utils": fake_inference}):
+            spec.loader.exec_module(module)
+        return module
+
     def test_github_service_fetches_repo_and_branch_names(self):
         service = GitHubService()
         repos_response = mock.Mock()
@@ -511,6 +522,7 @@ class ServiceTests(unittest.TestCase):
         bridge_root = self.project_dir / "azure_function_bridge"
         bridge_root.mkdir(parents=True, exist_ok=True)
         (bridge_root / "function_app.py").write_text("# function app\n", encoding="utf-8")
+        (bridge_root / "host.json").write_text('{"version":"2.0"}\n', encoding="utf-8")
         (bridge_root / "requirements.txt").write_text("azure-functions\n", encoding="utf-8")
         (self.project_dir / "train.py").write_text("# train\n", encoding="utf-8")
         (self.project_dir / "mlops_utils.py").write_text("# utils\n", encoding="utf-8")
@@ -518,6 +530,7 @@ class ServiceTests(unittest.TestCase):
 
         package_path = self.azure_platform.build_function_bridge_package("unit-feedback-bridge")
 
+        self.assertEqual(Path(package_path).name, "released-package.zip")
         with zipfile.ZipFile(package_path) as archive:
             names = set(archive.namelist())
         self.assertIn("function_app.py", names)
@@ -526,12 +539,150 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("mlops_utils.py", names)
         self.assertIn("requirements.train.txt", names)
 
+    def test_function_bridge_flex_template_does_not_use_forbidden_runtime_app_setting(self):
+        template_path = Path(__file__).resolve().parents[1] / "azure_function_bridge_infra.json"
+        template = json.loads(template_path.read_text(encoding="utf-8"))
+        function_apps = [
+            resource
+            for resource in template.get("resources", [])
+            if isinstance(resource, dict) and resource.get("type") == "Microsoft.Web/sites"
+        ]
+        self.assertTrue(function_apps)
+        app_settings = function_apps[0].get("properties", {}).get("siteConfig", {}).get("appSettings", [])
+        setting_names = {setting.get("name") for setting in app_settings if isinstance(setting, dict)}
+
+        self.assertNotIn("FUNCTIONS_WORKER_RUNTIME", setting_names)
+        self.assertEqual(
+            function_apps[0].get("properties", {}).get("functionAppConfig", {}).get("runtime", {}),
+            {"name": "python", "version": "3.11"},
+        )
+
+    def test_wait_for_function_bridge_endpoint_requires_indexed_function(self):
+        calls = []
+
+        def fake_management_request(_credential, method, url, payload=None, expected_statuses=(200,)):
+            del payload, expected_statuses
+            calls.append((method, url))
+            if method == "GET" and "/functions?" in url:
+                function_list_calls = [call for call in calls if call[0] == "GET" and "/functions?" in call[1]]
+                if len(function_list_calls) == 1:
+                    return {"value": []}
+                return {"value": [{"name": "func/ingest_log"}]}
+            if method == "POST" and "/host/default/sync" in url:
+                return {}
+            if method == "POST" and "/functions/ingest_log/listsecrets" in url:
+                return {"trigger_url": "https://func.azurewebsites.net/api/logs?code=function-key", "key": "function-key"}
+            if method == "POST" and "/host/default/listkeys" in url:
+                return {"functionKeys": {"default": "host-key"}}
+            self.fail(f"Unexpected Azure management request: {method} {url}")
+
+        self.azure_platform.azure_management_json_request = fake_management_request
+
+        with mock.patch("app_core.azure_platform_service.time.sleep", lambda _seconds: None):
+            trigger_url, function_key = self.azure_platform.wait_for_function_bridge_endpoint(
+                credential=object(),
+                sub_id="sub",
+                function_app_name="func",
+                function_host_name="func.azurewebsites.net",
+                function_name="ingest_log",
+                route_path="logs",
+                timeout_seconds=30,
+                poll_interval_seconds=1,
+            )
+
+        self.assertEqual(trigger_url, "https://func.azurewebsites.net/api/logs?code=function-key")
+        self.assertEqual(function_key, "function-key")
+        called_urls = [url for _method, url in calls]
+        self.assertTrue(any("/host/default/sync" in url for url in called_urls))
+        self.assertLess(
+            next(index for index, (_method, url) in enumerate(calls) if "/functions?" in url),
+            next(index for index, (_method, url) in enumerate(calls) if "/functions/ingest_log/listsecrets" in url),
+        )
+
+    def test_wait_for_function_bridge_endpoint_fails_when_no_functions_are_indexed(self):
+        def fake_management_request(_credential, method, url, payload=None, expected_statuses=(200,)):
+            del payload, expected_statuses
+            if method == "GET" and "/functions?" in url:
+                return {"value": []}
+            if method == "POST" and "/host/default/sync" in url:
+                return {}
+            if method == "POST" and "/host/default/listkeys" in url:
+                return {"functionKeys": {"default": "host-key"}}
+            self.fail(f"Unexpected Azure management request before function indexing: {method} {url}")
+
+        self.azure_platform.azure_management_json_request = fake_management_request
+
+        with mock.patch("app_core.azure_platform_service.time.time", side_effect=[100.0, 100.0, 102.0]), mock.patch(
+            "app_core.azure_platform_service.time.sleep",
+            lambda _seconds: None,
+        ):
+            with self.assertRaises(RuntimeError) as context:
+                self.azure_platform.wait_for_function_bridge_endpoint(
+                    credential=object(),
+                    sub_id="sub",
+                    function_app_name="func",
+                    function_host_name="func.azurewebsites.net",
+                    function_name="triage_log",
+                    route_path="triage",
+                    timeout_seconds=1,
+                    poll_interval_seconds=1,
+                )
+
+        message = str(context.exception)
+        self.assertIn("did not index `triage_log`", message)
+        self.assertIn("Visible functions: none", message)
+
+    def test_azure_platform_updates_online_deployment_environment_variables(self):
+        deployment = SimpleNamespace(environment_variables={"EXISTING": "1"})
+        captured = {}
+
+        class FakeOnlineDeployments:
+            def get(self, name, endpoint_name):
+                captured["get"] = {"name": name, "endpoint_name": endpoint_name}
+                return deployment
+
+            def begin_create_or_update(self, updated_deployment):
+                captured["updated_deployment"] = updated_deployment
+                return SimpleNamespace(result=lambda timeout=None: updated_deployment)
+
+        ml_client = SimpleNamespace(online_deployments=FakeOnlineDeployments())
+        with mock.patch.object(self.azure_platform, "wait_for_online_deployment_ready", return_value=deployment):
+            merged = self.azure_platform.update_online_deployment_environment_variables(
+                ml_client,
+                endpoint_name="endpoint",
+                deployment_name="blue",
+                variables={
+                    "LOGMONITOR_TRIAGE_ACTION_URL": "https://func/api/triage/action?code=key",
+                    "EMPTY": "",
+                },
+            )
+
+        self.assertEqual(captured["get"], {"name": "blue", "endpoint_name": "endpoint"})
+        self.assertEqual(merged["EXISTING"], "1")
+        self.assertEqual(merged["LOGMONITOR_TRIAGE_ACTION_URL"], "https://func/api/triage/action?code=key")
+        self.assertNotIn("EMPTY", merged)
+        self.assertIs(captured["updated_deployment"], deployment)
+
     def test_function_bridge_normalizes_copied_jira_project_url(self):
         bridge = self.load_function_bridge_module()
 
         site_url = bridge._normalize_jira_site_url("https://eece00.atlassian.net/jira/software/projects/KAN/boards/1")
 
         self.assertEqual(site_url, "https://eece00.atlassian.net")
+
+    def test_function_bridge_normalizes_wrapped_error_prediction_labels(self):
+        bridge = self.load_function_bridge_module()
+
+        cases = [
+            ({"predictions": [{"label": "Error"}]}, "Error"),
+            ({"result": {"output": "Predicted class: Error"}}, "Error"),
+            (json.dumps({"results": [{"class": "SYSTEM"}]}), "SYSTEM"),
+            ("classification: CONFIGURATION", "CONFIGURATION"),
+        ]
+        for raw_prediction, expected in cases:
+            with self.subTest(raw_prediction=raw_prediction):
+                self.assertEqual(bridge._normalize_prediction_label(raw_prediction), expected)
+        self.assertEqual(bridge._normalize_prediction_label({"errorMessage": "System.NullReferenceException"}), "")
 
     def test_function_bridge_jira_issue_retries_without_invalid_priority(self):
         bridge = self.load_function_bridge_module()
@@ -623,6 +774,226 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(summary["total"], 1)
         self.assertEqual(summary["jira_summary_issue_key"], "KAN-55")
         self.assertEqual(state_writes[-1]["days"]["2026-05-03"]["actions_by_type"]["ignore"], 1)
+
+    def test_function_bridge_triage_creates_jira_and_counts_wrapped_error_prediction(self):
+        bridge = self.load_function_bridge_module()
+        state_writes = []
+
+        class FakeRequest:
+            def get_json(self):
+                return {"message": "database write failed"}
+
+        def capture_state_write(state):
+            state_writes.append(json.loads(json.dumps(state)))
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_TRIAGE_ENABLED": "1",
+                "LOGMONITOR_JIRA_MONITORING_ENABLED": "1",
+                "LOGMONITOR_SOURCE_ENDPOINT_NAME": "log-monitor-endpoint",
+                "LOGMONITOR_HOSTING_SERVICE_KIND": "real-time endpoint",
+            },
+            clear=False,
+        ), mock.patch.object(
+            bridge,
+            "_call_prediction_endpoint",
+            return_value={"prediction": {"result": "Predicted class: Error"}, "raw_response": {"result": "Predicted class: Error"}},
+        ), mock.patch.object(
+            bridge,
+            "_find_github_impact_context",
+            return_value={"status": "skipped", "candidates": []},
+        ), mock.patch.object(
+            bridge,
+            "_create_jira_issue",
+            return_value={"issue_key": "KAN-99", "issue_url": "https://eece00.atlassian.net/browse/KAN-99"},
+        ), mock.patch.object(
+            bridge,
+            "_load_monitoring_state",
+            return_value={},
+        ), mock.patch.object(
+            bridge,
+            "_write_monitoring_state",
+            side_effect=capture_state_write,
+        ), mock.patch.object(
+            bridge,
+            "_upsert_jira_monitoring_issue",
+            return_value={
+                "issue_key": "KAN-55",
+                "issue_url": "https://eece00.atlassian.net/browse/KAN-55",
+                "operation": "created",
+            },
+        ):
+            response = bridge.triage_log(FakeRequest())
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["prediction"], "Error")
+        self.assertTrue(body["jira_created"])
+        self.assertEqual(body["jira_issue"]["issue_key"], "KAN-99")
+        self.assertEqual(body["monitoring"]["counts"]["Error"], 1)
+        self.assertEqual(state_writes[-1]["days"][body["monitoring"]["date"]]["jira_created"], 1)
+        stages = [entry["stage"] for entry in body["diagnostics"]]
+        self.assertIn("prediction_result", stages)
+        self.assertIn("github_lookup", stages)
+        self.assertIn("jira_create", stages)
+        self.assertIn("monitoring", stages)
+        self.assertEqual(body["diagnostics"][-1]["stage"], "response")
+        self.assertEqual(body["diagnostics"][-1]["details"]["status_code"], 200)
+        jira_events = [entry for entry in body["diagnostics"] if entry["stage"] == "jira_create" and entry["status"] == "ok"]
+        self.assertEqual(jira_events[-1]["details"]["issue_key"], "KAN-99")
+
+    def test_function_bridge_triage_action_uses_provided_prediction_without_calling_model(self):
+        bridge = self.load_function_bridge_module()
+        state_writes = []
+
+        class FakeRequest:
+            def get_json(self):
+                return {
+                    "message": "database write failed",
+                    "prediction": "Error",
+                    "prediction_result": {"prediction": "Error", "raw_response": {"prediction": "Error"}},
+                }
+
+        def capture_state_write(state):
+            state_writes.append(json.loads(json.dumps(state)))
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_TRIAGE_ENABLED": "1",
+                "LOGMONITOR_JIRA_MONITORING_ENABLED": "1",
+                "LOGMONITOR_SOURCE_ENDPOINT_NAME": "log-monitor-endpoint",
+                "LOGMONITOR_HOSTING_SERVICE_KIND": "real-time endpoint",
+            },
+            clear=False,
+        ), mock.patch.object(
+            bridge,
+            "_call_prediction_endpoint",
+            side_effect=AssertionError("triage_action must not call the model endpoint"),
+        ), mock.patch.object(
+            bridge,
+            "_find_github_impact_context",
+            return_value={"status": "skipped", "candidates": []},
+        ), mock.patch.object(
+            bridge,
+            "_create_jira_issue",
+            return_value={"issue_key": "KAN-101", "issue_url": "https://eece00.atlassian.net/browse/KAN-101"},
+        ), mock.patch.object(
+            bridge,
+            "_load_monitoring_state",
+            return_value={},
+        ), mock.patch.object(
+            bridge,
+            "_write_monitoring_state",
+            side_effect=capture_state_write,
+        ), mock.patch.object(
+            bridge,
+            "_upsert_jira_monitoring_issue",
+            return_value={
+                "issue_key": "KAN-55",
+                "issue_url": "https://eece00.atlassian.net/browse/KAN-55",
+                "operation": "created",
+            },
+        ):
+            response = bridge.triage_action(FakeRequest())
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["prediction"], "Error")
+        self.assertEqual(body["jira_issue"]["issue_key"], "KAN-101")
+        self.assertEqual(body["monitoring"]["counts"]["Error"], 1)
+        prediction_events = [entry for entry in body["diagnostics"] if entry["stage"] == "prediction_result"]
+        self.assertEqual(prediction_events[-1]["details"]["source"], "already_predicted")
+        self.assertEqual(state_writes[-1]["days"][body["monitoring"]["date"]]["jira_created"], 1)
+
+    def test_function_bridge_triage_returns_diagnostics_when_prediction_call_fails(self):
+        bridge = self.load_function_bridge_module()
+
+        class FakeRequest:
+            def get_json(self):
+                return {"message": "database write failed"}
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_TRIAGE_ENABLED": "1",
+                "LOGMONITOR_PREDICTION_ENDPOINT_URL": "https://endpoint.test/score",
+                "LOGMONITOR_PREDICTION_AUTH_MODE": "key",
+            },
+            clear=False,
+        ), mock.patch.object(
+            bridge,
+            "_call_prediction_endpoint",
+            side_effect=RuntimeError("Prediction endpoint failed."),
+        ), mock.patch.object(bridge.LOGGER, "exception"):
+            response = bridge.triage_log(FakeRequest())
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(body["accepted"])
+        failed_prediction_events = [
+            entry for entry in body["diagnostics"] if entry["stage"] == "prediction_call" and entry["status"] == "failed"
+        ]
+        self.assertTrue(failed_prediction_events)
+        self.assertIn("Prediction endpoint failed.", failed_prediction_events[0]["details"]["error"])
+
+    def test_azure_score_fire_and_forget_posts_prediction_to_triage_action(self):
+        score = self.load_azure_score_module()
+        sent_requests = []
+
+        class ImmediateThread:
+            def __init__(self, target, daemon=False):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                self.target()
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self, _size=-1):
+                return b"{}"
+
+        def fake_urlopen(req, timeout=0):
+            sent_requests.append(
+                {
+                    "url": req.full_url,
+                    "body": json.loads(req.data.decode("utf-8")),
+                    "timeout": timeout,
+                    "content_type": req.headers.get("Content-type") or req.headers.get("Content-Type"),
+                }
+            )
+            return FakeResponse()
+
+        with mock.patch.dict(
+            score.os.environ,
+            {
+                "LOGMONITOR_TRIAGE_ACTION_URL": "https://func.azurewebsites.net/api/triage/action?code=function-key",
+                "LOGMONITOR_TRIAGE_ACTION_ENABLED": "1",
+                "LOGMONITOR_TRIAGE_ACTION_TIMEOUT": "0.5",
+                "LOGMONITOR_SOURCE_ENDPOINT_NAME": "log-monitor-endpoint",
+                "LOGMONITOR_SOURCE_ENDPOINT_URL": "https://score",
+            },
+            clear=False,
+        ), mock.patch.object(score.threading, "Thread", ImmediateThread), mock.patch.object(
+            score.url_request,
+            "urlopen",
+            side_effect=fake_urlopen,
+        ), mock.patch("builtins.print"):
+            score.MODEL_BUNDLE = {"loaded": True}
+            response = json.loads(score.run(json.dumps({"errorMessage": "database failed"})))
+
+        self.assertEqual(response["prediction"], "Error")
+        self.assertEqual(sent_requests[0]["url"], "https://func.azurewebsites.net/api/triage/action?code=function-key")
+        self.assertEqual(sent_requests[0]["body"]["prediction"], "Error")
+        self.assertEqual(sent_requests[0]["body"]["source"], "azure_ml_online_endpoint")
+        self.assertEqual(sent_requests[0]["body"]["prediction_result"]["endpoint_url"], "https://score")
 
     def test_hosting_feedback_bridge_configures_mode_agnostic_feedback_endpoint(self):
         dataset_path = self.project_dir / "base.csv"
@@ -732,6 +1103,7 @@ class ServiceTests(unittest.TestCase):
             prediction_key="prediction-key",
         )
         self.assertEqual(triage_result["triage_api_url"], "https://func.azurewebsites.net/api/triage?code=key")
+        self.assertEqual(triage_result["triage_action_api_url"], "https://func.azurewebsites.net/api/triage/action?code=key")
         self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_ENABLED"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_PREDICTION_ENDPOINT_URL"], "https://score")
         self.assertEqual(captured["settings"]["LOGMONITOR_PREDICTION_KEY"], "prediction-key")
@@ -739,6 +1111,9 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_SYSTEM_EMAIL"], "email2@example.test")
         self.assertEqual(captured["settings"]["LOGMONITOR_GITHUB_REPO"], "owner/repo")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_PROJECT_KEY"], "OPS")
+        self.assertNotIn("FUNCTIONS_WORKER_RUNTIME", captured["settings"])
+        self.assertEqual(captured["settings"]["AzureWebJobsFeatureFlags"], "EnableWorkerIndexing")
+        self.assertEqual(captured["settings"]["PYTHON_ENABLE_WORKER_EXTENSIONS"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_MONITORING_ENABLED"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_MONITORING_ISSUE_TYPE"], "Task")
         self.assertEqual(captured["settings"]["LOGMONITOR_MONITORING_STATE_BLOB"], "monitoring/prediction-summary-state.json")

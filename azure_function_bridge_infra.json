@@ -195,6 +195,18 @@
         "siteConfig": {
           "appSettings": [
             {
+              "name": "AzureWebJobsFeatureFlags",
+              "value": "EnableWorkerIndexing"
+            },
+            {
+              "name": "PYTHON_ENABLE_WORKER_EXTENSIONS",
+              "value": "1"
+            },
+            {
+              "name": "PYTHON_ISOLATE_WORKER_DEPENDENCIES",
+              "value": "1"
+            },
+            {
               "name": "AzureWebJobsStorage__accountName",
               "value": "[parameters('storageAccountName')]"
             }

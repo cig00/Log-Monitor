@@ -14,13 +14,48 @@ from zoneinfo import ZoneInfo
 
 import azure.functions as func
 import requests
-from azure.ai.ml import Input, MLClient, command
-from azure.ai.ml.constants import AssetTypes
-from azure.ai.ml.entities import AmlCompute, Data
-from azure.core.exceptions import ResourceNotFoundError
-from azure.identity import DefaultAzureCredential
-from azure.servicebus import ServiceBusClient, ServiceBusMessage
-from azure.storage.blob import BlobServiceClient, ContentSettings
+try:
+    from azure.ai.ml import Input, MLClient, command
+    from azure.ai.ml.constants import AssetTypes
+    from azure.ai.ml.entities import AmlCompute, Data
+except Exception as exc:
+    Input = None
+    MLClient = None
+    command = None
+    AssetTypes = None
+    AmlCompute = None
+    Data = None
+    _AZURE_ML_IMPORT_ERROR = exc
+else:
+    _AZURE_ML_IMPORT_ERROR = None
+try:
+    from azure.core.exceptions import ResourceNotFoundError
+except Exception:
+    class ResourceNotFoundError(Exception):
+        pass
+try:
+    from azure.identity import DefaultAzureCredential
+except Exception as exc:
+    DefaultAzureCredential = None
+    _AZURE_IDENTITY_IMPORT_ERROR = exc
+else:
+    _AZURE_IDENTITY_IMPORT_ERROR = None
+try:
+    from azure.servicebus import ServiceBusClient, ServiceBusMessage
+except Exception as exc:
+    ServiceBusClient = None
+    ServiceBusMessage = None
+    _SERVICE_BUS_IMPORT_ERROR = exc
+else:
+    _SERVICE_BUS_IMPORT_ERROR = None
+try:
+    from azure.storage.blob import BlobServiceClient, ContentSettings
+except Exception as exc:
+    BlobServiceClient = None
+    ContentSettings = None
+    _BLOB_STORAGE_IMPORT_ERROR = exc
+else:
+    _BLOB_STORAGE_IMPORT_ERROR = None
 
 
 app = func.FunctionApp()
@@ -37,6 +72,56 @@ MESSAGE_KEYS = (
 )
 LABEL_NAMES = ("Error", "CONFIGURATION", "SYSTEM", "Noise")
 LABEL_ALIASES = {label.casefold(): label for label in LABEL_NAMES}
+PREDICTION_LABEL_KEYS = (
+    "prediction",
+    "predictions",
+    "class",
+    "classes",
+    "label",
+    "labels",
+    "predictedLabel",
+    "predicted_label",
+    "predictedClass",
+    "predicted_class",
+    "category",
+    "categories",
+    "result",
+    "results",
+    "output",
+    "outputs",
+    "response",
+    "answer",
+    "generated_text",
+)
+PREDICTION_SKIP_KEYS = {
+    "errorMessage",
+    "LogMessage",
+    "logMessage",
+    "message",
+    "log",
+    "msg",
+    "text",
+    "input",
+    "inputs",
+    "payload",
+    "request",
+    "raw_payload",
+}
+DIAGNOSTIC_SENSITIVE_KEY_PARTS = (
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "connection_string",
+    "connectionstring",
+    "access_key",
+    "account_key",
+    "api_key",
+    "endpoint_key",
+    "function_key",
+    "prediction_key",
+)
+DIAGNOSTIC_SENSITIVE_KEYS = {"code", "pat", "connection"}
 
 _BLOB_SERVICE_CLIENT = None
 _SERVICE_BUS_CLIENT = None
@@ -60,6 +145,11 @@ def _require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def _raise_import_error(package_name: str, exc: Exception | None) -> None:
+    if exc is not None:
+        raise RuntimeError(f"Azure Function dependency `{package_name}` is not installed or failed to import: {exc}") from exc
 
 
 def _parse_daily_time(raw_value: str) -> tuple[int, int]:
@@ -150,6 +240,55 @@ def _to_json_response(body: dict, status_code: int) -> func.HttpResponse:
     )
 
 
+def _redact_for_diagnostics(value: object, max_depth: int = 4) -> object:
+    if max_depth <= 0:
+        return _truncate(value, 300)
+    if isinstance(value, dict):
+        redacted = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 50:
+                redacted["..."] = f"{len(value) - index} more keys truncated"
+                break
+            clean_key = str(key)
+            clean_key_lower = clean_key.casefold()
+            if clean_key_lower in DIAGNOSTIC_SENSITIVE_KEYS or any(
+                part in clean_key_lower for part in DIAGNOSTIC_SENSITIVE_KEY_PARTS
+            ):
+                redacted[clean_key] = "<redacted>"
+            else:
+                redacted[clean_key] = _redact_for_diagnostics(item, max_depth - 1)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [_redact_for_diagnostics(item, max_depth - 1) for item in list(value)[:20]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return _truncate(value, 1000) if isinstance(value, str) else value
+    return _truncate(str(value), 1000)
+
+
+def _diagnostic_shape(value: object) -> dict:
+    shape = {"type": type(value).__name__}
+    if isinstance(value, dict):
+        shape["keys"] = [str(key) for key in list(value.keys())[:20]]
+    elif isinstance(value, list):
+        shape["length"] = len(value)
+        if value:
+            shape["first_item_type"] = type(value[0]).__name__
+    elif isinstance(value, str):
+        shape["length"] = len(value)
+    return shape
+
+
+def _add_diagnostic(diagnostics: list[dict], stage: str, status: str = "ok", **details) -> None:
+    diagnostics.append(
+        {
+            "at": _now_utc_iso(),
+            "stage": stage,
+            "status": status,
+            "details": _redact_for_diagnostics(details),
+        }
+    )
+
+
 def _truncate(value: object, max_chars: int = 4000) -> str:
     text = str(value or "")
     if len(text) <= max_chars:
@@ -174,27 +313,79 @@ def _get_payload_value(payload: dict, keys: tuple[str, ...]) -> str:
     return ""
 
 
-def _normalize_prediction_label(raw_prediction: object) -> str:
-    if isinstance(raw_prediction, dict):
-        for key in ("prediction", "class", "label", "predictedLabel", "predicted_label"):
-            value = raw_prediction.get(key)
-            if value not in (None, ""):
-                return _normalize_prediction_label(value)
+def _label_from_prediction_text(raw_prediction: object) -> str:
+    text = str(raw_prediction or "").strip()
+    if not text:
         return ""
-    if isinstance(raw_prediction, list) and raw_prediction:
-        return _normalize_prediction_label(raw_prediction[0])
+    cleaned = re.sub(r"^[\s\"'`*_]+|[\s\"'`*_.:;-]+$", "", text).strip()
+    for candidate in (text, cleaned):
+        label = LABEL_ALIASES.get(candidate.casefold())
+        if label:
+            return label
+
+    label_pattern = "|".join(re.escape(label) for label in LABEL_NAMES)
+    context_patterns = (
+        rf"(?:prediction|predicted\s+class|predicted\s+label|class|label|category|result|classification|answer)"
+        rf"\s*(?:is|:|=|-)?\s*[\"'`*]*({label_pattern})\b",
+        rf"(?:classified\s+as|predicted\s+as)\s*[\"'`*]*({label_pattern})\b",
+        rf"\b({label_pattern})\b\s*(?:prediction|class|label|category|classification)\b",
+    )
+    for pattern in context_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return LABEL_ALIASES.get(match.group(1).casefold(), "")
+
+    standalone_matches = {
+        LABEL_ALIASES[match.group(1).casefold()]
+        for match in re.finditer(rf"(?<![A-Za-z0-9_])({label_pattern})(?![A-Za-z0-9_])", text, flags=re.IGNORECASE)
+        if match.group(1).casefold() in LABEL_ALIASES
+    }
+    if len(text) <= 80 and len(standalone_matches) == 1:
+        return next(iter(standalone_matches))
+    return ""
+
+
+def _normalize_prediction_label(raw_prediction: object, allow_raw_text: bool = True) -> str:
+    if isinstance(raw_prediction, dict):
+        case_key_lookup = {str(key).casefold(): key for key in raw_prediction.keys()}
+        for key in PREDICTION_LABEL_KEYS:
+            actual_key = case_key_lookup.get(key.casefold())
+            if actual_key is None:
+                continue
+            value = raw_prediction.get(actual_key)
+            if value not in (None, ""):
+                nested = _normalize_prediction_label(value, allow_raw_text=True)
+                if nested:
+                    return nested
+        skip_keys = {key.casefold() for key in PREDICTION_SKIP_KEYS}
+        for key, value in raw_prediction.items():
+            if str(key).casefold() in skip_keys or value in (None, ""):
+                continue
+            nested = _normalize_prediction_label(value, allow_raw_text=False)
+            if nested:
+                return nested
+        return ""
+    if isinstance(raw_prediction, list):
+        for item in raw_prediction:
+            nested = _normalize_prediction_label(item, allow_raw_text=allow_raw_text)
+            if nested:
+                return nested
+        return ""
     text = str(raw_prediction or "").strip()
     if not text:
         return ""
     try:
         parsed = json.loads(text)
         if parsed is not text:
-            nested = _normalize_prediction_label(parsed)
+            nested = _normalize_prediction_label(parsed, allow_raw_text=allow_raw_text)
             if nested:
                 return nested
     except Exception:
         pass
-    return LABEL_ALIASES.get(text.casefold(), text)
+    label = _label_from_prediction_text(text)
+    if label:
+        return label
+    return text if allow_raw_text else ""
 
 
 def _call_prediction_endpoint(payload: dict) -> dict:
@@ -211,6 +402,7 @@ def _call_prediction_endpoint(payload: dict) -> dict:
         prediction_key = _require_env("LOGMONITOR_PREDICTION_KEY")
         headers["Authorization"] = f"Bearer {prediction_key}"
     elif auth_mode in {"aad", "aad_token", "entra", "managed_identity"}:
+        _raise_import_error("azure-identity", _AZURE_IDENTITY_IMPORT_ERROR)
         credential = DefaultAzureCredential()
         token = credential.get_token("https://ml.azure.com/.default").token
         headers["Authorization"] = f"Bearer {token}"
@@ -717,7 +909,7 @@ def _record_prediction_monitoring(
     actions_by_type = day.setdefault("actions_by_type", {})
     unknown_predictions = day.setdefault("unknown_predictions", {})
 
-    normalized_prediction = LABEL_ALIASES.get(str(prediction or "").casefold(), str(prediction or "Unknown"))
+    normalized_prediction = _normalize_prediction_label(prediction) or str(prediction or "Unknown")
     day["total"] = int(day.get("total", 0) or 0) + 1
     if normalized_prediction in LABEL_NAMES:
         _increment_count(counts, normalized_prediction)
@@ -785,6 +977,7 @@ def _build_notification_body(payload: dict, prediction_result: dict) -> str:
 def _get_blob_service_client() -> BlobServiceClient:
     global _BLOB_SERVICE_CLIENT
     if _BLOB_SERVICE_CLIENT is None:
+        _raise_import_error("azure-storage-blob", _BLOB_STORAGE_IMPORT_ERROR)
         _BLOB_SERVICE_CLIENT = BlobServiceClient.from_connection_string(
             _require_env("LOGMONITOR_STORAGE_CONNECTION")
         )
@@ -809,6 +1002,7 @@ def _download_blob_text(blob_name: str) -> str:
 
 
 def _upload_blob_text(blob_name: str, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
+    _raise_import_error("azure-storage-blob", _BLOB_STORAGE_IMPORT_ERROR)
     blob_client = _get_container_client().get_blob_client(blob_name)
     blob_client.upload_blob(
         body.encode("utf-8"),
@@ -820,6 +1014,7 @@ def _upload_blob_text(blob_name: str, body: str, content_type: str = "text/plain
 def _get_service_bus_client() -> ServiceBusClient:
     global _SERVICE_BUS_CLIENT
     if _SERVICE_BUS_CLIENT is None:
+        _raise_import_error("azure-servicebus", _SERVICE_BUS_IMPORT_ERROR)
         _SERVICE_BUS_CLIENT = ServiceBusClient.from_connection_string(
             _require_env("LOGMONITOR_SERVICEBUS_CONNECTION")
         )
@@ -829,6 +1024,8 @@ def _get_service_bus_client() -> ServiceBusClient:
 def _get_ml_client() -> MLClient:
     global _ML_CLIENT
     if _ML_CLIENT is None:
+        _raise_import_error("azure-ai-ml", _AZURE_ML_IMPORT_ERROR)
+        _raise_import_error("azure-identity", _AZURE_IDENTITY_IMPORT_ERROR)
         credential = DefaultAzureCredential()
         _ML_CLIENT = MLClient(
             credential=credential,
@@ -878,6 +1075,7 @@ def _load_feedback_state() -> dict:
 
 
 def _write_feedback_state(state: dict) -> None:
+    _raise_import_error("azure-storage-blob", _BLOB_STORAGE_IMPORT_ERROR)
     blob_client = _get_container_client().get_blob_client(_get_feedback_state_blob_name())
     payload = json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True)
     blob_client.upload_blob(
@@ -904,6 +1102,7 @@ def _load_monitoring_state() -> dict:
 
 
 def _write_monitoring_state(state: dict) -> None:
+    _raise_import_error("azure-storage-blob", _BLOB_STORAGE_IMPORT_ERROR)
     blob_client = _get_container_client().get_blob_client(_get_monitoring_state_blob_name())
     payload = json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True)
     blob_client.upload_blob(
@@ -938,6 +1137,7 @@ def _message_body_to_text(message) -> str:
 
 
 def _invoke_batch_endpoint(blob_name: str) -> str:
+    _raise_import_error("azure-ai-ml", _AZURE_ML_IMPORT_ERROR)
     datastore_name = _require_env("LOGMONITOR_DATASTORE_NAME")
     endpoint_name = _require_env("LOGMONITOR_BATCH_ENDPOINT_NAME")
     deployment_name = _get_env("LOGMONITOR_BATCH_DEPLOYMENT_NAME")
@@ -1027,6 +1227,7 @@ def _feedback_dataset_blob_name(dataset_hash: str) -> str:
 
 
 def _register_feedback_data_asset(blob_name: str, dataset_hash: str, row_count: int, event_blob_name: str) -> dict:
+    _raise_import_error("azure-ai-ml", _AZURE_ML_IMPORT_ERROR)
     datastore_name = _require_env("LOGMONITOR_DATASTORE_NAME")
     asset_name = _get_env("LOGMONITOR_FEEDBACK_DATA_ASSET_NAME", "log-monitor-feedback-labeled-data")
     asset_version = "".join(ch if ch.isalnum() or ch in "_.-" else "-" for ch in dataset_hash)[:30].strip("-._") or "1"
@@ -1056,6 +1257,7 @@ def _register_feedback_data_asset(blob_name: str, dataset_hash: str, row_count: 
 
 
 def _ensure_retrain_compute() -> str:
+    _raise_import_error("azure-ai-ml", _AZURE_ML_IMPORT_ERROR)
     compute_name = _get_env("LOGMONITOR_RETRAIN_COMPUTE_NAME", "log-monitor-feedback-cpu")
     instance_type = _get_env("LOGMONITOR_RETRAIN_INSTANCE_TYPE", "Standard_D2as_v4")
     compute = AmlCompute(
@@ -1071,6 +1273,7 @@ def _ensure_retrain_compute() -> str:
 
 
 def _submit_feedback_retraining_job(data_asset_uri: str, dataset_hash: str) -> str:
+    _raise_import_error("azure-ai-ml", _AZURE_ML_IMPORT_ERROR)
     if _get_env("LOGMONITOR_RETRAIN_ENABLED", "1").lower() not in {"1", "true", "yes", "on"}:
         return ""
     code_dir = Path(__file__).resolve().parent
@@ -1345,50 +1548,7 @@ def feedback_status(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
-@app.function_name(name="triage_log")
-@app.route(route="triage", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
-def triage_log(req: func.HttpRequest) -> func.HttpResponse:
-    if _get_env("LOGMONITOR_TRIAGE_ENABLED", "0").lower() not in {"1", "true", "yes", "on"}:
-        return _to_json_response(
-            {
-                "accepted": False,
-                "error": "Azure triage automation is not enabled for this deployment.",
-            },
-            404,
-        )
-
-    try:
-        payload = req.get_json()
-    except ValueError:
-        raw_text = req.get_body().decode("utf-8", errors="ignore").strip()
-        if not raw_text:
-            return _to_json_response(
-                {
-                    "accepted": False,
-                    "error": "Send a JSON body or plain-text log message.",
-                },
-                400,
-            )
-        payload = raw_text
-
-    normalized = _normalize_payload(payload)
-    message = _extract_message(normalized)
-    if not message:
-        return _to_json_response(
-            {
-                "accepted": False,
-                "error": "Triage payload needs a log message in errorMessage, LogMessage, message, log, msg, or text.",
-            },
-            400,
-        )
-
-    try:
-        prediction_result = _call_prediction_endpoint(normalized)
-    except Exception as exc:
-        LOGGER.exception("Prediction call failed during triage.")
-        return _to_json_response({"accepted": False, "error": str(exc)}, 502)
-
-    prediction = LABEL_ALIASES.get(str(prediction_result.get("prediction", "")).casefold(), prediction_result.get("prediction", ""))
+def _execute_triage_actions(normalized: dict, prediction_result: dict, prediction: str, diagnostics: list[dict]) -> dict:
     actions: list[dict] = []
     action_errors: list[dict] = []
     monitoring_errors: list[dict] = []
@@ -1396,9 +1556,13 @@ def triage_log(req: func.HttpRequest) -> func.HttpResponse:
     jira_issue: dict = {}
     monitoring_summary: dict = {}
     jira_config = _jira_config_status()
+    message = _extract_message(normalized)
+    _add_diagnostic(diagnostics, "jira_config", **jira_config)
+    _add_diagnostic(diagnostics, "action_route", prediction=prediction)
 
     if prediction == "Noise":
         actions.append({"type": "ignore", "reason": "Prediction was Noise."})
+        _add_diagnostic(diagnostics, "action_route", action="ignore")
     elif prediction == "CONFIGURATION":
         try:
             email_result = _send_email(
@@ -1407,9 +1571,18 @@ def triage_log(req: func.HttpRequest) -> func.HttpResponse:
                 _build_notification_body(normalized, prediction_result),
             )
             actions.append({"type": "email", "recipient_kind": "configuration", **email_result})
+            _add_diagnostic(diagnostics, "email_send", recipient_kind="configuration", message_id=email_result.get("message_id", ""))
         except Exception as exc:
             LOGGER.exception("Failed to send CONFIGURATION email.")
             action_errors.append({"type": "email", "recipient_kind": "configuration", "error": str(exc)})
+            _add_diagnostic(
+                diagnostics,
+                "email_send",
+                "failed",
+                recipient_kind="configuration",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
     elif prediction == "SYSTEM":
         try:
             email_result = _send_email(
@@ -1418,20 +1591,54 @@ def triage_log(req: func.HttpRequest) -> func.HttpResponse:
                 _build_notification_body(normalized, prediction_result),
             )
             actions.append({"type": "email", "recipient_kind": "system", **email_result})
+            _add_diagnostic(diagnostics, "email_send", recipient_kind="system", message_id=email_result.get("message_id", ""))
         except Exception as exc:
             LOGGER.exception("Failed to send SYSTEM email.")
             action_errors.append({"type": "email", "recipient_kind": "system", "error": str(exc)})
+            _add_diagnostic(
+                diagnostics,
+                "email_send",
+                "failed",
+                recipient_kind="system",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
     elif prediction == "Error":
+        _add_diagnostic(diagnostics, "github_lookup", "started")
         github_context = _find_github_impact_context(normalized, message)
+        _add_diagnostic(
+            diagnostics,
+            "github_lookup",
+            status=str(github_context.get("status") or "unknown"),
+            candidates=len(github_context.get("candidates", []) if isinstance(github_context.get("candidates"), list) else []),
+            error=github_context.get("error", ""),
+        )
+        _add_diagnostic(diagnostics, "jira_create", "started")
         try:
             jira_issue = _create_jira_issue(normalized, prediction_result, github_context)
             actions.append({"type": "jira", **jira_issue})
+            _add_diagnostic(
+                diagnostics,
+                "jira_create",
+                issue_key=jira_issue.get("issue_key", ""),
+                issue_url=jira_issue.get("issue_url", ""),
+                warnings=jira_issue.get("jira_warnings", []),
+            )
         except Exception as exc:
             LOGGER.exception("Failed to create Jira issue.")
             action_errors.append({"type": "jira", "error": str(exc), "github_context": github_context, "jira_config": jira_config})
+            _add_diagnostic(
+                diagnostics,
+                "jira_create",
+                "failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
     else:
         actions.append({"type": "none", "reason": f"No triage rule is configured for prediction '{prediction}'."})
+        _add_diagnostic(diagnostics, "action_route", "skipped", reason=f"No triage rule is configured for prediction '{prediction}'.")
 
+    _add_diagnostic(diagnostics, "monitoring", "started")
     try:
         monitoring_summary = _record_prediction_monitoring(
             normalized,
@@ -1441,32 +1648,279 @@ def triage_log(req: func.HttpRequest) -> func.HttpResponse:
             action_errors,
             jira_issue,
         )
+        _add_diagnostic(
+            diagnostics,
+            "monitoring",
+            enabled=monitoring_summary.get("enabled"),
+            date=monitoring_summary.get("date", ""),
+            total=monitoring_summary.get("total", ""),
+            counts=monitoring_summary.get("counts", {}),
+            jira_summary_issue_key=monitoring_summary.get("jira_summary_issue_key", ""),
+            jira_summary_operation=monitoring_summary.get("jira_summary_operation", ""),
+            reason=monitoring_summary.get("reason", ""),
+        )
     except Exception as exc:
         LOGGER.exception("Failed to update Jira prediction monitoring summary.")
         monitoring_errors.append({"type": "jira_monitoring", "error": str(exc), "jira_config": jira_config})
+        _add_diagnostic(
+            diagnostics,
+            "monitoring",
+            "failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
 
     jira_created = bool(jira_issue.get("issue_key"))
     status_code = 200
     if prediction == "Error" and not jira_created:
         status_code = 502
+    action_status = "partial_failure" if action_errors or monitoring_errors else "ok"
+    return {
+        "status_code": status_code,
+        "accepted": status_code == 200,
+        "prediction": prediction,
+        "action_status": action_status,
+        "actions": actions,
+        "action_errors": action_errors,
+        "monitoring": monitoring_summary,
+        "monitoring_errors": monitoring_errors,
+        "github_context": github_context,
+        "jira_config": jira_config,
+        "jira_issue": jira_issue,
+        "jira_created": jira_created,
+        "received_at": normalized.get("received_at"),
+    }
 
+
+def _to_triage_action_response(normalized: dict, result: dict, diagnostics: list[dict]) -> func.HttpResponse:
+    _add_diagnostic(
+        diagnostics,
+        "response",
+        status_code=result.get("status_code", 200),
+        accepted=bool(result.get("accepted")),
+        action_status=result.get("action_status", ""),
+        jira_created=bool(result.get("jira_created")),
+        action_error_count=len(result.get("action_errors", [])),
+        monitoring_error_count=len(result.get("monitoring_errors", [])),
+    )
+    status_code = int(result.get("status_code", 200) or 200)
     return _to_json_response(
         {
             "accepted": status_code == 200,
-            "prediction": prediction,
-            "action_status": "partial_failure" if action_errors or monitoring_errors else "ok",
-            "actions": actions,
-            "action_errors": action_errors,
-            "monitoring": monitoring_summary,
-            "monitoring_errors": monitoring_errors,
-            "github_context": github_context,
-            "jira_config": jira_config,
-            "jira_issue": jira_issue,
-            "jira_created": jira_created,
+            "prediction": result.get("prediction", ""),
+            "action_status": result.get("action_status", ""),
+            "actions": result.get("actions", []),
+            "action_errors": result.get("action_errors", []),
+            "monitoring": result.get("monitoring", {}),
+            "monitoring_errors": result.get("monitoring_errors", []),
+            "github_context": result.get("github_context", {}),
+            "jira_config": result.get("jira_config", {}),
+            "jira_issue": result.get("jira_issue", {}),
+            "jira_created": bool(result.get("jira_created")),
             "received_at": normalized.get("received_at"),
             "caveat": (
                 "GitHub history is an investigation aid only. A matching or recent commit does not prove developer impact."
             ),
+            "diagnostics": diagnostics,
         },
         status_code,
     )
+
+
+def _parse_request_payload(req: func.HttpRequest, diagnostics: list[dict]) -> object | func.HttpResponse:
+    try:
+        payload = req.get_json()
+        _add_diagnostic(diagnostics, "payload_parse", payload_shape=_diagnostic_shape(payload))
+        return payload
+    except ValueError:
+        raw_text = req.get_body().decode("utf-8", errors="ignore").strip()
+        if not raw_text:
+            _add_diagnostic(diagnostics, "payload_parse", "failed", reason="empty body")
+            return _to_json_response(
+                {
+                    "accepted": False,
+                    "error": "Send a JSON body or plain-text log message.",
+                    "diagnostics": diagnostics,
+                },
+                400,
+            )
+        _add_diagnostic(diagnostics, "payload_parse", payload_shape=_diagnostic_shape(raw_text), fallback="plain_text")
+        return raw_text
+
+
+def _validate_triage_message(normalized: dict, diagnostics: list[dict]) -> str | func.HttpResponse:
+    message = _extract_message(normalized)
+    _add_diagnostic(
+        diagnostics,
+        "payload_normalized",
+        payload_shape=_diagnostic_shape(normalized),
+        message_present=bool(message),
+        message_length=len(message),
+        received_at=normalized.get("received_at"),
+    )
+    if not message:
+        _add_diagnostic(diagnostics, "payload_validation", "failed", reason="missing log message")
+        return _to_json_response(
+            {
+                "accepted": False,
+                "error": "Triage payload needs a log message in errorMessage, LogMessage, message, log, msg, or text.",
+                "diagnostics": diagnostics,
+            },
+            400,
+        )
+    return message
+
+
+@app.function_name(name="triage_action")
+@app.route(route="triage/action", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def triage_action(req: func.HttpRequest) -> func.HttpResponse:
+    diagnostics: list[dict] = []
+    triage_enabled = _get_env("LOGMONITOR_TRIAGE_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
+    _add_diagnostic(diagnostics, "start", route="triage/action", triage_enabled=triage_enabled)
+    if not triage_enabled:
+        _add_diagnostic(diagnostics, "config", "failed", reason="Azure triage automation is not enabled.")
+        return _to_json_response(
+            {
+                "accepted": False,
+                "error": "Azure triage automation is not enabled for this deployment.",
+                "diagnostics": diagnostics,
+            },
+            404,
+        )
+
+    payload = _parse_request_payload(req, diagnostics)
+    if isinstance(payload, func.HttpResponse):
+        return payload
+
+    normalized = _normalize_payload(payload)
+    message_or_response = _validate_triage_message(normalized, diagnostics)
+    if isinstance(message_or_response, func.HttpResponse):
+        return message_or_response
+
+    raw_prediction_result = normalized.get("prediction_result") if isinstance(normalized.get("prediction_result"), dict) else {}
+    prediction = (
+        _normalize_prediction_label(normalized.get("prediction"))
+        or _normalize_prediction_label(raw_prediction_result)
+        or _normalize_prediction_label(normalized.get("raw_response"))
+    )
+    if not prediction:
+        _add_diagnostic(diagnostics, "prediction_result", "failed", reason="missing prediction")
+        return _to_json_response(
+            {
+                "accepted": False,
+                "error": "Triage action payload needs prediction or prediction_result because prediction has already happened.",
+                "diagnostics": diagnostics,
+            },
+            400,
+        )
+    prediction_result = dict(raw_prediction_result)
+    prediction_result["prediction"] = prediction
+    prediction_result.setdefault("raw_response", normalized.get("raw_response", raw_prediction_result or {"prediction": prediction}))
+    prediction_result.setdefault(
+        "endpoint_url",
+        str(normalized.get("source_endpoint_url") or "").strip() or _get_env("LOGMONITOR_SOURCE_ENDPOINT_URL"),
+    )
+    _add_diagnostic(
+        diagnostics,
+        "prediction_result",
+        prediction=prediction,
+        prediction_shape=_diagnostic_shape(prediction_result.get("prediction", "")),
+        raw_response_shape=_diagnostic_shape(prediction_result.get("raw_response", "")),
+        raw_response_preview=prediction_result.get("raw_response", ""),
+        endpoint_url=prediction_result.get("endpoint_url", ""),
+        source="already_predicted",
+    )
+    result = _execute_triage_actions(normalized, prediction_result, prediction, diagnostics)
+    return _to_triage_action_response(normalized, result, diagnostics)
+
+
+@app.function_name(name="triage_log")
+@app.route(route="triage", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def triage_log(req: func.HttpRequest) -> func.HttpResponse:
+    diagnostics: list[dict] = []
+    _add_diagnostic(
+        diagnostics,
+        "start",
+        triage_enabled=_get_env("LOGMONITOR_TRIAGE_ENABLED", "0").lower() in {"1", "true", "yes", "on"},
+    )
+    if _get_env("LOGMONITOR_TRIAGE_ENABLED", "0").lower() not in {"1", "true", "yes", "on"}:
+        _add_diagnostic(diagnostics, "config", "failed", reason="Azure triage automation is not enabled.")
+        return _to_json_response(
+            {
+                "accepted": False,
+                "error": "Azure triage automation is not enabled for this deployment.",
+                "diagnostics": diagnostics,
+            },
+            404,
+        )
+
+    try:
+        payload = req.get_json()
+        _add_diagnostic(diagnostics, "payload_parse", payload_shape=_diagnostic_shape(payload))
+    except ValueError:
+        raw_text = req.get_body().decode("utf-8", errors="ignore").strip()
+        if not raw_text:
+            _add_diagnostic(diagnostics, "payload_parse", "failed", reason="empty body")
+            return _to_json_response(
+                {
+                    "accepted": False,
+                    "error": "Send a JSON body or plain-text log message.",
+                    "diagnostics": diagnostics,
+                },
+                400,
+            )
+        payload = raw_text
+        _add_diagnostic(diagnostics, "payload_parse", payload_shape=_diagnostic_shape(payload), fallback="plain_text")
+
+    normalized = _normalize_payload(payload)
+    message = _extract_message(normalized)
+    _add_diagnostic(
+        diagnostics,
+        "payload_normalized",
+        payload_shape=_diagnostic_shape(normalized),
+        message_present=bool(message),
+        message_length=len(message),
+        received_at=normalized.get("received_at"),
+    )
+    if not message:
+        _add_diagnostic(diagnostics, "payload_validation", "failed", reason="missing log message")
+        return _to_json_response(
+            {
+                "accepted": False,
+                "error": "Triage payload needs a log message in errorMessage, LogMessage, message, log, msg, or text.",
+                "diagnostics": diagnostics,
+            },
+            400,
+        )
+
+    _add_diagnostic(
+        diagnostics,
+        "prediction_call",
+        endpoint_configured=bool(_get_env("LOGMONITOR_PREDICTION_ENDPOINT_URL") or _get_env("LOGMONITOR_SOURCE_ENDPOINT_URL")),
+        auth_mode=_get_env("LOGMONITOR_PREDICTION_AUTH_MODE", "key").lower(),
+    )
+    try:
+        prediction_result = _call_prediction_endpoint(normalized)
+    except Exception as exc:
+        LOGGER.exception("Prediction call failed during triage.")
+        _add_diagnostic(
+            diagnostics,
+            "prediction_call",
+            "failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return _to_json_response({"accepted": False, "error": str(exc), "diagnostics": diagnostics}, 502)
+
+    prediction = _normalize_prediction_label(prediction_result.get("prediction", "")) or prediction_result.get("prediction", "")
+    _add_diagnostic(
+        diagnostics,
+        "prediction_result",
+        prediction=prediction,
+        prediction_shape=_diagnostic_shape(prediction_result.get("prediction", "")),
+        raw_response_shape=_diagnostic_shape(prediction_result.get("raw_response", "")),
+        raw_response_preview=prediction_result.get("raw_response", ""),
+        endpoint_url=prediction_result.get("endpoint_url", ""),
+    )
+    result = _execute_triage_actions(normalized, prediction_result, prediction, diagnostics)
+    return _to_triage_action_response(normalized, result, diagnostics)

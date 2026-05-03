@@ -73,6 +73,11 @@ from mlops_utils import clean_optional_string, read_json
 Reporter = Callable[[str], None]
 DEFAULT_SERVERLESS_MODEL_ID = "azureml://registries/azureml/models/Phi-4-mini-instruct"
 COMMUNICATION_API_VERSION = "2025-09-01"
+FUNCTION_BRIDGE_WORKER_SETTINGS = {
+    "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
+    "PYTHON_ENABLE_WORKER_EXTENSIONS": "1",
+    "PYTHON_ISOLATE_WORKER_DEPENDENCIES": "1",
+}
 
 
 class AzurePlatformService:
@@ -1343,7 +1348,15 @@ class AzurePlatformService:
         bridge_root = self.project_dir / "azure_function_bridge"
         if not bridge_root.exists():
             raise RuntimeError("The Azure Function bridge files are missing from this project.")
-        package_path = Path(tempfile.gettempdir()) / f"{package_name}.zip"
+        required_files = ["function_app.py", "host.json", "requirements.txt"]
+        missing_files = [name for name in required_files if not (bridge_root / name).is_file()]
+        if missing_files:
+            raise RuntimeError(
+                "The Azure Function bridge package is missing required files: " + ", ".join(missing_files)
+            )
+        package_dir = Path(tempfile.gettempdir()) / self.sanitize_azure_name(package_name, max_length=60)
+        package_dir.mkdir(parents=True, exist_ok=True)
+        package_path = package_dir / "released-package.zip"
         if package_path.exists():
             package_path.unlink()
         extra_root_files = [
@@ -1390,7 +1403,7 @@ class AzurePlatformService:
 
         blob_service = BlobServiceClient.from_connection_string(storage_connection_string)
         container_client = blob_service.get_container_client(package_container_name)
-        package_blob_name = f"releases/{Path(package_path).name}"
+        package_blob_name = f"releases/{Path(package_path).parent.name}/released-package.zip"
         with open(package_path, "rb") as handle:
             container_client.upload_blob(name=package_blob_name, data=handle, overwrite=True)
 
@@ -1420,9 +1433,72 @@ class AzurePlatformService:
             credential,
             "PUT",
             url,
-            payload={"properties": {"packageUri": package_uri, "remoteBuild": True}, "type": "zip"},
+            payload={"properties": {"packageUri": package_uri, "remoteBuild": True}},
             expected_statuses=(200, 202),
         )
+
+    def list_function_app_function_names(self, credential, sub_id: str, function_app_name: str) -> list[str]:
+        url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.resource_group}"
+            f"/providers/Microsoft.Web/sites/{function_app_name}/functions?api-version=2025-03-01"
+        )
+        payload = self.azure_management_json_request(credential, "GET", url, expected_statuses=(200,))
+        raw_values = payload.get("value", []) if isinstance(payload, dict) else []
+        names: list[str] = []
+        for item in raw_values:
+            if not isinstance(item, dict):
+                continue
+            raw_name = clean_optional_string(item.get("name"))
+            if not raw_name:
+                continue
+            names.append(raw_name.split("/")[-1])
+        return names
+
+    def sync_function_app_triggers(self, credential, sub_id: str, function_app_name: str) -> None:
+        url = (
+            f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.resource_group}"
+            f"/providers/Microsoft.Web/sites/{function_app_name}/host/default/sync?api-version=2025-03-01"
+        )
+        self.azure_management_json_request(credential, "POST", url, payload={}, expected_statuses=(200, 202, 204))
+
+    def update_online_deployment_environment_variables(
+        self,
+        ml_client,
+        endpoint_name: str,
+        deployment_name: str,
+        variables: dict[str, str],
+        emit: Reporter | None = None,
+    ) -> dict[str, str]:
+        clean_variables = {
+            clean_optional_string(key): clean_optional_string(value)
+            for key, value in (variables or {}).items()
+            if clean_optional_string(key) and clean_optional_string(value)
+        }
+        if not clean_variables:
+            return {}
+        deployment = ml_client.online_deployments.get(name=deployment_name, endpoint_name=endpoint_name)
+        existing_variables = getattr(deployment, "environment_variables", None)
+        if not isinstance(existing_variables, dict):
+            existing_variables = {}
+        merged_variables = {**existing_variables, **clean_variables}
+        setattr(deployment, "environment_variables", merged_variables)
+        if emit:
+            emit("Updating Azure online deployment environment variables...")
+        self.wait_for_azure_poller(
+            ml_client.online_deployments.begin_create_or_update(deployment),
+            action="Updating Azure online deployment environment variables",
+            emit=emit,
+            timeout_seconds=1800,
+        )
+        self.wait_for_online_deployment_ready(
+            ml_client,
+            endpoint_name,
+            deployment_name,
+            action="Waiting for Azure online deployment environment update",
+            emit=emit,
+            timeout_seconds=1800,
+        )
+        return merged_variables
 
     def wait_for_function_bridge_endpoint(
         self,
@@ -1432,6 +1508,8 @@ class AzurePlatformService:
         function_host_name: str,
         function_name: str = "ingest_log",
         route_path: str = "logs",
+        timeout_seconds: int = 900,
+        poll_interval_seconds: int = 10,
     ) -> tuple[str, str]:
         host_keys_url = (
             f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.resource_group}"
@@ -1441,32 +1519,56 @@ class AzurePlatformService:
             f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.resource_group}"
             f"/providers/Microsoft.Web/sites/{function_app_name}/functions/{function_name}/listsecrets?api-version=2025-05-01"
         )
-        deadline = time.time() + 900
+        deadline = time.time() + max(int(timeout_seconds), 1)
+        poll_interval = max(int(poll_interval_seconds), 1)
         last_error = ""
+        last_function_names: list[str] = []
+        sync_attempted = False
         while time.time() < deadline:
             try:
-                payload = self.azure_management_json_request(credential, "POST", host_keys_url, payload={}, expected_statuses=(200,))
-                function_keys = payload.get("functionKeys") if isinstance(payload.get("functionKeys"), dict) else {}
-                function_key = clean_optional_string(function_keys.get("default"))
-                if not function_key and function_keys:
-                    function_key = clean_optional_string(next(iter(function_keys.values()), ""))
-                if function_key:
-                    return f"https://{function_host_name}/api/{route_path.strip('/')}?code={function_key}", function_key
+                last_function_names = self.list_function_app_function_names(credential, sub_id, function_app_name)
             except Exception as exc:
                 last_error = str(exc)
-            try:
-                payload = self.azure_management_json_request(credential, "POST", function_secrets_url, payload={}, expected_statuses=(200,))
-                trigger_url = clean_optional_string(payload.get("trigger_url"))
-                function_key = clean_optional_string(payload.get("key"))
-                if trigger_url:
-                    return trigger_url, function_key
-                if function_key:
-                    return f"https://{function_host_name}/api/{route_path.strip('/')}?code={function_key}", function_key
-            except Exception as exc:
-                last_error = str(exc)
-            time.sleep(10)
+            if function_name in last_function_names:
+                try:
+                    payload = self.azure_management_json_request(
+                        credential,
+                        "POST",
+                        function_secrets_url,
+                        payload={},
+                        expected_statuses=(200,),
+                    )
+                    trigger_url = clean_optional_string(payload.get("trigger_url"))
+                    function_key = clean_optional_string(payload.get("key"))
+                    if trigger_url:
+                        return trigger_url, function_key
+                    if function_key:
+                        return f"https://{function_host_name}/api/{route_path.strip('/')}?code={function_key}", function_key
+                except Exception as exc:
+                    last_error = str(exc)
+                try:
+                    payload = self.azure_management_json_request(credential, "POST", host_keys_url, payload={}, expected_statuses=(200,))
+                    function_keys = payload.get("functionKeys") if isinstance(payload.get("functionKeys"), dict) else {}
+                    function_key = clean_optional_string(function_keys.get("default"))
+                    if not function_key and function_keys:
+                        function_key = clean_optional_string(next(iter(function_keys.values()), ""))
+                    if function_key:
+                        return f"https://{function_host_name}/api/{route_path.strip('/')}?code={function_key}", function_key
+                except Exception as exc:
+                    last_error = str(exc)
+            elif not sync_attempted:
+                try:
+                    self.sync_function_app_triggers(credential, sub_id, function_app_name)
+                except Exception as exc:
+                    last_error = str(exc)
+                sync_attempted = True
+            time.sleep(poll_interval)
+        visible_functions = ", ".join(last_function_names) if last_function_names else "none"
         raise RuntimeError(
-            "The Azure Function API was deployed, but the app could not retrieve the trigger URL in time.\n\n"
+            f"The Azure Function API package was deployed, but Azure did not index `{function_name}` in time.\n"
+            f"Visible functions: {visible_functions}.\n\n"
+            "Open the Function App > Log stream or Diagnose and solve problems > Flex Consumption Deployment "
+            "to see Python import/build errors from the deployment.\n\n"
             f"Last error:\n{last_error}"
         )
 

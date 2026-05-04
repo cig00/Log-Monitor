@@ -65,14 +65,14 @@ class LogProcessorApp:
     DEFAULT_HOSTING_FORM_VALUES = {
         "hosting_mode": "azure",
         "azure_service": "online",
-        "github_token": "GITHUB_TOKEN",
+        "github_token": "",
         "azure_host_sub_id": "91a62f38-6e7e-434a-ad85-592905ae1bf7",
         "azure_host_tenant_id": "5bf6ff5b-6333-491c-b315-f803d901c135",
         "configuration_email": "eece00@outlook.com",
         "system_email": "eece00@outlook.com",
         "jira_site_url": "https://eece00.atlassian.net",
         "jira_account_email": "eece00@outlook.com",
-        "jira_api_token": "JIRA_TOKEN",
+        "jira_api_token": "",
         "jira_project_key": "KAN",
     }
 

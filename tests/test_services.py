@@ -174,7 +174,6 @@ class ServiceTests(unittest.TestCase):
 
     def test_github_copilot_prompt_does_not_require_token_settings_by_default(self):
         service = GitHubService()
-        template_info = service.get_log_forwarding_prompt_template_info()
 
         prompt = service.build_log_forwarding_copilot_prompt(
             repo_name="owner/repo",
@@ -184,24 +183,14 @@ class ServiceTests(unittest.TestCase):
         )
 
         self.assertIn("https://example.test/api/logs?code=function-key", prompt)
-        self.assertTrue(Path(template_info["copilot_prompt_template_path"]).exists())
-        self.assertEqual(len(template_info["copilot_prompt_template_version_id"]), 64)
-        self.assertIn(f"Prompt template version: {template_info['copilot_prompt_template_version_label']}", prompt)
-        self.assertIn("Rendered Copilot prompt version: not archived yet", prompt)
         self.assertIn("Hard-code the deployed Log Monitor endpoint URL above as the default target", prompt)
         self.assertIn("Do not require the user to access the server or set environment variables", prompt)
         self.assertIn("already includes the required Function access code", prompt)
-        self.assertIn('"errorMessage": "ViewException: Call to undefined method App\\\\Models\\\\TicketPriority::nonexistent_relation()', prompt)
-        self.assertIn("Every POST to the Log Monitor endpoint must send one JSON object, not an array.", prompt)
-        self.assertIn('The only accepted body is `{"errorMessage": "<log>"}`', prompt)
-        self.assertIn("Never send arrays", prompt)
-        self.assertIn("Treat the `errorMessage` contract as mandatory", prompt)
         self.assertNotIn("LOG_MONITOR_ENDPOINT_URL", prompt)
         self.assertNotIn("LOG_MONITOR_FORWARDING_ENABLED", prompt)
         self.assertNotIn("LOG_MONITOR_ENDPOINT_KEY", prompt)
         self.assertNotIn("bearer-token", prompt.lower())
         self.assertNotIn("bearer token", prompt.lower())
-        self.assertNotIn("send each log as JSON including at least `message`, `level`, `timestamp`, `source`", prompt)
 
     def test_github_copilot_prompt_mentions_endpoint_key_only_for_key_auth(self):
         service = GitHubService()
@@ -240,7 +229,7 @@ class ServiceTests(unittest.TestCase):
         body = service.build_log_forwarding_issue_body(prompt, "https://example.test/api/logs?code=function-key", studio_url)
 
         self.assertIn(studio_url, prompt)
-        self.assertIn("Rendered Copilot prompt version: abc123 (abc123full)", prompt)
+        self.assertIn("Copilot prompt version: abc123 (abc123full)", prompt)
         self.assertIn("Azure ML Studio endpoint page", body)
         self.assertIn(studio_url, body)
 
@@ -306,10 +295,8 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("LOG_MONITOR_ENDPOINT_URL", prompt_text)
         self.assertEqual(captured["log_prompt_mlflow"]["tracking_uri"], "azureml://tracking")
         self.assertEqual(captured["log_prompt_mlflow"]["metadata"]["azure_studio_endpoint_url"], studio_url)
-        self.assertIn("copilot_prompt_template_version_id", captured["log_prompt_mlflow"]["metadata"])
         self.assertEqual(result["github_pr_task"]["azure_studio_endpoint_url"], studio_url)
         self.assertEqual(result["github_pr_task"]["copilot_prompt_mlflow_status"], "logged")
-        self.assertIn("copilot_prompt_template_version_id", result["github_pr_task"])
 
     def test_model_catalog_archives_dataset_and_finds_models(self):
         dataset_path = self.project_dir / "sample.csv"

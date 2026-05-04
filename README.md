@@ -541,7 +541,7 @@ Important note about GitHub PR automation:
 - the Copilot task prompt includes the deployed endpoint URL and the Azure ML Studio endpoint page for traceability
 - when Azure hosting creates a Function bridge, the Copilot task uses the triage/log Function URL first so the committed default URL already contains the Function access code
 - the prompt asks Copilot to commit the deployed endpoint URL as the default target in the app code/config, without requiring server environment variable setup by the user
-- the Copilot task prompt template lives at `app_core/prompts/log_forwarding_copilot_prompt.txt`; the rendered prompt is versioned under `./outputs/copilot_pr_prompts` with both the template SHA and rendered prompt SHA, and when Azure MLflow tracking is available it is logged to the `log-monitor-copilot-prompts` experiment in Azure ML Studio
+- the generated Copilot task prompt is versioned under `./outputs/copilot_pr_prompts` and, when Azure MLflow tracking is available, logged to the `log-monitor-copilot-prompts` experiment in Azure ML Studio
 
 ## Input And Output Data Contracts
 
@@ -830,7 +830,7 @@ Data-prep tracking still depends on MLflow being enabled in the UI, but Azure tr
 
 ### Copilot PR Prompt Tracking
 
-When Azure hosting creates a GitHub Copilot PR task, Log Monitor renders the template in `app_core/prompts/log_forwarding_copilot_prompt.txt` and archives the exact rendered prompt under `./outputs/copilot_pr_prompts`. The archive metadata includes both the template version SHA and the rendered prompt version SHA. If the Azure workspace exposes an MLflow tracking URI, the same prompt is also logged to Azure ML Studio in the `log-monitor-copilot-prompts` experiment with the prompt version ID, template version ID, endpoint URL, Azure ML Studio endpoint page, target repo, branch, and GitHub issue URL.
+When Azure hosting creates a GitHub Copilot PR task, Log Monitor archives the exact prompt under `./outputs/copilot_pr_prompts`. If the Azure workspace exposes an MLflow tracking URI, the same prompt is also logged to Azure ML Studio in the `log-monitor-copilot-prompts` experiment with the prompt version ID, endpoint URL, Azure ML Studio endpoint page, target repo, branch, and GitHub issue URL.
 
 ### Data-Prep Tracking
 

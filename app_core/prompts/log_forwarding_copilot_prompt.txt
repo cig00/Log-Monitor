@@ -14,7 +14,7 @@ Endpoint:
 - Rendered Copilot prompt version: $copilot_prompt_version_text
 
 Primary requirement:
-Send actionable error, configuration, and system failure events to the endpoint without degrading user experience. The application must never wait for the endpoint request to complete on the user-facing request/UI path.
+Send application logs and error events to the endpoint without degrading user experience. The application must never wait for the endpoint request to complete on the user-facing request/UI path.
 
 Required endpoint request body:
 - Every POST to the Log Monitor endpoint must send one JSON object, not an array.
@@ -30,15 +30,6 @@ Required endpoint request body:
 - Do not send any other body format. The only accepted body is `{"errorMessage": "<log>"}`.
 - Never send arrays or objects shaped like `{"message": "...", "level": "...", "timestamp": "...", "source": "..."}`.
 - If the app produces structured log records, convert each relevant error/exception record into one `{"errorMessage": "..."}` request. For multiple errors, send multiple separate requests.
-
-Forwarding scope and classification hygiene:
-- Do not forward every local log line to the realtime triage endpoint. Routine request/access logs, app boot logs, health checks, cache/config clear events, database transaction start/commit/rollback logs, successful SQL/query logs, info/debug/audit logs, and other normal operational logs are Noise and should stay local unless they contain an explicit exception or failure.
-- Forward only actionable signals likely to need Log Monitor triage: unhandled exceptions, framework error events, fatal errors, caught exceptions intentionally reported as errors, configuration failures, system/infrastructure failures, queue/job failures, notification/mail failures, and critical/error-level records with a real failure message.
-- If you hook a broad logger or shared local log helper, filter before enqueueing. Do not blindly attach Log Monitor forwarding to every local write/log call when that helper is also used for routine app events.
-- When an exception occurs in the same request as routine request/transaction/boot logs, send the exception/error event as the representative payload. Do not let a request summary, boot message, or transaction log be the payload that reaches Log Monitor.
-- Preserve the full useful exception text before applying local storage limits. Do not send a message after truncating it to a database column, UI table, CSV export, or local log field length. Apply a separate outbound cap after redaction if the endpoint payload needs a size bound.
-- For exception payloads, prefer exception class, message, source file/line, top application stack frame or view path when available, and route/request path. Avoid full URLs or headers that may contain secrets.
-- The sample `ViewException` for `TicketPriority::nonexistent_relation()` should reach the endpoint as the `errorMessage` value itself. It must not be replaced by a GET/POST request summary, app boot log, transaction log, or structured wrapper.
 
 Implementation guidance:
 - First inspect the repository to find its language, framework, logging layer, error handlers, and app startup/configuration patterns.

@@ -1036,8 +1036,7 @@ class HostingService:
             raise RuntimeError("Azure real-time triage needs the Azure ML online endpoint key, but no key was available.")
         settings = {
             **FUNCTION_BRIDGE_WORKER_SETTINGS,
-            "AzureWebJobsStorage": storage_connection_string,
-            "DEPLOYMENT_STORAGE_CONNECTION_STRING": storage_connection_string,
+            "AzureWebJobsStorage__accountName": storage_account_name,
             "LOGMONITOR_STORAGE_CONNECTION": storage_connection_string,
             "LOGMONITOR_BLOB_CONTAINER": blob_container_name,
             "LOGMONITOR_SERVICEBUS_CONNECTION": service_bus_connection_string,
@@ -1097,11 +1096,7 @@ class HostingService:
             settings=settings,
         )
         ctx.emit("progress", "Packaging the Azure Function feedback bridge...")
-        include_azure_ml_in_bridge = not triage_enabled
-        package_path = self.azure_platform_service.build_function_bridge_package(
-            f"log-monitor-function-{clean_service_kind}-{timestamp}",
-            include_azure_ml=include_azure_ml_in_bridge,
-        )
+        package_path = self.azure_platform_service.build_function_bridge_package(f"log-monitor-function-{clean_service_kind}-{timestamp}")
         package_uri = self.azure_platform_service.upload_function_bridge_package(
             storage_connection_string=storage_connection_string,
             storage_account_name=storage_account_name,

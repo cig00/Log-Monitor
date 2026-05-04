@@ -396,91 +396,6 @@ class AzurePlatformService:
             **init_kwargs,
         )
 
-    def get_azure_object_value(self, value: Any, *keys: str) -> Any:
-        if value is None:
-            return None
-        for key in keys:
-            if isinstance(value, dict) and key in value:
-                return value.get(key)
-            try:
-                candidate = getattr(value, key)
-            except Exception:
-                candidate = None
-            if candidate not in (None, ""):
-                return candidate
-        return None
-
-    def azure_object_to_plain(self, value: Any, max_depth: int = 4) -> Any:
-        if max_depth <= 0:
-            return clean_optional_string(value)
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, dict):
-            return {str(key): self.azure_object_to_plain(item, max_depth - 1) for key, item in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            return [self.azure_object_to_plain(item, max_depth - 1) for item in value]
-        for method_name in ("as_dict", "serialize", "to_dict"):
-            method = getattr(value, method_name, None)
-            if callable(method):
-                try:
-                    return self.azure_object_to_plain(method(), max_depth - 1)
-                except Exception:
-                    pass
-        attrs = getattr(value, "__dict__", None)
-        if isinstance(attrs, dict):
-            payload = {
-                key: self.azure_object_to_plain(item, max_depth - 1)
-                for key, item in attrs.items()
-                if not str(key).startswith("_") and not callable(item)
-            }
-            if payload:
-                return payload
-        return clean_optional_string(value)
-
-    def format_azure_payload_detail(self, value: Any, max_chars: int = 4000) -> str:
-        plain = self.azure_object_to_plain(value)
-        if isinstance(plain, (dict, list)):
-            detail = json.dumps(plain, indent=2, ensure_ascii=True)
-        else:
-            detail = clean_optional_string(plain)
-        if len(detail) <= max_chars:
-            return detail
-        return detail[: max_chars - 30] + "\n...[truncated by Log Monitor]"
-
-    def extract_online_deployment_failure_detail(self, deployment: Any) -> str:
-        properties = self.get_azure_object_value(deployment, "properties") or {}
-        candidates: list[Any] = []
-        for source in (deployment, properties):
-            for key in (
-                "error",
-                "provisioning_error",
-                "provisioningError",
-                "failure_reason",
-                "failureReason",
-                "status_message",
-                "statusMessage",
-                "message",
-            ):
-                candidate = self.get_azure_object_value(source, key)
-                if candidate not in (None, "", []):
-                    candidates.append(candidate)
-        if not candidates:
-            plain_properties = self.azure_object_to_plain(properties)
-            if isinstance(plain_properties, dict):
-                for key, value in plain_properties.items():
-                    if "error" in str(key).lower() or "message" in str(key).lower() or "reason" in str(key).lower():
-                        if value not in (None, "", []):
-                            candidates.append({key: value})
-            elif clean_optional_string(plain_properties):
-                candidates.append(plain_properties)
-
-        detail_parts: list[str] = []
-        for candidate in candidates:
-            detail = self.format_azure_payload_detail(candidate)
-            if detail and detail not in detail_parts:
-                detail_parts.append(detail)
-        return "\n\n".join(detail_parts)
-
     def wait_for_online_deployment_ready(
         self,
         ml_client,
@@ -498,10 +413,10 @@ class AzurePlatformService:
         while time.time() < deadline:
             try:
                 deployment = self.get_raw_online_deployment(ml_client, endpoint_name, deployment_name)
-                properties = self.get_azure_object_value(deployment, "properties") or {}
+                properties = getattr(deployment, "properties", None)
                 state = clean_optional_string(
-                    self.get_azure_object_value(deployment, "provisioning_state", "provisioningState")
-                    or self.get_azure_object_value(properties, "provisioning_state", "provisioningState")
+                    getattr(deployment, "provisioning_state", "")
+                    or getattr(properties, "provisioning_state", "")
                 )
                 if state:
                     last_state = state
@@ -509,12 +424,7 @@ class AzurePlatformService:
                 if state_lower == "succeeded":
                     return deployment
                 if state_lower in {"failed", "canceled"}:
-                    detail = self.extract_online_deployment_failure_detail(deployment)
-                    detail_suffix = f"\n\nAzure failure details:\n{detail}" if detail else ""
-                    raise RuntimeError(
-                        f"Azure deployment '{deployment_name}' provisioning {state_lower}."
-                        + detail_suffix
-                    )
+                    raise RuntimeError(f"Azure deployment '{deployment_name}' provisioning {state_lower}.")
             except AttributeError as exc:
                 if "endpoint_compute_type" not in clean_optional_string(exc):
                     raise
@@ -1434,7 +1344,7 @@ class AzurePlatformService:
             raise RuntimeError("Azure infrastructure deployment completed but did not return the expected outputs.")
         return normalized
 
-    def build_function_bridge_package(self, package_name: str, include_azure_ml: bool = True) -> str:
+    def build_function_bridge_package(self, package_name: str) -> str:
         bridge_root = self.project_dir / "azure_function_bridge"
         if not bridge_root.exists():
             raise RuntimeError("The Azure Function bridge files are missing from this project.")
@@ -1457,17 +1367,7 @@ class AzurePlatformService:
         with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for file_path in bridge_root.rglob("*"):
                 if file_path.is_file() and "__pycache__" not in file_path.parts:
-                    relative_name = str(file_path.relative_to(bridge_root))
-                    if relative_name == "requirements.txt" and not include_azure_ml:
-                        requirements = file_path.read_text(encoding="utf-8").splitlines()
-                        lean_requirements = [
-                            line
-                            for line in requirements
-                            if not line.strip().split("#", 1)[0].strip().lower().startswith("azure-ai-ml")
-                        ]
-                        archive.writestr(relative_name, "\n".join(lean_requirements).rstrip() + "\n")
-                    else:
-                        archive.write(file_path, arcname=relative_name)
+                    archive.write(file_path, arcname=str(file_path.relative_to(bridge_root)))
             for file_path in extra_root_files:
                 if file_path.exists() and file_path.is_file():
                     archive.write(file_path, arcname=file_path.name)
@@ -1522,16 +1422,7 @@ class AzurePlatformService:
             f"https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{self.resource_group}"
             f"/providers/Microsoft.Web/sites/{function_app_name}/config/appsettings?api-version=2025-03-01"
         )
-        existing: dict[str, Any] = {}
-        try:
-            payload = self.azure_management_json_request(credential, "GET", url, expected_statuses=(200,))
-            existing_properties = payload.get("properties") if isinstance(payload, dict) else {}
-            if isinstance(existing_properties, dict):
-                existing = dict(existing_properties)
-        except Exception:
-            existing = {}
-        merged = {**existing, **(settings or {})}
-        self.azure_management_json_request(credential, "PUT", url, payload={"properties": merged}, expected_statuses=(200,))
+        self.azure_management_json_request(credential, "PUT", url, payload={"properties": settings}, expected_statuses=(200,))
 
     def trigger_function_app_onedeploy(self, credential, sub_id: str, function_app_name: str, package_uri: str) -> None:
         url = (

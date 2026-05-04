@@ -179,8 +179,7 @@
               "type": "blobContainer",
               "value": "[concat(reference(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))).primaryEndpoints.blob, parameters('packageContainerName'))]",
               "authentication": {
-                "type": "StorageAccountConnectionString",
-                "storageAccountConnectionStringName": "DEPLOYMENT_STORAGE_CONNECTION_STRING"
+                "type": "SystemAssignedIdentity"
               }
             }
           },
@@ -208,12 +207,8 @@
               "value": "1"
             },
             {
-              "name": "AzureWebJobsStorage",
-              "value": "[concat('DefaultEndpointsProtocol=https;AccountName=', parameters('storageAccountName'), ';AccountKey=', listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2024-01-01').keys[0].value, ';EndpointSuffix=', environment().suffixes.storage)]"
-            },
-            {
-              "name": "DEPLOYMENT_STORAGE_CONNECTION_STRING",
-              "value": "[concat('DefaultEndpointsProtocol=https;AccountName=', parameters('storageAccountName'), ';AccountKey=', listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2024-01-01').keys[0].value, ';EndpointSuffix=', environment().suffixes.storage)]"
+              "name": "AzureWebJobsStorage__accountName",
+              "value": "[parameters('storageAccountName')]"
             }
           ]
         }

@@ -1,9 +1,8 @@
 # 🧪 Testing Guide
 
 ## 1. Watch the Demo
-Please start by watching the demo video below:
-
-[Play the demo video](demo.mp4)
+### 🎬 Watch the Demo
+Watch demo.mp4 in repo or [▶️ Click here to watch the demo](https://wh1522657.ispot.cc/demo.mp4)
 
 > Note: GitHub Markdown preview does not reliably render the HTML `<video>` tag, so this link is provided as a working fallback.
 

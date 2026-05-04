@@ -687,6 +687,19 @@ def _github_request(path: str, params: dict | None = None) -> object:
     return response.json()
 
 
+def _github_post(path: str, payload: dict, timeout: int = 60) -> dict:
+    repo = _require_env("LOGMONITOR_GITHUB_REPO")
+    url = f"https://api.github.com/repos/{repo}/{path.lstrip('/')}"
+    response = requests.post(url, headers=_github_headers(), json=payload, timeout=timeout)
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = _truncate(response.text, 2000)
+        raise RuntimeError(f"GitHub request failed ({response.status_code}). {detail}") from exc
+    parsed = response.json()
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _github_search_commits(repo: str, terms: list[str], since_date: str) -> list[dict]:
     search_terms = [term for term in terms if term][:6]
     if not repo or not search_terms:
@@ -1525,6 +1538,173 @@ def _create_jira_issue(payload: dict, prediction_result: dict, github_context: d
         "jira_response": result,
         "jira_warnings": jira_warnings,
     }
+
+
+def _copilot_remediation_enabled() -> bool:
+    return _get_env("LOGMONITOR_COPILOT_REMEDIATION_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+
+
+def _github_copilot_assignee() -> str:
+    return _get_env("LOGMONITOR_COPILOT_ASSIGNEE", "copilot-swe-agent[bot]") or "copilot-swe-agent[bot]"
+
+
+def _build_copilot_remediation_prompt(
+    payload: dict,
+    prediction_result: dict,
+    github_context: dict,
+    jira_issue: dict,
+) -> str:
+    message = _extract_message(payload)
+    jira_issue_key = str(jira_issue.get("issue_key") or "").strip()
+    jira_issue_url = str(jira_issue.get("issue_url") or "").strip()
+    repo = _get_env("LOGMONITOR_GITHUB_REPO")
+    branch = _clean_github_branch(_get_env("LOGMONITOR_GITHUB_BRANCH")) or "main"
+    return "\n".join(
+        [
+            f"You are GitHub Copilot coding agent acting as a senior software engineer in `{repo}` from `{branch}`.",
+            "",
+            "Goal:",
+            "Fix the production/runtime error captured by Log Monitor, open a pull request, and link it back to the Jira incident.",
+            "",
+            "Jira incident:",
+            f"- Key: {jira_issue_key or 'not provided'}",
+            f"- URL: {jira_issue_url or 'not provided'}",
+            "",
+            "Error message:",
+            "```text",
+            _truncate(message, 6000),
+            "```",
+            "",
+            "Implementation guidance:",
+            "- Treat the Jira ticket as the source incident and this GitHub issue as the engineering repair task.",
+            "- Inspect the repository before editing; identify the smallest safe fix for the root cause.",
+            "- Use the GitHub history context below as investigation aid only. Do not assume a developer is responsible unless the diff proves it.",
+            "- Prefer fixing the real defect over suppressing the error. Add defensive handling only when it preserves intended behavior.",
+            "- Add or update focused tests when the repository has an obvious test pattern.",
+            "- Run the cheapest relevant formatter/linter/tests available in the repository.",
+            "- In the pull request body, include the Jira incident key, the observed error, the root cause, the fix, and verification results.",
+            "- If the error is caused by external configuration or infrastructure rather than application code, open the PR with the safest code-side guard or diagnostic improvement and explain the operational action needed.",
+            "",
+            "Prediction result:",
+            json.dumps(prediction_result, ensure_ascii=True, indent=2)[:5000],
+            "",
+            "GitHub impact context from Log Monitor:",
+            json.dumps(github_context, ensure_ascii=True, indent=2)[:10000],
+            "",
+            "Raw Log Monitor payload:",
+            json.dumps(payload, ensure_ascii=True, indent=2)[:10000],
+            "",
+            f"Created by Log Monitor at {_now_utc_iso()}.",
+        ]
+    )
+
+
+def _build_copilot_remediation_issue_body(prompt_text: str, jira_issue: dict) -> str:
+    jira_issue_key = str(jira_issue.get("issue_key") or "").strip()
+    jira_issue_url = str(jira_issue.get("issue_url") or "").strip()
+    jira_line = f"[{jira_issue_key}]({jira_issue_url})" if jira_issue_key and jira_issue_url else jira_issue_key or jira_issue_url
+    return "\n".join(
+        [
+            "Log Monitor created this GitHub issue so Copilot coding agent can prepare a pull request for a Jira incident.",
+            "",
+            f"Jira incident: {jira_line or 'not provided'}",
+            "",
+            "Copilot should fix the underlying error, run relevant checks, and include the Jira incident key in the PR body.",
+            "",
+            "```text",
+            prompt_text.strip(),
+            "```",
+        ]
+    )
+
+
+def _add_jira_comment(issue_key: str, text: str) -> dict:
+    clean_issue_key = str(issue_key or "").strip()
+    if not clean_issue_key:
+        raise RuntimeError("Jira issue key is required to add a comment.")
+    site_url = _normalize_jira_site_url(_require_env("LOGMONITOR_JIRA_SITE_URL"))
+    account_email = _require_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL")
+    api_token = _require_env("LOGMONITOR_JIRA_API_TOKEN")
+    response = requests.post(
+        f"{site_url}/rest/api/3/issue/{clean_issue_key}/comment",
+        headers=_jira_auth_headers(account_email, api_token),
+        json={"body": _jira_adf_from_text(text)},
+        timeout=30,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(f"Jira comment creation failed ({response.status_code}). {_truncate(response.text, 2000)}") from exc
+    result = response.json()
+    comment_id = str(result.get("id") or "") if isinstance(result, dict) else ""
+    return {"comment_id": comment_id}
+
+
+def _create_github_copilot_remediation_task(
+    payload: dict,
+    prediction_result: dict,
+    github_context: dict,
+    jira_issue: dict,
+) -> dict:
+    if not _copilot_remediation_enabled():
+        return {"enabled": False, "reason": "GitHub Copilot remediation is disabled."}
+    issue_key = str(jira_issue.get("issue_key") or "").strip()
+    if not issue_key:
+        raise RuntimeError("A Jira issue must be created before assigning Copilot remediation.")
+
+    repo = _require_env("LOGMONITOR_GITHUB_REPO")
+    branch = _clean_github_branch(_get_env("LOGMONITOR_GITHUB_BRANCH")) or "main"
+    assignee = _github_copilot_assignee()
+    prompt_text = _build_copilot_remediation_prompt(payload, prediction_result, github_context, jira_issue)
+    title = _jira_summary_text(f"Fix {issue_key}: {_extract_message(payload) or 'Log Monitor error'}")
+    request_payload = {
+        "title": title,
+        "body": _build_copilot_remediation_issue_body(prompt_text, jira_issue),
+        "assignees": [assignee],
+        "agent_assignment": {
+            "target_repo": repo,
+            "base_branch": branch,
+            "custom_instructions": prompt_text,
+            "custom_agent": _get_env("LOGMONITOR_COPILOT_CUSTOM_AGENT"),
+            "model": _get_env("LOGMONITOR_COPILOT_MODEL"),
+        },
+    }
+    issue = _github_post("issues", request_payload)
+    issue_number = issue.get("number")
+    html_url = str(issue.get("html_url") or "")
+    task = {
+        "enabled": True,
+        "repo_name": repo,
+        "base_branch": branch,
+        "issue_number": issue_number,
+        "issue_url": str(issue.get("url") or ""),
+        "html_url": html_url,
+        "copilot_assignee": assignee,
+        "copilot_model": _get_env("LOGMONITOR_COPILOT_MODEL") or "github-default-best-available",
+        "jira_issue_key": issue_key,
+        "jira_issue_url": str(jira_issue.get("issue_url") or ""),
+        "created_at": _now_utc_iso(),
+    }
+    try:
+        comment = _add_jira_comment(
+            issue_key,
+            "\n".join(
+                [
+                    "GitHub Copilot remediation task created.",
+                    "",
+                    f"GitHub issue: {html_url or task['issue_url']}",
+                    f"Repository: {repo}",
+                    f"Base branch: {branch}",
+                    f"Assignee: {assignee}",
+                    "",
+                    "Copilot should create a pull request from that GitHub issue when the task is complete.",
+                ]
+            ),
+        )
+        task["jira_comment_id"] = comment.get("comment_id", "")
+    except Exception as exc:
+        task["jira_comment_error"] = str(exc)
+    return task
 
 
 def _monitoring_enabled() -> bool:
@@ -2437,6 +2617,48 @@ def _execute_triage_actions(normalized: dict, prediction_result: dict, predictio
                 issue_url=jira_issue.get("issue_url", ""),
                 warnings=jira_issue.get("jira_warnings", []),
             )
+            _add_diagnostic(diagnostics, "copilot_remediation", "started")
+            try:
+                copilot_task = _create_github_copilot_remediation_task(
+                    normalized,
+                    prediction_result,
+                    github_context,
+                    jira_issue,
+                )
+                if copilot_task.get("enabled") is False:
+                    _add_diagnostic(
+                        diagnostics,
+                        "copilot_remediation",
+                        "skipped",
+                        reason=copilot_task.get("reason", ""),
+                    )
+                else:
+                    actions.append({"type": "github_copilot_remediation", **copilot_task})
+                    _add_diagnostic(
+                        diagnostics,
+                        "copilot_remediation",
+                        issue_number=copilot_task.get("issue_number", ""),
+                        issue_url=copilot_task.get("html_url", ""),
+                        assignee=copilot_task.get("copilot_assignee", ""),
+                        jira_comment_error=copilot_task.get("jira_comment_error", ""),
+                    )
+            except Exception as exc:
+                LOGGER.exception("Failed to create GitHub Copilot remediation task.")
+                action_errors.append(
+                    {
+                        "type": "github_copilot_remediation",
+                        "error": str(exc),
+                        "jira_issue": jira_issue,
+                        "github_repo": _get_env("LOGMONITOR_GITHUB_REPO"),
+                    }
+                )
+                _add_diagnostic(
+                    diagnostics,
+                    "copilot_remediation",
+                    "failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
         except Exception as exc:
             LOGGER.exception("Failed to create Jira issue.")
             action_errors.append({"type": "jira", "error": str(exc), "github_context": github_context, "jira_config": jira_config})

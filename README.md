@@ -447,8 +447,9 @@ Triage behavior:
 - `Noise`: no action
 - `CONFIGURATION`: sends email to the configured configuration recipient
 - `SYSTEM`: sends email to the configured system recipient
-- `Error`: creates a Jira issue with the log payload, prediction response, endpoint metadata, and GitHub commit context
+- `Error`: creates a Jira issue with the log payload, prediction response, endpoint metadata, and GitHub commit context; after the Jira issue is created, it creates a linked GitHub issue assigned to `copilot-swe-agent[bot]` so Copilot coding agent can open a repair PR from the selected branch
 - if Jira issue creation fails for an `Error` prediction, the triage endpoint returns `action_status: partial_failure`, `jira_created: false`, and the Jira error/config summary in `action_errors`
+- if the Copilot remediation task fails after Jira succeeds, the triage endpoint keeps `jira_created: true` and returns `action_status: partial_failure` with the GitHub error in `action_errors`
 - every triage prediction updates a daily Jira `Log Monitor Prediction Summary - YYYY-MM-DD` issue with counts for `Error`, `CONFIGURATION`, `SYSTEM`, and `Noise`, plus Jira incident success/failure counts
 - every triage response includes sanitized `diagnostics` showing the payload, prediction, selected action, Jira creation, monitoring update, and response stages without returning tokens or connection strings
 - Azure real-time scoring also receives a fire-and-forget `triage/action` Function URL. When callers hit the Azure ML scoring URI directly, `azure_score.py` returns the prediction immediately and starts a background POST to `triage/action` so Jira/email/monitoring can run without blocking the prediction response. The action route uses the already computed prediction and does not call the model again.

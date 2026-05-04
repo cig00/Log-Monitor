@@ -830,6 +830,71 @@ class ServiceTests(unittest.TestCase):
         self.assertLessEqual(len(summary), 240)
         self.assertIn("ViewException", summary)
 
+    def test_function_bridge_creates_copilot_remediation_issue_for_jira_incident(self):
+        bridge = self.load_function_bridge_module()
+
+        class FakeResponse:
+            def __init__(self, status_code, text, payload=None):
+                self.status_code = status_code
+                self.text = text
+                self._payload = payload or {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise bridge.requests.HTTPError(self.text)
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            del headers, timeout
+            calls.append({"url": url, "body": json})
+            if url == "https://api.github.com/repos/owner/repo/issues":
+                return FakeResponse(
+                    201,
+                    "{}",
+                    {
+                        "number": 42,
+                        "url": "https://api.github.test/repos/owner/repo/issues/42",
+                        "html_url": "https://github.com/owner/repo/issues/42",
+                    },
+                )
+            if url == "https://eece00.atlassian.net/rest/api/3/issue/KAN-88/comment":
+                return FakeResponse(201, "{}", {"id": "10001"})
+            return FakeResponse(404, "not found")
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_GITHUB_TOKEN": "gh-token",
+                "LOGMONITOR_GITHUB_REPO": "owner/repo",
+                "LOGMONITOR_GITHUB_BRANCH": "refs/heads/master",
+                "LOGMONITOR_JIRA_SITE_URL": "https://eece00.atlassian.net",
+                "LOGMONITOR_JIRA_ACCOUNT_EMAIL": "eece00@outlook.com",
+                "LOGMONITOR_JIRA_API_TOKEN": "jira-token",
+            },
+            clear=False,
+        ), mock.patch.object(bridge.requests, "post", side_effect=fake_post):
+            result = bridge._create_github_copilot_remediation_task(
+                {"errorMessage": "ViewException: undefined method TicketPriority::nonexistent_relation()"},
+                {"prediction": "Error", "raw_response": {"prediction": "Error"}},
+                {"status": "success", "candidates": []},
+                {"issue_key": "KAN-88", "issue_url": "https://eece00.atlassian.net/browse/KAN-88"},
+            )
+
+        github_payload = calls[0]["body"]
+        self.assertEqual(result["issue_number"], 42)
+        self.assertEqual(result["html_url"], "https://github.com/owner/repo/issues/42")
+        self.assertEqual(result["jira_comment_id"], "10001")
+        self.assertEqual(github_payload["assignees"], ["copilot-swe-agent[bot]"])
+        self.assertEqual(github_payload["agent_assignment"]["target_repo"], "owner/repo")
+        self.assertEqual(github_payload["agent_assignment"]["base_branch"], "master")
+        self.assertIn("senior software engineer", github_payload["agent_assignment"]["custom_instructions"])
+        self.assertIn("KAN-88", github_payload["body"])
+        self.assertIn("https://github.com/owner/repo/issues/42", json.dumps(calls[1]["body"]))
+
     def test_function_bridge_prediction_monitoring_counts_and_links_daily_jira_summary(self):
         bridge = self.load_function_bridge_module()
         state_writes = []
@@ -952,6 +1017,14 @@ class ServiceTests(unittest.TestCase):
             return_value={"issue_key": "KAN-99", "issue_url": "https://eece00.atlassian.net/browse/KAN-99"},
         ), mock.patch.object(
             bridge,
+            "_create_github_copilot_remediation_task",
+            return_value={
+                "issue_number": 42,
+                "html_url": "https://github.com/owner/repo/issues/42",
+                "copilot_assignee": "copilot-swe-agent[bot]",
+            },
+        ), mock.patch.object(
+            bridge,
             "_load_monitoring_state",
             return_value={},
         ), mock.patch.object(
@@ -974,6 +1047,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(body["prediction"], "Error")
         self.assertTrue(body["jira_created"])
         self.assertEqual(body["jira_issue"]["issue_key"], "KAN-99")
+        self.assertTrue(any(action.get("type") == "github_copilot_remediation" for action in body["actions"]))
         self.assertEqual(body["monitoring"]["counts"]["Error"], 1)
         self.assertEqual(state_writes[-1]["days"][body["monitoring"]["date"]]["jira_created"], 1)
         stages = [entry["stage"] for entry in body["diagnostics"]]
@@ -1022,6 +1096,14 @@ class ServiceTests(unittest.TestCase):
             bridge,
             "_create_jira_issue",
             return_value={"issue_key": "KAN-101", "issue_url": "https://eece00.atlassian.net/browse/KAN-101"},
+        ), mock.patch.object(
+            bridge,
+            "_create_github_copilot_remediation_task",
+            return_value={
+                "issue_number": 43,
+                "html_url": "https://github.com/owner/repo/issues/43",
+                "copilot_assignee": "copilot-swe-agent[bot]",
+            },
         ), mock.patch.object(
             bridge,
             "_load_monitoring_state",
@@ -1494,6 +1576,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_CONFIGURATION_EMAIL"], "email1@example.test")
         self.assertEqual(captured["settings"]["LOGMONITOR_SYSTEM_EMAIL"], "email2@example.test")
         self.assertEqual(captured["settings"]["LOGMONITOR_GITHUB_REPO"], "owner/repo")
+        self.assertEqual(captured["settings"]["LOGMONITOR_COPILOT_REMEDIATION_ENABLED"], "1")
+        self.assertEqual(captured["settings"]["LOGMONITOR_COPILOT_ASSIGNEE"], "copilot-swe-agent[bot]")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_PROJECT_KEY"], "OPS")
         self.assertNotIn("FUNCTIONS_WORKER_RUNTIME", captured["settings"])
         self.assertEqual(captured["settings"]["AzureWebJobsFeatureFlags"], "EnableWorkerIndexing")

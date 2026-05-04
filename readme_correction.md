@@ -3,7 +3,9 @@
 ## 1. Watch the Demo
 Please start by watching the demo video below:
 
-<video controls src="demo.mp4" title="Demo"></video>
+[Play the demo video](demo.mp4)
+
+> Note: GitHub Markdown preview does not reliably render the HTML `<video>` tag, so this link is provided as a working fallback.
 
 ---
 

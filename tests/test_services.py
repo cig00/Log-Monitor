@@ -822,146 +822,6 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(bridge._normalize_prediction_label(raw_prediction), expected)
         self.assertEqual(bridge._normalize_prediction_label({"errorMessage": "System.NullReferenceException"}), "")
 
-    def test_function_bridge_jira_adf_renders_feedback_links(self):
-        bridge = self.load_function_bridge_module()
-
-        adf = bridge._jira_adf_from_text("- [This is Noise](https://func.test/api/feedback?eventId=1&correctLabel=Noise)")
-
-        paragraph = adf["content"][0]["content"]
-        self.assertEqual(paragraph[1]["text"], "This is Noise")
-        self.assertEqual(paragraph[1]["marks"][0]["type"], "link")
-        self.assertIn("correctLabel=Noise", paragraph[1]["marks"][0]["attrs"]["href"])
-
-    def test_function_bridge_feedback_get_link_applies_stored_event_label(self):
-        bridge = self.load_function_bridge_module()
-        applied = {}
-
-        class FakeRequest:
-            method = "GET"
-            params = {"eventId": "event-1", "correctLabel": "Noise"}
-
-        def fake_apply_feedback(payload):
-            applied.update(payload)
-            return {"accepted": True, "correct_label": payload["correctLabel"], "azure_data_asset_version": "v1"}
-
-        with mock.patch.object(
-            bridge,
-            "_load_feedback_context",
-            return_value={"message": "database failed", "predicted_label": "Error"},
-        ), mock.patch.object(bridge, "_apply_feedback", side_effect=fake_apply_feedback):
-            response = bridge.submit_feedback(FakeRequest())
-
-        body = json.loads(response.body)
-        self.assertEqual(response.status_code, 202)
-        self.assertTrue(body["accepted"])
-        self.assertEqual(applied["errorMessage"], "database failed")
-        self.assertEqual(applied["correctLabel"], "Noise")
-        self.assertEqual(applied["predictedLabel"], "Error")
-
-    def test_function_bridge_feedback_data_asset_registration_uses_rest(self):
-        bridge = self.load_function_bridge_module()
-        captured = {}
-
-        class FakeCredential:
-            def get_token(self, scope):
-                captured["scope"] = scope
-                return SimpleNamespace(token="aad-token")
-
-        class FakeResponse:
-            status_code = 201
-            text = "{}"
-
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {
-                    "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.MachineLearningServices/workspaces/ws/data/log-monitor-feedback-labeled-data/versions/v1",
-                    "properties": {"dataUri": "azureml://datastores/ds/paths/feedback/dataset.csv"},
-                }
-
-        def fake_put(url, headers=None, json=None, timeout=None):
-            captured.update({"url": url, "headers": headers, "payload": json, "timeout": timeout})
-            return FakeResponse()
-
-        with mock.patch.dict(
-            bridge.os.environ,
-            {
-                "LOGMONITOR_AML_SUBSCRIPTION_ID": "sub",
-                "LOGMONITOR_AML_RESOURCE_GROUP": "rg",
-                "LOGMONITOR_AML_WORKSPACE_NAME": "ws",
-                "LOGMONITOR_DATASTORE_NAME": "ds",
-                "LOGMONITOR_FEEDBACK_DATA_ASSET_NAME": "log-monitor-feedback-labeled-data",
-            },
-            clear=False,
-        ), mock.patch.object(bridge, "DefaultAzureCredential", return_value=FakeCredential()), mock.patch.object(
-            bridge.requests,
-            "put",
-            side_effect=fake_put,
-        ):
-            result = bridge._register_feedback_data_asset("feedback/dataset.csv", "abc123", 3, "feedback/events/e.json")
-
-        self.assertEqual(captured["scope"], "https://management.azure.com/.default")
-        self.assertIn("/data/log-monitor-feedback-labeled-data/versions/abc123", captured["url"])
-        self.assertEqual(captured["headers"]["Authorization"], "Bearer aad-token")
-        self.assertEqual(captured["payload"]["properties"]["dataType"], "uri_file")
-        self.assertEqual(captured["payload"]["properties"]["dataUri"], "azureml://datastores/ds/paths/feedback/dataset.csv")
-        self.assertEqual(result["azure_data_asset_uri"], "azureml:log-monitor-feedback-labeled-data:abc123")
-
-    def test_function_bridge_feedback_retraining_skips_when_azure_ml_sdk_missing(self):
-        bridge = self.load_function_bridge_module()
-        bridge._AZURE_ML_IMPORT_ERROR = ImportError("no azure-ai-ml")
-
-        with mock.patch.dict(bridge.os.environ, {"LOGMONITOR_RETRAIN_ENABLED": "1"}, clear=False):
-            job_name = bridge._submit_feedback_retraining_job("azureml:data:1", "hash")
-
-        self.assertEqual(job_name, "")
-
-    def test_function_bridge_copilot_fix_task_uses_senior_engineer_prompt(self):
-        bridge = self.load_function_bridge_module()
-        captured = {}
-
-        class FakeResponse:
-            status_code = 201
-            text = "{}"
-
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {
-                    "number": 77,
-                    "url": "https://api.github.com/repos/owner/repo/issues/77",
-                    "html_url": "https://github.com/owner/repo/issues/77",
-                }
-
-        def fake_post(url, headers=None, json=None, timeout=None):
-            captured.update({"url": url, "headers": headers, "payload": json, "timeout": timeout})
-            return FakeResponse()
-
-        with mock.patch.dict(
-            bridge.os.environ,
-            {
-                "LOGMONITOR_GITHUB_TOKEN": "gh-token",
-                "LOGMONITOR_GITHUB_REPO": "owner/repo",
-                "LOGMONITOR_GITHUB_BRANCH": "main",
-            },
-            clear=False,
-        ), mock.patch.object(bridge.requests, "post", side_effect=fake_post):
-            result = bridge._create_copilot_fix_pr_task(
-                {"message": "database failed in app/Models/Ticket.php"},
-                {"prediction": "Error", "endpoint_url": "https://score", "raw_response": {"prediction": "Error"}},
-                {"developer_impact_verdict": "possible_developer_impact", "candidates": []},
-                {"issue_key": "KAN-10", "issue_url": "https://jira.example/browse/KAN-10"},
-            )
-
-        self.assertEqual(result["issue_number"], 77)
-        self.assertEqual(captured["url"], "https://api.github.com/repos/owner/repo/issues")
-        self.assertEqual(captured["payload"]["assignees"], ["copilot-swe-agent[bot]"])
-        self.assertEqual(captured["payload"]["agent_assignment"]["target_repo"], "owner/repo")
-        self.assertIn("senior software engineer", captured["payload"]["agent_assignment"]["custom_instructions"])
-        self.assertIn("KAN-10", captured["payload"]["title"])
-
     def test_function_bridge_jira_issue_retries_without_invalid_priority(self):
         bridge = self.load_function_bridge_module()
 
@@ -1023,9 +883,6 @@ class ServiceTests(unittest.TestCase):
                 "LOGMONITOR_JIRA_MONITORING_ENABLED": "1",
                 "LOGMONITOR_SOURCE_ENDPOINT_NAME": "log-monitor-endpoint",
                 "LOGMONITOR_HOSTING_SERVICE_KIND": "real-time endpoint",
-                "LOGMONITOR_GITHUB_TOKEN": "gh-token",
-                "LOGMONITOR_GITHUB_REPO": "owner/repo",
-                "LOGMONITOR_GITHUB_BRANCH": "main",
             },
             clear=False,
         ), mock.patch.object(bridge, "_load_monitoring_state", return_value={}), mock.patch.object(
@@ -1090,18 +947,6 @@ class ServiceTests(unittest.TestCase):
             return_value={"issue_key": "KAN-99", "issue_url": "https://eece00.atlassian.net/browse/KAN-99"},
         ), mock.patch.object(
             bridge,
-            "_create_copilot_fix_pr_task",
-            return_value={"issue_number": 7, "html_url": "https://github.com/owner/repo/issues/7"},
-        ), mock.patch.object(
-            bridge,
-            "_update_jira_issue_description",
-            return_value={"issue_key": "KAN-99", "updated": True},
-        ), mock.patch.object(
-            bridge,
-            "_add_jira_comment",
-            return_value={"comment_id": "comment-1", "issue_key": "KAN-99"},
-        ), mock.patch.object(
-            bridge,
             "_load_monitoring_state",
             return_value={},
         ), mock.patch.object(
@@ -1126,16 +971,10 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(body["jira_issue"]["issue_key"], "KAN-99")
         self.assertEqual(body["monitoring"]["counts"]["Error"], 1)
         self.assertEqual(state_writes[-1]["days"][body["monitoring"]["date"]]["jira_created"], 1)
-        action_types = [action["type"] for action in body["actions"]]
-        self.assertIn("github_copilot_pr", action_types)
-        self.assertIn("jira_update", action_types)
-        self.assertIn("jira_comment", action_types)
-        self.assertEqual(body["copilot_pr_task"]["html_url"], "https://github.com/owner/repo/issues/7")
         stages = [entry["stage"] for entry in body["diagnostics"]]
         self.assertIn("prediction_result", stages)
         self.assertIn("github_lookup", stages)
         self.assertIn("jira_create", stages)
-        self.assertIn("copilot_pr_task", stages)
         self.assertIn("monitoring", stages)
         self.assertEqual(body["diagnostics"][-1]["stage"], "response")
         self.assertEqual(body["diagnostics"][-1]["details"]["status_code"], 200)
@@ -1370,19 +1209,10 @@ class ServiceTests(unittest.TestCase):
                 "conclusion": "No developer commit candidate was found by the automatic search. This can mean no developer is responsible.",
                 "candidates": [],
             },
-            {
-                "This is Noise": "https://func.test/api/feedback?eventId=1&correctLabel=Noise",
-                "This is Configuration": "https://func.test/api/feedback?eventId=1&correctLabel=CONFIGURATION",
-                "This is System": "https://func.test/api/feedback?eventId=1&correctLabel=SYSTEM",
-            },
         )
 
         self.assertIn("Developer Impact Verdict: no_developer_candidate_found", description)
         self.assertIn("Non-Developer Cause Possible: yes", description)
-        self.assertIn("Quick Feedback:", description)
-        self.assertIn("[This is Noise]", description)
-        self.assertIn("correctLabel=CONFIGURATION", description)
-        self.assertIn("Copilot Fix PR:", description)
         self.assertIn("Candidate Commits For Manual Review:", description)
         self.assertIn("no developer is responsible", description)
         self.assertNotIn("no developer caused", description.casefold())
@@ -1478,7 +1308,7 @@ class ServiceTests(unittest.TestCase):
     def test_hosting_feedback_bridge_configures_mode_agnostic_feedback_endpoint(self):
         dataset_path = self.project_dir / "base.csv"
         dataset_path.write_text("LogMessage,class\nhello,Noise\n", encoding="utf-8")
-        captured = {"settings": {}, "settings_calls": [], "uploaded_blob": "", "packages": []}
+        captured = {"settings": {}, "uploaded_blob": "", "packages": []}
 
         self.azure_platform.deploy_azure_function_bridge_infrastructure = lambda **kwargs: {
             "storageConnectionString": "UseDevelopmentStorage=true",
@@ -1488,11 +1318,7 @@ class ServiceTests(unittest.TestCase):
         }
         self.azure_platform.ensure_azure_blob_datastore = lambda **kwargs: None
         self.azure_platform.upload_blob_file = lambda **kwargs: captured.update({"uploaded_blob": kwargs["blob_name"]}) or kwargs["blob_name"]
-        def capture_settings(**kwargs):
-            captured["settings_calls"].append(kwargs["settings"])
-            captured["settings"].update(kwargs["settings"])
-
-        self.azure_platform.set_function_app_settings = capture_settings
+        self.azure_platform.set_function_app_settings = lambda **kwargs: captured.update({"settings": kwargs["settings"]})
         self.azure_platform.build_function_bridge_package = (
             lambda package_name, **kwargs: captured["packages"].append({"name": package_name, **kwargs}) or str(dataset_path)
         )
@@ -1606,15 +1432,6 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_MONITORING_ENABLED"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_MONITORING_ISSUE_TYPE"], "Task")
         self.assertEqual(captured["settings"]["LOGMONITOR_MONITORING_STATE_BLOB"], "monitoring/prediction-summary-state.json")
-        self.assertEqual(captured["settings"]["LOGMONITOR_FEEDBACK_PENDING_PREFIX"], "feedback/pending")
-        self.assertEqual(captured["settings"]["LOGMONITOR_FEEDBACK_API_URL"], "https://func.azurewebsites.net/api/feedback?code=key")
-        self.assertEqual(captured["settings"]["LOGMONITOR_FUNCTION_KEY"], "key")
-        self.assertEqual(captured["settings"]["LOGMONITOR_TRIAGE_API_URL"], "https://func.azurewebsites.net/api/triage?code=key")
-        self.assertEqual(
-            captured["settings"]["LOGMONITOR_TRIAGE_ACTION_URL"],
-            "https://func.azurewebsites.net/api/triage/action?code=key",
-        )
-        self.assertGreaterEqual(len(captured["settings_calls"]), 6)
         self.assertEqual(captured["packages"][-1]["include_azure_ml"], False)
 
     def test_hosting_run_blocks_when_gate_fails(self):

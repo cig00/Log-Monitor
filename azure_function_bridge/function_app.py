@@ -9,7 +9,7 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import azure.functions as func
@@ -1061,37 +1061,13 @@ def _find_github_impact_context(payload: dict, message: str) -> dict:
     }
 
 
-MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]{1,160})\]\((https?://[^)\s]+)\)")
-
-
-def _jira_paragraph_content_from_text(line: str) -> list[dict]:
-    content: list[dict] = []
-    cursor = 0
-    for match in MARKDOWN_LINK_PATTERN.finditer(line):
-        if match.start() > cursor:
-            content.append({"type": "text", "text": line[cursor : match.start()]})
-        content.append(
-            {
-                "type": "text",
-                "text": match.group(1),
-                "marks": [{"type": "link", "attrs": {"href": match.group(2)}}],
-            }
-        )
-        cursor = match.end()
-    if cursor < len(line):
-        content.append({"type": "text", "text": line[cursor:]})
-    if not content:
-        content.append({"type": "text", "text": line if line else " "})
-    return content
-
-
 def _jira_adf_from_text(text: str) -> dict:
     content = []
     for line in _truncate(text, 25000).splitlines()[:220]:
         content.append(
             {
                 "type": "paragraph",
-                "content": _jira_paragraph_content_from_text(line),
+                "content": [{"type": "text", "text": line if line else " "}],
             }
         )
     if not content:
@@ -1155,85 +1131,6 @@ def _jira_auth_headers(account_email: str, api_token: str) -> dict:
     }
 
 
-def _append_url_query_params(url: str, params: dict[str, str]) -> str:
-    clean_url = str(url or "").strip()
-    if not clean_url:
-        return ""
-    parsed = urlparse(clean_url)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    for key, value in params.items():
-        clean_value = str(value or "").strip()
-        if clean_value:
-            query[key] = clean_value
-    return urlunparse(parsed._replace(query=urlencode(query)))
-
-
-def _feedback_api_url() -> str:
-    configured_url = _get_env("LOGMONITOR_FEEDBACK_API_URL")
-    if configured_url:
-        return configured_url
-    host_name = _get_env("WEBSITE_HOSTNAME")
-    function_key = _get_env("LOGMONITOR_FUNCTION_KEY")
-    if host_name and function_key:
-        return f"https://{host_name}/api/feedback?{urlencode({'code': function_key})}"
-    return ""
-
-
-def _feedback_pending_blob_name(event_id: str) -> str:
-    clean_event_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(event_id or "").strip()).strip("-._")
-    if not clean_event_id:
-        raise ValueError("Feedback event id is empty.")
-    prefix = _get_env("LOGMONITOR_FEEDBACK_PENDING_PREFIX", "feedback/pending").strip("/") or "feedback/pending"
-    return f"{prefix}/{clean_event_id}.json"
-
-
-def _save_feedback_context(payload: dict, prediction_result: dict, github_context: dict) -> dict:
-    message = _extract_message(payload)
-    if not message:
-        raise ValueError("Cannot create feedback links without a log message.")
-    event_id = str(uuid.uuid4())
-    blob_name = _feedback_pending_blob_name(event_id)
-    event_payload = {
-        "event_id": event_id,
-        "created_at": _now_utc_iso(),
-        "message": message,
-        "predicted_label": str(prediction_result.get("prediction") or ""),
-        "source": "jira_report",
-        "payload": _redact_for_diagnostics(payload),
-        "prediction_result": _redact_for_diagnostics(prediction_result),
-        "github_context": _redact_for_diagnostics(github_context),
-    }
-    _upload_blob_text(blob_name, json.dumps(event_payload, ensure_ascii=True, indent=2), content_type="application/json")
-    return {"event_id": event_id, "blob_name": blob_name}
-
-
-def _load_feedback_context(event_id: str) -> dict:
-    blob_name = _feedback_pending_blob_name(event_id)
-    body = _download_blob_text(blob_name)
-    if not body:
-        raise ValueError(f"Feedback event '{event_id}' was not found.")
-    payload = json.loads(body)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Feedback event '{event_id}' is not a JSON object.")
-    return payload
-
-
-def _build_feedback_correction_links(feedback_context: dict) -> dict:
-    feedback_url = _feedback_api_url()
-    event_id = str(feedback_context.get("event_id") or "").strip() if isinstance(feedback_context, dict) else ""
-    if not feedback_url or not event_id:
-        return {}
-    labels = {
-        "This is Noise": "Noise",
-        "This is Configuration": "CONFIGURATION",
-        "This is System": "SYSTEM",
-    }
-    return {
-        title: _append_url_query_params(feedback_url, {"eventId": event_id, "correctLabel": label})
-        for title, label in labels.items()
-    }
-
-
 def _post_jira_issue_with_fallbacks(
     site_url: str,
     headers: dict,
@@ -1277,107 +1174,7 @@ def _post_jira_issue_with_fallbacks(
     return response.json(), jira_warnings
 
 
-def _build_copilot_fix_prompt(payload: dict, prediction_result: dict, github_context: dict, jira_issue: dict) -> str:
-    message = _extract_message(payload)
-    repo = _get_env("LOGMONITOR_GITHUB_REPO")
-    branch = _get_env("LOGMONITOR_GITHUB_BRANCH", "main") or "main"
-    issue_url = str(jira_issue.get("issue_url") or "")
-    return "\n".join(
-        [
-            f"You are a senior software engineer working in `{repo}` from base branch `{branch}`.",
-            "",
-            "Goal:",
-            "Open a focused PR that fixes the runtime issue reported by Log Monitor.",
-            "",
-            "How to work:",
-            "- Treat the model prediction as a triage signal, not proof of root cause.",
-            "- Inspect the code, tests, recent commits, and the stack/message context before editing.",
-            "- Use the GitHub impact context below as evidence only; a developer commit may or may not be responsible.",
-            "- Make the smallest production-quality fix that addresses the actual root cause.",
-            "- Do not hide the symptom by suppressing logs, swallowing exceptions, or disabling Log Monitor forwarding.",
-            "- Run the existing relevant tests or explain clearly why they could not be run.",
-            "",
-            f"Jira report: {issue_url or 'not available'}",
-            f"Prediction: {prediction_result.get('prediction', '')}",
-            f"Prediction endpoint: {prediction_result.get('endpoint_url', '')}",
-            "",
-            "Log message:",
-            _truncate(message, 6000),
-            "",
-            "Raw payload:",
-            json.dumps(_redact_for_diagnostics(payload), ensure_ascii=True, indent=2)[:12000],
-            "",
-            "GitHub impact context:",
-            json.dumps(_redact_for_diagnostics(github_context), ensure_ascii=True, indent=2)[:12000],
-            "",
-            "Raw prediction response:",
-            json.dumps(_redact_for_diagnostics(prediction_result.get("raw_response", "")), ensure_ascii=True, indent=2)[:8000],
-        ]
-    )
-
-
-def _create_copilot_fix_pr_task(payload: dict, prediction_result: dict, github_context: dict, jira_issue: dict) -> dict:
-    token = _get_env("LOGMONITOR_GITHUB_TOKEN")
-    repo = _get_env("LOGMONITOR_GITHUB_REPO")
-    branch = _get_env("LOGMONITOR_GITHUB_BRANCH", "main") or "main"
-    if not token or not repo or not branch:
-        return {"skipped": True, "reason": "GitHub token, repository, or branch is not configured."}
-
-    message = _extract_message(payload)
-    issue_key = str(jira_issue.get("issue_key") or "").strip()
-    title_prefix = f"Fix Log Monitor error {issue_key}: " if issue_key else "Fix Log Monitor error: "
-    title = _truncate(title_prefix + (message.splitlines()[0] if message else "runtime issue"), 240)
-    prompt = _build_copilot_fix_prompt(payload, prediction_result, github_context, jira_issue)
-    issue_body = (
-        "Log Monitor classified an event as `Error` and created this Copilot coding-agent task to produce a fix PR.\n\n"
-        f"Jira report: {jira_issue.get('issue_url', '') or 'not available'}\n\n"
-        "```text\n"
-        f"{prompt.strip()}\n"
-        "```\n"
-    )
-    request_payload = {
-        "title": title,
-        "body": issue_body,
-        "assignees": ["copilot-swe-agent[bot]"],
-        "agent_assignment": {
-            "target_repo": repo,
-            "base_branch": branch,
-            "custom_instructions": prompt,
-            "custom_agent": "",
-            "model": _get_env("LOGMONITOR_COPILOT_MODEL", "github-default-best-available"),
-        },
-    }
-    response = requests.post(
-        f"https://api.github.com/repos/{repo}/issues",
-        headers=_github_headers(),
-        json=request_payload,
-        timeout=60,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        raise RuntimeError(f"GitHub Copilot fix task creation failed ({response.status_code}). {_truncate(response.text, 2000)}") from exc
-    issue = response.json()
-    return {
-        "title": title,
-        "repo_name": repo,
-        "base_branch": branch,
-        "issue_number": issue.get("number"),
-        "issue_url": issue.get("url", ""),
-        "html_url": issue.get("html_url", ""),
-        "copilot_assignee": "copilot-swe-agent[bot]",
-        "copilot_model": request_payload["agent_assignment"]["model"],
-        "created_at": _now_utc_iso(),
-    }
-
-
-def _build_jira_description(
-    payload: dict,
-    prediction_result: dict,
-    github_context: dict,
-    feedback_links: dict | None = None,
-    copilot_pr_task: dict | None = None,
-) -> str:
+def _build_jira_description(payload: dict, prediction_result: dict, github_context: dict) -> str:
     message = _extract_message(payload)
     github_candidates = github_context.get("candidates", []) if isinstance(github_context, dict) else []
     if not isinstance(github_candidates, list):
@@ -1427,29 +1224,8 @@ def _build_jira_description(
             "- No candidate commit was identified by the automatic lookup. No developer may be responsible, "
             "or the relevant commit evidence may be missing from the payload/history."
         )
-    feedback_link_lines = []
-    if isinstance(feedback_links, dict) and feedback_links:
-        for title in ("This is Noise", "This is Configuration", "This is System"):
-            url = str(feedback_links.get(title) or "").strip()
-            if url:
-                feedback_link_lines.append(f"- [{title}]({url})")
-    if not feedback_link_lines:
-        feedback_link_lines.append("- Feedback correction links were not generated for this report.")
-    copilot_lines = []
-    if isinstance(copilot_pr_task, dict) and copilot_pr_task.get("html_url"):
-        copilot_lines.append(f"- [GitHub Copilot fix task]({copilot_pr_task.get('html_url')})")
-    elif isinstance(copilot_pr_task, dict) and copilot_pr_task.get("skipped"):
-        copilot_lines.append(f"- Copilot fix task skipped: {copilot_pr_task.get('reason', '')}")
-    else:
-        copilot_lines.append("- Copilot fix task will be created after this Jira issue is opened when GitHub is configured.")
     lines = [
         "Log Monitor classified this event as Error.",
-        "",
-        "Quick Feedback:",
-        "\n".join(feedback_link_lines),
-        "",
-        "Copilot Fix PR:",
-        "\n".join(copilot_lines),
         "",
         "Important: GitHub history is included only as investigation context. It can suggest possible developer impact, but it is not proof.",
         f"Developer Impact Verdict: {developer_verdict}",
@@ -1490,18 +1266,7 @@ def _create_jira_issue(payload: dict, prediction_result: dict, github_context: d
     labels = _parse_jira_labels(_get_env("LOGMONITOR_JIRA_LABELS", "log-monitor,ml-triage"))
     message = _extract_message(payload)
     summary = _truncate("Log Monitor Error: " + (message.splitlines()[0] if message else "unclassified runtime error"), 240)
-    feedback_context: dict = {}
-    feedback_links: dict = {}
-    feedback_error = ""
-    try:
-        feedback_context = _save_feedback_context(payload, prediction_result, github_context)
-        feedback_links = _build_feedback_correction_links(feedback_context)
-    except Exception as exc:
-        LOGGER.exception("Failed to create Jira feedback correction links.")
-        feedback_error = str(exc)
-    description_text = _build_jira_description(payload, prediction_result, github_context, feedback_links)
-    if feedback_error:
-        description_text += f"\n\nFeedback link generation error:\n{_truncate(feedback_error, 1000)}"
+    description_text = _build_jira_description(payload, prediction_result, github_context)
     fields = {
         "project": {"key": project_key},
         "summary": summary,
@@ -1521,52 +1286,7 @@ def _create_jira_issue(payload: dict, prediction_result: dict, github_context: d
         "issue_url": f"{site_url}/browse/{issue_key}" if issue_key else "",
         "jira_response": result,
         "jira_warnings": jira_warnings,
-        "feedback_context": feedback_context,
-        "feedback_links": feedback_links,
-        "feedback_link_error": feedback_error,
     }
-
-
-def _add_jira_comment(issue_key: str, text: str) -> dict:
-    clean_issue_key = str(issue_key or "").strip()
-    if not clean_issue_key:
-        return {"skipped": True, "reason": "Jira issue key is empty."}
-    site_url = _normalize_jira_site_url(_require_env("LOGMONITOR_JIRA_SITE_URL"))
-    headers = _jira_auth_headers(_require_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL"), _require_env("LOGMONITOR_JIRA_API_TOKEN"))
-    response = requests.post(
-        f"{site_url}/rest/api/3/issue/{clean_issue_key}/comment",
-        headers=headers,
-        json={"body": _jira_adf_from_text(text)},
-        timeout=30,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        raise RuntimeError(f"Jira comment creation failed ({response.status_code}). {_truncate(response.text, 2000)}") from exc
-    try:
-        payload = response.json()
-    except Exception:
-        payload = {}
-    return {"comment_id": str(payload.get("id") or ""), "issue_key": clean_issue_key}
-
-
-def _update_jira_issue_description(issue_key: str, description_text: str) -> dict:
-    clean_issue_key = str(issue_key or "").strip()
-    if not clean_issue_key:
-        return {"skipped": True, "reason": "Jira issue key is empty."}
-    site_url = _normalize_jira_site_url(_require_env("LOGMONITOR_JIRA_SITE_URL"))
-    headers = _jira_auth_headers(_require_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL"), _require_env("LOGMONITOR_JIRA_API_TOKEN"))
-    response = requests.put(
-        f"{site_url}/rest/api/3/issue/{clean_issue_key}",
-        headers=headers,
-        json={"fields": {"description": _jira_adf_from_text(description_text)}},
-        timeout=30,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        raise RuntimeError(f"Jira issue description update failed ({response.status_code}). {_truncate(response.text, 2000)}") from exc
-    return {"issue_key": clean_issue_key, "updated": True}
 
 
 def _monitoring_enabled() -> bool:
@@ -2045,59 +1765,32 @@ def _feedback_dataset_blob_name(dataset_hash: str) -> str:
 
 
 def _register_feedback_data_asset(blob_name: str, dataset_hash: str, row_count: int, event_blob_name: str) -> dict:
-    _raise_import_error("azure-identity", _AZURE_IDENTITY_IMPORT_ERROR)
+    _raise_import_error("azure-ai-ml", _AZURE_ML_IMPORT_ERROR)
     datastore_name = _require_env("LOGMONITOR_DATASTORE_NAME")
     asset_name = _get_env("LOGMONITOR_FEEDBACK_DATA_ASSET_NAME", "log-monitor-feedback-labeled-data")
     asset_version = "".join(ch if ch.isalnum() or ch in "_.-" else "-" for ch in dataset_hash)[:30].strip("-._") or "1"
     datastore_uri = f"azureml://datastores/{datastore_name}/paths/{blob_name}"
-    token = DefaultAzureCredential().get_token("https://management.azure.com/.default").token
-    url = (
-        "https://management.azure.com/subscriptions/"
-        f"{_require_env('LOGMONITOR_AML_SUBSCRIPTION_ID')}/resourceGroups/"
-        f"{_require_env('LOGMONITOR_AML_RESOURCE_GROUP')}/providers/Microsoft.MachineLearningServices/workspaces/"
-        f"{_require_env('LOGMONITOR_AML_WORKSPACE_NAME')}/data/{asset_name}/versions/{asset_version}"
-        "?api-version=2025-06-01"
-    )
-    request_body = {
-        "properties": {
-            "dataType": "uri_file",
-            "dataUri": datastore_uri,
-            "description": "Log Monitor corrected labeled dataset created from feedback.",
-            "isAnonymous": False,
-            "tags": {
-                "created_by": "log-monitor-feedback",
-                "dataset_hash": dataset_hash,
-                "row_count": str(int(row_count)),
-                "feedback_event_blob": event_blob_name,
-                "hosting_service_kind": _get_env("LOGMONITOR_HOSTING_SERVICE_KIND", ""),
-            },
+    data_asset = Data(
+        path=datastore_uri,
+        type=AssetTypes.URI_FILE,
+        name=asset_name,
+        version=asset_version,
+        description="Log Monitor corrected labeled dataset created from feedback.",
+        tags={
+            "created_by": "log-monitor-feedback",
+            "dataset_hash": dataset_hash,
+            "row_count": str(int(row_count)),
+            "feedback_event_blob": event_blob_name,
+            "hosting_service_kind": _get_env("LOGMONITOR_HOSTING_SERVICE_KIND", ""),
         },
-    }
-    response = requests.put(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json=request_body,
-        timeout=60,
     )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        raise RuntimeError(
-            f"Feedback data asset version registration failed ({response.status_code}). {_truncate(response.text, 2000)}"
-        ) from exc
-    try:
-        registered = response.json()
-    except Exception:
-        registered = {}
+    registered = _get_ml_client().data.create_or_update(data_asset)
     return {
         "azure_data_asset_name": asset_name,
         "azure_data_asset_version": asset_version,
         "azure_data_asset_uri": f"azureml:{asset_name}:{asset_version}",
-        "azure_data_asset_id": str(registered.get("id") or ""),
-        "azure_data_asset_path": str(
-            (registered.get("properties") if isinstance(registered.get("properties"), dict) else {}).get("dataUri")
-            or datastore_uri
-        ),
+        "azure_data_asset_id": str(getattr(registered, "id", "") or ""),
+        "azure_data_asset_path": str(getattr(registered, "path", "") or datastore_uri),
     }
 
 
@@ -2118,12 +1811,9 @@ def _ensure_retrain_compute() -> str:
 
 
 def _submit_feedback_retraining_job(data_asset_uri: str, dataset_hash: str) -> str:
+    _raise_import_error("azure-ai-ml", _AZURE_ML_IMPORT_ERROR)
     if _get_env("LOGMONITOR_RETRAIN_ENABLED", "1").lower() not in {"1", "true", "yes", "on"}:
         return ""
-    if _AZURE_ML_IMPORT_ERROR is not None:
-        LOGGER.warning("Skipping feedback retraining because azure-ai-ml is unavailable: %s", _AZURE_ML_IMPORT_ERROR)
-        return ""
-    _raise_import_error("azure-ai-ml", _AZURE_ML_IMPORT_ERROR)
     code_dir = Path(__file__).resolve().parent
     if not (code_dir / "train.py").exists() or not (code_dir / "mlops_utils.py").exists():
         raise RuntimeError("The Function package is missing train.py or mlops_utils.py, so retraining cannot start.")
@@ -2349,32 +2039,8 @@ def daily_batch_driver(timer: func.TimerRequest) -> None:
 
 
 @app.function_name(name="submit_feedback")
-@app.route(route="feedback", methods=["GET", "POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="feedback", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def submit_feedback(req: func.HttpRequest) -> func.HttpResponse:
-    if str(getattr(req, "method", "") or "").upper() == "GET":
-        params = getattr(req, "params", {}) or {}
-        event_id = str(params.get("eventId") or params.get("event_id") or "").strip()
-        correct_label = str(params.get("correctLabel") or params.get("correct_label") or params.get("label") or "").strip()
-        try:
-            context = _load_feedback_context(event_id) if event_id else {}
-            payload = {
-                "errorMessage": str(context.get("message") or params.get("errorMessage") or params.get("message") or ""),
-                "correctLabel": correct_label,
-                "predictedLabel": str(context.get("predicted_label") or ""),
-                "source": "jira_feedback_link",
-                "metadata": {
-                    "feedback_event_id": event_id,
-                    "feedback_context_blob": _feedback_pending_blob_name(event_id) if event_id else "",
-                },
-            }
-            result = _apply_feedback(payload)
-        except ValueError as exc:
-            return _to_json_response({"accepted": False, "error": str(exc)}, 400)
-        except Exception as exc:
-            LOGGER.exception("Failed to process feedback link.")
-            return _to_json_response({"accepted": False, "error": str(exc)}, 500)
-        return _to_json_response(result, 202)
-
     try:
         payload = req.get_json()
     except ValueError:
@@ -2426,7 +2092,6 @@ def _execute_triage_actions(normalized: dict, prediction_result: dict, predictio
     monitoring_errors: list[dict] = []
     github_context: dict = {}
     jira_issue: dict = {}
-    copilot_pr_task: dict = {}
     monitoring_summary: dict = {}
     jira_config = _jira_config_status()
     message = _extract_message(normalized)
@@ -2507,69 +2172,6 @@ def _execute_triage_actions(normalized: dict, prediction_result: dict, predictio
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
-        if jira_issue.get("issue_key"):
-            _add_diagnostic(diagnostics, "copilot_pr_task", "started")
-            try:
-                copilot_pr_task = _create_copilot_fix_pr_task(normalized, prediction_result, github_context, jira_issue)
-                if copilot_pr_task.get("skipped"):
-                    _add_diagnostic(diagnostics, "copilot_pr_task", "skipped", reason=copilot_pr_task.get("reason", ""))
-                else:
-                    actions.append({"type": "github_copilot_pr", **copilot_pr_task})
-                    _add_diagnostic(
-                        diagnostics,
-                        "copilot_pr_task",
-                        issue_number=copilot_pr_task.get("issue_number", ""),
-                        html_url=copilot_pr_task.get("html_url", ""),
-                    )
-                    try:
-                        updated_description = _build_jira_description(
-                            normalized,
-                            prediction_result,
-                            github_context,
-                            jira_issue.get("feedback_links", {}) if isinstance(jira_issue.get("feedback_links"), dict) else {},
-                            copilot_pr_task,
-                        )
-                        update_result = _update_jira_issue_description(str(jira_issue.get("issue_key") or ""), updated_description)
-                        actions.append({"type": "jira_update", **update_result})
-                        _add_diagnostic(diagnostics, "jira_update", issue_key=update_result.get("issue_key", ""))
-                    except Exception as update_exc:
-                        LOGGER.exception("Failed to update Jira issue with Copilot task link.")
-                        action_errors.append({"type": "jira_update", "error": str(update_exc), "jira_issue": jira_issue})
-                        _add_diagnostic(
-                            diagnostics,
-                            "jira_update",
-                            "failed",
-                            error_type=type(update_exc).__name__,
-                            error=str(update_exc),
-                        )
-                    try:
-                        comment_result = _add_jira_comment(
-                            str(jira_issue.get("issue_key") or ""),
-                            "GitHub Copilot fix task created:\n"
-                            f"[Open Copilot fix task]({copilot_pr_task.get('html_url', '')})",
-                        )
-                        actions.append({"type": "jira_comment", **comment_result})
-                        _add_diagnostic(diagnostics, "jira_comment", comment_id=comment_result.get("comment_id", ""))
-                    except Exception as comment_exc:
-                        LOGGER.exception("Failed to add Copilot task link to Jira issue.")
-                        action_errors.append({"type": "jira_comment", "error": str(comment_exc), "jira_issue": jira_issue})
-                        _add_diagnostic(
-                            diagnostics,
-                            "jira_comment",
-                            "failed",
-                            error_type=type(comment_exc).__name__,
-                            error=str(comment_exc),
-                        )
-            except Exception as exc:
-                LOGGER.exception("Failed to create GitHub Copilot fix task.")
-                action_errors.append({"type": "github_copilot_pr", "error": str(exc), "github_context": github_context})
-                _add_diagnostic(
-                    diagnostics,
-                    "copilot_pr_task",
-                    "failed",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                )
     else:
         actions.append({"type": "none", "reason": f"No triage rule is configured for prediction '{prediction}'."})
         _add_diagnostic(diagnostics, "action_route", "skipped", reason=f"No triage rule is configured for prediction '{prediction}'.")
@@ -2621,7 +2223,6 @@ def _execute_triage_actions(normalized: dict, prediction_result: dict, predictio
         "monitoring": monitoring_summary,
         "monitoring_errors": monitoring_errors,
         "github_context": github_context,
-        "copilot_pr_task": copilot_pr_task,
         "jira_config": jira_config,
         "jira_issue": jira_issue,
         "jira_created": jira_created,
@@ -2651,7 +2252,6 @@ def _to_triage_action_response(normalized: dict, result: dict, diagnostics: list
             "monitoring": result.get("monitoring", {}),
             "monitoring_errors": result.get("monitoring_errors", []),
             "github_context": result.get("github_context", {}),
-            "copilot_pr_task": result.get("copilot_pr_task", {}),
             "jira_config": result.get("jira_config", {}),
             "jira_issue": result.get("jira_issue", {}),
             "jira_created": bool(result.get("jira_created")),

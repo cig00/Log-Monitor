@@ -1057,7 +1057,6 @@ class HostingService:
             "LOGMONITOR_MONITORING_STATE_BLOB": "monitoring/prediction-summary-state.json",
             "LOGMONITOR_FEEDBACK_DATASET_PREFIX": "feedback/datasets",
             "LOGMONITOR_FEEDBACK_EVENTS_PREFIX": "feedback/events",
-            "LOGMONITOR_FEEDBACK_PENDING_PREFIX": "feedback/pending",
             "LOGMONITOR_FEEDBACK_DATA_ASSET_NAME": "log-monitor-feedback-labeled-data",
             "LOGMONITOR_BASE_DATASET_BLOB": base_dataset_blob,
             "LOGMONITOR_RETRAIN_ENABLED": "1",
@@ -1153,20 +1152,6 @@ class HostingService:
                 route_path="triage/action",
             )
         feedback_status_url = f"https://{function_host_name}/api/feedback/status?code={function_key}" if function_key else ""
-        runtime_link_settings = {
-            "LOGMONITOR_FEEDBACK_API_URL": feedback_api_url,
-            "LOGMONITOR_FUNCTION_KEY": function_key,
-        }
-        if triage_enabled:
-            runtime_link_settings["LOGMONITOR_TRIAGE_API_URL"] = triage_api_url
-            runtime_link_settings["LOGMONITOR_TRIAGE_ACTION_URL"] = triage_action_api_url
-        ctx.emit("progress", "Publishing Azure Function feedback and triage action links...")
-        self.azure_platform_service.set_function_app_settings(
-            credential=credential,
-            sub_id=request.azure_sub_id,
-            function_app_name=function_app_name,
-            settings=runtime_link_settings,
-        )
         return {
             "function_app_name": function_app_name,
             "function_host_name": function_host_name,

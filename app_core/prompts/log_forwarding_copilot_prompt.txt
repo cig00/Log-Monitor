@@ -55,14 +55,6 @@ Endpoint request contract:
 - Follow the authentication guidance above, and do not block the user path while obtaining or sending endpoint credentials.
 - Include the Azure ML Studio endpoint page in the PR description for traceability, but application code must call the deployed endpoint URL, not the Studio page.
 
-Integration validation (critical):
-- Before finalizing the PR, scan the entire integration path end-to-end for format mismatches or failures:
-  - Verify that every HTTP request body sent to the endpoint is a single JSON object (never an array, never wrapped in a list).
-  - Verify that the JSON key is exactly `errorMessage` (not `message`, `log`, `msg`, or any other variant).
-  - If the repository already has existing Log Monitor forwarding code, inspect it for format issues (e.g., batching logs into arrays, using wrong keys) and fix them in this PR.
-  - Confirm that the endpoint response is handled gracefully (non-blocking, failures swallowed).
-  - If any existing middleware, helper, or service forwards logs to this endpoint in a different format, refactor it to comply with the contract above.
-
 Verification:
 - Run the existing formatter/linter/tests when they are already available and cheap.
 - No new unit tests are required for this task unless the repository has a very clear existing telemetry test pattern.

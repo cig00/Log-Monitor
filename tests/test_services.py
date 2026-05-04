@@ -196,6 +196,10 @@ class ServiceTests(unittest.TestCase):
         self.assertIn('The only accepted body is `{"errorMessage": "<log>"}`', prompt)
         self.assertIn("Never send arrays", prompt)
         self.assertIn("Treat the `errorMessage` contract as mandatory", prompt)
+        self.assertIn("Do not forward every local log line", prompt)
+        self.assertIn("filter before enqueueing", prompt)
+        self.assertIn("Do not send a message after truncating it to a database column", prompt)
+        self.assertIn("not be replaced by a GET/POST request summary", prompt)
         self.assertNotIn("LOG_MONITOR_ENDPOINT_URL", prompt)
         self.assertNotIn("LOG_MONITOR_FORWARDING_ENABLED", prompt)
         self.assertNotIn("LOG_MONITOR_ENDPOINT_KEY", prompt)
@@ -531,12 +535,48 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("Request a quota increase", message)
         self.assertNotIn("BadRequest", message)
 
+    def test_wait_for_online_deployment_ready_surfaces_azure_failure_details(self):
+        deployment = SimpleNamespace(
+            provisioning_state="Failed",
+            properties=SimpleNamespace(
+                error={
+                    "code": "UserScriptImportError",
+                    "message": "Scoring script failed during import.",
+                    "details": [{"message": "ModuleNotFoundError: No module named 'sklearn'"}],
+                }
+            ),
+        )
+        calls = []
+
+        class FakeOnlineDeployments:
+            def get(self, name, endpoint_name):
+                calls.append({"name": name, "endpoint_name": endpoint_name})
+                return deployment
+
+        ml_client = SimpleNamespace(online_deployments=FakeOnlineDeployments())
+
+        with self.assertRaises(RuntimeError) as context:
+            self.azure_platform.wait_for_online_deployment_ready(
+                ml_client,
+                endpoint_name="endpoint",
+                deployment_name="blue",
+                timeout_seconds=1,
+                poll_interval_seconds=1,
+            )
+
+        message = str(context.exception)
+        self.assertEqual(calls, [{"name": "blue", "endpoint_name": "endpoint"}])
+        self.assertIn("Azure deployment 'blue' provisioning failed", message)
+        self.assertIn("Azure failure details", message)
+        self.assertIn("Scoring script failed during import", message)
+        self.assertIn("ModuleNotFoundError", message)
+
     def test_function_bridge_package_includes_feedback_retraining_code(self):
         bridge_root = self.project_dir / "azure_function_bridge"
         bridge_root.mkdir(parents=True, exist_ok=True)
         (bridge_root / "function_app.py").write_text("# function app\n", encoding="utf-8")
         (bridge_root / "host.json").write_text('{"version":"2.0"}\n', encoding="utf-8")
-        (bridge_root / "requirements.txt").write_text("azure-functions\n", encoding="utf-8")
+        (bridge_root / "requirements.txt").write_text("azure-functions\nazure-ai-ml\nrequests\n", encoding="utf-8")
         (self.project_dir / "train.py").write_text("# train\n", encoding="utf-8")
         (self.project_dir / "mlops_utils.py").write_text("# utils\n", encoding="utf-8")
         (self.project_dir / "requirements.train.txt").write_text("pandas\n", encoding="utf-8")
@@ -546,11 +586,34 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(Path(package_path).name, "released-package.zip")
         with zipfile.ZipFile(package_path) as archive:
             names = set(archive.namelist())
+            requirements = archive.read("requirements.txt").decode("utf-8")
         self.assertIn("function_app.py", names)
         self.assertIn("requirements.txt", names)
         self.assertIn("train.py", names)
         self.assertIn("mlops_utils.py", names)
         self.assertIn("requirements.train.txt", names)
+        self.assertIn("azure-ai-ml", requirements)
+
+    def test_function_bridge_package_can_omit_azure_ml_dependency_for_triage(self):
+        bridge_root = self.project_dir / "azure_function_bridge"
+        bridge_root.mkdir(parents=True, exist_ok=True)
+        (bridge_root / "function_app.py").write_text("# function app\n", encoding="utf-8")
+        (bridge_root / "host.json").write_text('{"version":"2.0"}\n', encoding="utf-8")
+        (bridge_root / "requirements.txt").write_text(
+            "azure-functions\nazure-ai-ml\nazure-ai-ml==1.26.0 # pinned\nrequests\n",
+            encoding="utf-8",
+        )
+
+        package_path = self.azure_platform.build_function_bridge_package(
+            "unit-lean-triage-bridge",
+            include_azure_ml=False,
+        )
+
+        with zipfile.ZipFile(package_path) as archive:
+            requirements = archive.read("requirements.txt").decode("utf-8")
+        self.assertIn("azure-functions", requirements)
+        self.assertIn("requests", requirements)
+        self.assertNotIn("azure-ai-ml", requirements)
 
     def test_function_bridge_flex_template_does_not_use_forbidden_runtime_app_setting(self):
         template_path = Path(__file__).resolve().parents[1] / "azure_function_bridge_infra.json"
@@ -563,12 +626,74 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(function_apps)
         app_settings = function_apps[0].get("properties", {}).get("siteConfig", {}).get("appSettings", [])
         setting_names = {setting.get("name") for setting in app_settings if isinstance(setting, dict)}
+        deployment_storage_auth = (
+            function_apps[0]
+            .get("properties", {})
+            .get("functionAppConfig", {})
+            .get("deployment", {})
+            .get("storage", {})
+            .get("authentication", {})
+        )
 
         self.assertNotIn("FUNCTIONS_WORKER_RUNTIME", setting_names)
+        self.assertNotIn("AzureWebJobsStorage__accountName", setting_names)
+        self.assertIn("AzureWebJobsStorage", setting_names)
+        self.assertIn("DEPLOYMENT_STORAGE_CONNECTION_STRING", setting_names)
+        self.assertEqual(deployment_storage_auth.get("type"), "StorageAccountConnectionString")
+        self.assertEqual(
+            deployment_storage_auth.get("storageAccountConnectionStringName"),
+            "DEPLOYMENT_STORAGE_CONNECTION_STRING",
+        )
         self.assertEqual(
             function_apps[0].get("properties", {}).get("functionAppConfig", {}).get("runtime", {}),
             {"name": "python", "version": "3.11"},
         )
+
+    def test_function_bridge_host_json_uses_extension_bundle(self):
+        host_path = Path(__file__).resolve().parents[1] / "azure_function_bridge" / "host.json"
+        host = json.loads(host_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(host.get("version"), "2.0")
+        self.assertEqual(host.get("extensionBundle", {}).get("id"), "Microsoft.Azure.Functions.ExtensionBundle")
+        self.assertEqual(host.get("extensionBundle", {}).get("version"), "[4.0.0, 5.0.0)")
+
+    def test_set_function_app_settings_preserves_existing_runtime_settings(self):
+        calls = []
+
+        def fake_management_request(_credential, method, url, payload=None, expected_statuses=(200,)):
+            del expected_statuses
+            calls.append({"method": method, "url": url, "payload": payload})
+            if method == "GET":
+                return {
+                    "properties": {
+                        "AzureWebJobsStorage": "runtime-storage-connection",
+                        "DEPLOYMENT_STORAGE_CONNECTION_STRING": "deployment-storage-connection",
+                        "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
+                        "EXISTING": "keep",
+                    }
+                }
+            if method == "PUT":
+                return {}
+            self.fail(f"Unexpected Azure management request: {method} {url}")
+
+        self.azure_platform.azure_management_json_request = fake_management_request
+
+        self.azure_platform.set_function_app_settings(
+            credential=object(),
+            sub_id="sub",
+            function_app_name="func",
+            settings={"LOGMONITOR_QUEUE_NAME": "logs", "EXISTING": "override"},
+        )
+
+        self.assertEqual([call["method"] for call in calls], ["GET", "PUT"])
+        written = calls[-1]["payload"]["properties"]
+        self.assertEqual(written["AzureWebJobsStorage"], "runtime-storage-connection")
+        self.assertEqual(written["DEPLOYMENT_STORAGE_CONNECTION_STRING"], "deployment-storage-connection")
+        self.assertEqual(written["AzureWebJobsFeatureFlags"], "EnableWorkerIndexing")
+        self.assertEqual(written["LOGMONITOR_QUEUE_NAME"], "logs")
+        self.assertEqual(written["EXISTING"], "override")
+        self.assertNotIn("AzureWebJobsStorage__accountName", written)
+        self.assertNotIn("FUNCTIONS_WORKER_RUNTIME", written)
 
     def test_wait_for_function_bridge_endpoint_requires_indexed_function(self):
         calls = []
@@ -1183,7 +1308,7 @@ class ServiceTests(unittest.TestCase):
     def test_hosting_feedback_bridge_configures_mode_agnostic_feedback_endpoint(self):
         dataset_path = self.project_dir / "base.csv"
         dataset_path.write_text("LogMessage,class\nhello,Noise\n", encoding="utf-8")
-        captured = {"settings": {}, "uploaded_blob": ""}
+        captured = {"settings": {}, "uploaded_blob": "", "packages": []}
 
         self.azure_platform.deploy_azure_function_bridge_infrastructure = lambda **kwargs: {
             "storageConnectionString": "UseDevelopmentStorage=true",
@@ -1194,7 +1319,9 @@ class ServiceTests(unittest.TestCase):
         self.azure_platform.ensure_azure_blob_datastore = lambda **kwargs: None
         self.azure_platform.upload_blob_file = lambda **kwargs: captured.update({"uploaded_blob": kwargs["blob_name"]}) or kwargs["blob_name"]
         self.azure_platform.set_function_app_settings = lambda **kwargs: captured.update({"settings": kwargs["settings"]})
-        self.azure_platform.build_function_bridge_package = lambda package_name: str(dataset_path)
+        self.azure_platform.build_function_bridge_package = (
+            lambda package_name, **kwargs: captured["packages"].append({"name": package_name, **kwargs}) or str(dataset_path)
+        )
         self.azure_platform.upload_function_bridge_package = lambda **kwargs: "https://blob/package.zip"
         self.azure_platform.trigger_function_app_onedeploy = lambda **kwargs: None
         self.azure_platform.wait_for_function_bridge_endpoint = (
@@ -1297,11 +1424,15 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_GITHUB_REPO"], "owner/repo")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_PROJECT_KEY"], "OPS")
         self.assertNotIn("FUNCTIONS_WORKER_RUNTIME", captured["settings"])
+        self.assertNotIn("AzureWebJobsStorage__accountName", captured["settings"])
+        self.assertEqual(captured["settings"]["AzureWebJobsStorage"], "UseDevelopmentStorage=true")
+        self.assertEqual(captured["settings"]["DEPLOYMENT_STORAGE_CONNECTION_STRING"], "UseDevelopmentStorage=true")
         self.assertEqual(captured["settings"]["AzureWebJobsFeatureFlags"], "EnableWorkerIndexing")
         self.assertEqual(captured["settings"]["PYTHON_ENABLE_WORKER_EXTENSIONS"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_MONITORING_ENABLED"], "1")
         self.assertEqual(captured["settings"]["LOGMONITOR_JIRA_MONITORING_ISSUE_TYPE"], "Task")
         self.assertEqual(captured["settings"]["LOGMONITOR_MONITORING_STATE_BLOB"], "monitoring/prediction-summary-state.json")
+        self.assertEqual(captured["packages"][-1]["include_azure_ml"], False)
 
     def test_hosting_run_blocks_when_gate_fails(self):
         request = HostingRequest(model_dir=str(self.project_dir), mode="local")

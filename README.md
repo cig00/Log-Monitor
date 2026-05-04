@@ -421,12 +421,14 @@ When feedback is accepted, the Function:
 2. updates or appends the row in a corrected labeled CSV
 3. writes the corrected CSV as an immutable blob
 4. registers the corrected CSV as a new Azure ML Data asset version named `log-monitor-feedback-labeled-data`
-5. submits an Azure ML retraining command job against that new data asset version
+5. submits an Azure ML retraining command job when the deployed Function package includes the Azure ML SDK; realtime triage packages always create the corrected data version and may skip retraining to keep Function indexing lightweight
 
 The hosting summary includes:
 
 - `Feedback API`: `POST` corrected labels here
 - `Feedback status`: stored in hosting metadata as `feedback_status_url`
+
+Jira triage reports also include quick feedback links for `This is Noise`, `This is Configuration`, and `This is System`. Those links call the same feedback API with the stored event id, correct the labeled dataset, and create a new Azure ML Data asset version without putting the raw log message in the URL.
 
 For model-based Azure hosting, the app uploads the current local labeled data version as the feedback base dataset when it can find it from training metadata. If no base dataset is available, the feedback pipeline still creates data versions from submitted corrections, but retraining may need enough feedback rows to satisfy the training split and label distribution requirements.
 
@@ -447,7 +449,7 @@ Triage behavior:
 - `Noise`: no action
 - `CONFIGURATION`: sends email to the configured configuration recipient
 - `SYSTEM`: sends email to the configured system recipient
-- `Error`: creates a Jira issue with the log payload, prediction response, endpoint metadata, and GitHub commit context
+- `Error`: creates a Jira issue with the log payload, prediction response, endpoint metadata, GitHub commit context, quick feedback links, and a GitHub Copilot coding-agent task that asks Copilot to fix the issue as a senior software engineer
 - if Jira issue creation fails for an `Error` prediction, the triage endpoint returns `action_status: partial_failure`, `jira_created: false`, and the Jira error/config summary in `action_errors`
 - every triage prediction updates a daily Jira `Log Monitor Prediction Summary - YYYY-MM-DD` issue with counts for `Error`, `CONFIGURATION`, `SYSTEM`, and `Noise`, plus Jira incident success/failure counts
 - every triage response includes sanitized `diagnostics` showing the payload, prediction, selected action, Jira creation, monitoring update, and response stages without returning tokens or connection strings

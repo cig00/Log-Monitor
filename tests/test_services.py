@@ -732,6 +732,104 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("priority", posted_fields[1])
         self.assertTrue(warnings)
 
+    def test_function_bridge_jira_issue_falls_back_to_task_after_generic_bad_request(self):
+        bridge = self.load_function_bridge_module()
+
+        class FakeResponse:
+            def __init__(self, status_code, text, payload=None):
+                self.status_code = status_code
+                self.text = text
+                self._payload = payload or {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise bridge.requests.HTTPError(self.text)
+
+            def json(self):
+                return self._payload
+
+        fields = {
+            "project": {"key": "KAN"},
+            "summary": "summary",
+            "description": {},
+            "issuetype": {"name": "Bug"},
+        }
+        responses = [
+            FakeResponse(400, '{"errors":{"customfield_10020":"Field is required for Bug"}}'),
+            FakeResponse(201, "{}", {"key": "KAN-77"}),
+        ]
+        posted_fields = []
+
+        def fake_post(_url, headers=None, json=None, timeout=None):
+            del headers, timeout
+            posted_fields.append({**json["fields"], "issuetype": dict(json["fields"]["issuetype"])})
+            return responses.pop(0)
+
+        with mock.patch.object(bridge.requests, "post", side_effect=fake_post):
+            result, warnings = bridge._post_jira_issue_with_fallbacks(
+                "https://eece00.atlassian.net",
+                {"Authorization": "Basic token"},
+                fields,
+                "Bug",
+                "",
+                ["Task"],
+            )
+
+        self.assertEqual(result["key"], "KAN-77")
+        self.assertEqual(posted_fields[0]["issuetype"]["name"], "Bug")
+        self.assertEqual(posted_fields[1]["issuetype"]["name"], "Task")
+        self.assertTrue(any("retried it as 'Task'" in warning for warning in warnings))
+
+    def test_function_bridge_jira_issue_sanitizes_multiline_summary(self):
+        bridge = self.load_function_bridge_module()
+
+        class FakeResponse:
+            status_code = 201
+            text = "{}"
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"key": "KAN-88"}
+
+        posted_fields = []
+
+        def fake_post(_url, headers=None, json=None, timeout=None):
+            del headers, timeout
+            posted_fields.append(json["fields"])
+            return FakeResponse()
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_JIRA_SITE_URL": "https://eece00.atlassian.net",
+                "LOGMONITOR_JIRA_ACCOUNT_EMAIL": "eece00@outlook.com",
+                "LOGMONITOR_JIRA_API_TOKEN": "jira-token",
+                "LOGMONITOR_JIRA_PROJECT_KEY": "KAN",
+                "LOGMONITOR_JIRA_ISSUE_TYPE": "Bug",
+            },
+            clear=False,
+        ), mock.patch.object(bridge.requests, "post", side_effect=fake_post):
+            result = bridge._create_jira_issue(
+                {
+                    "errorMessage": (
+                        "ViewException: Call to undefined method\n"
+                        "App\\Models\\TicketPriority::nonexistent_relation()\r\n"
+                        "(View: /full/path/file.blade.php)"
+                    )
+                },
+                {"prediction": "Error", "raw_response": {"prediction": "Error"}},
+                {"status": "skipped", "candidates": []},
+            )
+
+        self.assertEqual(result["issue_key"], "KAN-88")
+        summary = posted_fields[0]["summary"]
+        self.assertNotIn("\n", summary)
+        self.assertNotIn("\r", summary)
+        self.assertLessEqual(len(summary), 240)
+        self.assertIn("ViewException", summary)
+
     def test_function_bridge_prediction_monitoring_counts_and_links_daily_jira_summary(self):
         bridge = self.load_function_bridge_module()
         state_writes = []
@@ -774,6 +872,51 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(summary["total"], 1)
         self.assertEqual(summary["jira_summary_issue_key"], "KAN-55")
         self.assertEqual(state_writes[-1]["days"]["2026-05-03"]["actions_by_type"]["ignore"], 1)
+
+    def test_function_bridge_prediction_monitoring_records_jira_failure_reason(self):
+        bridge = self.load_function_bridge_module()
+        state_writes = []
+
+        def capture_state_write(state):
+            state_writes.append(json.loads(json.dumps(state)))
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_JIRA_MONITORING_ENABLED": "1",
+                "LOGMONITOR_SOURCE_ENDPOINT_NAME": "log-monitor-endpoint",
+                "LOGMONITOR_HOSTING_SERVICE_KIND": "real-time endpoint",
+            },
+            clear=False,
+        ), mock.patch.object(bridge, "_load_monitoring_state", return_value={}), mock.patch.object(
+            bridge,
+            "_write_monitoring_state",
+            side_effect=capture_state_write,
+        ), mock.patch.object(
+            bridge,
+            "_upsert_jira_monitoring_issue",
+            return_value={
+                "issue_key": "KAN-55",
+                "issue_url": "https://eece00.atlassian.net/browse/KAN-55",
+                "operation": "updated",
+            },
+        ):
+            summary = bridge._record_prediction_monitoring(
+                {"received_at": "2026-05-03T10:15:00Z", "message": "failed"},
+                {"prediction": "Error", "raw_response": {"prediction": "Error"}},
+                "Error",
+                [],
+                [{"type": "jira", "error": "Jira issue creation failed (400). Field is required for Bug"}],
+                {},
+            )
+
+        day = state_writes[-1]["days"]["2026-05-03"]
+        self.assertEqual(day["jira_failed"], 1)
+        self.assertEqual(summary["jira_failure_reasons"], day["jira_failure_reasons"])
+        failure_text = bridge._build_monitoring_summary_text(day)
+        self.assertIn("Jira incident failure reasons:", failure_text)
+        self.assertIn("Field is required for Bug", failure_text)
+        self.assertEqual(day["last_prediction"]["action_errors"][0]["type"], "jira")
 
     def test_function_bridge_triage_creates_jira_and_counts_wrapped_error_prediction(self):
         bridge = self.load_function_bridge_module()
@@ -1059,6 +1202,75 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("KeyError", context["candidates"][0]["matched_terms"])
         self.assertIn("KeyError", context["candidates"][0]["diff_evidence"]["matched_terms_in_diff"])
         self.assertTrue(context["candidates"][0]["diff_match"])
+
+    def test_function_bridge_github_lookup_reviews_ten_consecutive_diffs(self):
+        bridge = self.load_function_bridge_module()
+        compare_calls = []
+
+        def sha(index):
+            return f"{index:040x}"
+
+        commits = [
+            {
+                "sha": sha(index),
+                "html_url": f"https://github.com/owner/repo/commit/{sha(index)}",
+                "parents": [{"sha": sha(index - 1)}] if index > 0 else [],
+                "commit": {
+                    "message": f"Commit {index}",
+                    "author": {"name": "Dev", "email": "dev@example.com", "date": f"2026-05-03T10:{index:02d}:00Z"},
+                    "committer": {"date": f"2026-05-03T10:{index:02d}:00Z"},
+                },
+                "author": {"login": "dev"},
+            }
+            for index in range(10, -1, -1)
+        ]
+
+        def fake_github_request(path, params=None):
+            if path == "commits":
+                self.assertEqual((params or {}).get("per_page"), 11)
+                return commits
+            if path.startswith("compare/"):
+                compare_calls.append(path)
+                base_sha, head_sha = path[len("compare/") :].split("...")
+                files = [{"filename": "docs/readme.md", "patch": "+documentation"}]
+                if head_sha == sha(5):
+                    files = [
+                        {
+                            "filename": "app/Models/TicketPriority.php",
+                            "patch": "+return $this->nonexistent_relation();",
+                        }
+                    ]
+                return {
+                    "html_url": f"https://github.com/owner/repo/compare/{base_sha}...{head_sha}",
+                    "files": files,
+                }
+            return []
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_GITHUB_TOKEN": "gh-token",
+                "LOGMONITOR_GITHUB_REPO": "owner/repo",
+                "LOGMONITOR_GITHUB_BRANCH": "main",
+            },
+            clear=False,
+        ), mock.patch.object(bridge, "_github_request", side_effect=fake_github_request), mock.patch.object(
+            bridge, "_github_search_commits", return_value=[]
+        ):
+            context = bridge._find_github_impact_context(
+                {"received_at": "2026-05-03T11:00:00Z"},
+                "ViewException: Call to undefined method App\\Models\\TicketPriority::nonexistent_relation()",
+            )
+
+        self.assertEqual(len(compare_calls), 10)
+        self.assertEqual(context["consecutive_diff_limit"], 10)
+        self.assertEqual(len(context["consecutive_diff_reviews"]), 10)
+        self.assertEqual(context["status"], "candidates_found")
+        self.assertEqual(context["developer_impact_verdict"], "possible_developer_impact")
+        self.assertEqual(context["candidates"][0]["source"], "consecutive_history_diff")
+        self.assertEqual(context["candidates"][0]["head_sha"], sha(5))
+        self.assertTrue(context["candidates"][0]["copilot_diff_review"]["related"])
+        self.assertIn("nonexistent_relation", context["candidates"][0]["diff_evidence"]["matched_terms_in_diff"])
 
     def test_function_bridge_jira_description_keeps_developer_impact_nuanced(self):
         bridge = self.load_function_bridge_module()

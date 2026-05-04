@@ -376,6 +376,16 @@ def _truncate(value: object, max_chars: int = 4000) -> str:
     return text[: max_chars - 30] + "\n...[truncated by Log Monitor]"
 
 
+def _jira_summary_text(value: object, max_chars: int = 240) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        text = "Log Monitor event"
+    if len(text) <= max_chars:
+        return text
+    suffix = "...[truncated]"
+    return text[: max(1, max_chars - len(suffix))].rstrip() + suffix
+
+
 def _get_payload_value(payload: dict, keys: tuple[str, ...]) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -699,6 +709,14 @@ def _github_search_commits(repo: str, terms: list[str], since_date: str) -> list
     return []
 
 
+def _github_history_diff_limit() -> int:
+    try:
+        limit = int(_get_env("LOGMONITOR_GITHUB_HISTORY_DIFF_LIMIT", "10") or "10")
+    except Exception:
+        limit = 10
+    return min(max(limit, 1), 25)
+
+
 def _extract_source_paths(payload: dict, message: str) -> list[str]:
     candidates: list[str] = []
     for value in (
@@ -759,6 +777,16 @@ def _diff_snippet_for_term(filename: str, patch_text: str, term: str) -> str:
     return ""
 
 
+def _diff_snippet_for_source_path(filename: str, patch_text: str, source_path: str) -> str:
+    clean_filename = filename.replace("\\", "/").strip("/")
+    if _source_path_match(clean_filename, source_path):
+        for line in patch_text.splitlines():
+            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                return _truncate(f"{filename}: {line.strip()}", 240)
+        return _truncate(f"{filename}: changed file matched {source_path}", 240)
+    return ""
+
+
 def _github_diff_evidence(commit: dict, source_paths: list[str], evidence_terms: list[str]) -> dict:
     files = commit.get("files") if isinstance(commit.get("files"), list) else []
     changed_files = [str(file_info.get("filename") or "") for file_info in files if isinstance(file_info, dict)]
@@ -785,6 +813,9 @@ def _github_diff_evidence(commit: dict, source_paths: list[str], evidence_terms:
                 matched_source_paths.append(source_path)
             if filename not in matched_files:
                 matched_files.append(filename)
+            snippet = _diff_snippet_for_source_path(filename, patch_text, source_path)
+            if snippet and snippet not in diff_snippets:
+                diff_snippets.append(snippet)
             score += 70 if match_kind in {"exact", "suffix"} else 25
 
         for term in evidence_terms:
@@ -809,6 +840,92 @@ def _github_diff_evidence(commit: dict, source_paths: list[str], evidence_terms:
         "matched_terms_in_changed_files": matched_terms_in_changed_files[:12],
         "diff_snippets": diff_snippets[:5],
         "score": min(score, 160),
+    }
+
+
+def _commit_sha(commit: dict) -> str:
+    return str(commit.get("sha") or "").strip()[:40] if isinstance(commit, dict) else ""
+
+
+def _commit_parent_sha(commit: dict) -> str:
+    if not isinstance(commit, dict):
+        return ""
+    parents = commit.get("parents") if isinstance(commit.get("parents"), list) else []
+    for parent in parents:
+        if isinstance(parent, dict):
+            sha = _commit_sha(parent)
+            if sha:
+                return sha
+    return ""
+
+
+def _commit_from_compare_payload(compare_payload: dict, head_commit: dict, base_sha: str, head_sha: str) -> dict:
+    commit = dict(head_commit) if isinstance(head_commit, dict) else {}
+    commit["sha"] = head_sha or _commit_sha(commit)
+    commit.setdefault("html_url", str(compare_payload.get("html_url") or ""))
+    if isinstance(compare_payload.get("files"), list):
+        commit["files"] = compare_payload["files"]
+    if not isinstance(commit.get("commit"), dict) and isinstance(compare_payload.get("commits"), list):
+        for item in compare_payload["commits"]:
+            if isinstance(item, dict) and _commit_sha(item) == commit["sha"]:
+                commit["commit"] = item.get("commit") if isinstance(item.get("commit"), dict) else {}
+                commit.setdefault("author", item.get("author") if isinstance(item.get("author"), dict) else {})
+                commit.setdefault("html_url", item.get("html_url") or commit.get("html_url") or "")
+                break
+    commit["base_sha"] = base_sha
+    commit["head_sha"] = commit["sha"]
+    commit["compare_url"] = str(compare_payload.get("html_url") or "")
+    return commit
+
+
+def _build_copilot_diff_review_prompt(message: str, source_paths: list[str], evidence_terms: list[str]) -> str:
+    return (
+        "You are GitHub Copilot acting as a senior software engineer. Review this exact git diff against the "
+        "production log evidence. Decide whether the changed files or patch text are related to the error. "
+        "Do not rely on the commit message alone. Return related, confidence, and a short reason.\n\n"
+        f"Error log:\n{_truncate(message, 2000)}\n\n"
+        f"Source paths: {', '.join(source_paths[:8]) or 'none extracted'}\n"
+        f"Evidence terms: {', '.join(evidence_terms[:12]) or 'none extracted'}"
+    )
+
+
+def _copilot_diff_relevance_review(
+    commit: dict,
+    message: str,
+    source_paths: list[str],
+    evidence_terms: list[str],
+    diff_evidence: dict | None = None,
+) -> dict:
+    evidence = diff_evidence if isinstance(diff_evidence, dict) else _github_diff_evidence(commit, source_paths, evidence_terms)
+    score = int(evidence.get("score") or 0)
+    matched_paths = evidence.get("matched_source_paths") if isinstance(evidence.get("matched_source_paths"), list) else []
+    matched_terms = evidence.get("matched_terms_in_diff") if isinstance(evidence.get("matched_terms_in_diff"), list) else []
+    matched_file_terms = (
+        evidence.get("matched_terms_in_changed_files")
+        if isinstance(evidence.get("matched_terms_in_changed_files"), list)
+        else []
+    )
+    related = bool(matched_paths or matched_terms or score >= 35)
+    confidence = _github_confidence_from_score(score)
+    if matched_paths:
+        reason = "The diff changes file paths extracted from the log, so this commit is a strong candidate for review."
+    elif matched_terms:
+        reason = "The patch text contains error terms extracted from the log, so this commit may be related."
+    elif matched_file_terms:
+        reason = "Changed filenames contain log evidence terms, but the patch text did not directly match."
+    else:
+        reason = "No changed file or patch-text evidence matched this error; this diff is likely unrelated."
+    return {
+        "reviewer": "copilot_diff_rubric",
+        "related": related,
+        "confidence": confidence,
+        "score": score,
+        "reason": reason,
+        "matched_source_paths": matched_paths[:8],
+        "matched_terms_in_diff": matched_terms[:12],
+        "matched_terms_in_changed_files": matched_file_terms[:12],
+        "diff_snippets": evidence.get("diff_snippets", [])[:5] if isinstance(evidence.get("diff_snippets"), list) else [],
+        "prompt": _build_copilot_diff_review_prompt(message, source_paths, evidence_terms),
     }
 
 
@@ -927,7 +1044,13 @@ def _find_github_impact_context(payload: dict, message: str) -> dict:
         detail = request_or_warn(f"commits/{sha}", lookup=f"{source}_diff")
         return detail if isinstance(detail, dict) else commit
 
-    def add_candidate(commit: dict, source: str, score: int, matched_terms: list[str] | None = None) -> None:
+    def add_candidate(
+        commit: dict,
+        source: str,
+        score: int,
+        matched_terms: list[str] | None = None,
+        extra: dict | None = None,
+    ) -> None:
         sha = str(commit.get("sha") or "")
         if not sha:
             return
@@ -941,6 +1064,8 @@ def _find_github_impact_context(payload: dict, message: str) -> dict:
         signal = {"source": source, "score": score, "diff_score": diff_score}
         if matched_terms:
             signal["matched_terms"] = matched_terms[:6]
+        if isinstance(extra, dict):
+            signal.update({key: value for key, value in extra.items() if key in {"base_sha", "head_sha", "compare_url"}})
         if sha in candidate_map:
             existing = candidate_map[sha]
             existing["score"] = int(existing.get("score") or 0) + adjusted_score
@@ -957,6 +1082,12 @@ def _find_github_impact_context(payload: dict, message: str) -> dict:
                 for term in matched_terms:
                     if term not in existing_terms:
                         existing_terms.append(term)
+            if isinstance(extra, dict):
+                if extra.get("copilot_diff_review"):
+                    existing.setdefault("copilot_diff_reviews", []).append(extra["copilot_diff_review"])
+                for key in ("base_sha", "head_sha", "compare_url"):
+                    if extra.get(key):
+                        existing[key] = extra[key]
             return
         summary["score"] = adjusted_score
         summary["diff_score"] = diff_score
@@ -966,6 +1097,13 @@ def _find_github_impact_context(payload: dict, message: str) -> dict:
         summary["sources"] = [source]
         summary["signals"] = [signal]
         summary["matched_terms"] = matched_terms[:] if matched_terms else []
+        if isinstance(extra, dict):
+            if extra.get("copilot_diff_review"):
+                summary["copilot_diff_review"] = extra["copilot_diff_review"]
+                summary["copilot_diff_reviews"] = [extra["copilot_diff_review"]]
+            for key in ("base_sha", "head_sha", "compare_url"):
+                if extra.get(key):
+                    summary[key] = extra[key]
         candidate_map[sha] = summary
 
     def request_or_warn(path: str, params: dict | None = None, lookup: str = "") -> object:
@@ -976,8 +1114,84 @@ def _find_github_impact_context(payload: dict, message: str) -> dict:
             lookup_warnings.append({"lookup": lookup or path, "error": str(exc)})
             return None
 
+    def review_recent_consecutive_diffs() -> list[dict]:
+        limit = _github_history_diff_limit()
+        recent_params = {"sha": branch, "per_page": limit + 1} if branch else {"per_page": limit + 1}
+        recent = request_or_warn("commits", params=recent_params, lookup="recent_consecutive_history")
+        if not isinstance(recent, list):
+            return []
+        reviews: list[dict] = []
+        for index, head_commit in enumerate(recent[:limit]):
+            if not isinstance(head_commit, dict):
+                continue
+            head_sha = _commit_sha(head_commit)
+            base_sha = _commit_parent_sha(head_commit)
+            if not base_sha and index + 1 < len(recent) and isinstance(recent[index + 1], dict):
+                base_sha = _commit_sha(recent[index + 1])
+            if not head_sha or not base_sha:
+                reviews.append(
+                    {
+                        "index": index,
+                        "head_sha": head_sha,
+                        "base_sha": base_sha,
+                        "status": "skipped",
+                        "reason": "Could not determine consecutive base/head SHA.",
+                    }
+                )
+                continue
+            compare_path = f"compare/{base_sha}...{head_sha}"
+            comparison = request_or_warn(compare_path, lookup=f"consecutive_diff:{base_sha[:7]}...{head_sha[:7]}")
+            if not isinstance(comparison, dict):
+                reviews.append(
+                    {
+                        "index": index,
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "status": "failed",
+                        "reason": "GitHub compare API did not return a diff payload.",
+                    }
+                )
+                continue
+            compared_commit = _commit_from_compare_payload(comparison, head_commit, base_sha, head_sha)
+            diff_evidence = _github_diff_evidence(compared_commit, source_paths, evidence_terms)
+            copilot_review = _copilot_diff_relevance_review(
+                compared_commit,
+                message,
+                source_paths,
+                evidence_terms,
+                diff_evidence,
+            )
+            review_summary = {
+                "index": index,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+                "commit_message": _summarize_github_commit(compared_commit, "consecutive_history_diff", "low").get("message", ""),
+                "compare_url": compared_commit.get("compare_url", ""),
+                "changed_files": diff_evidence.get("changed_files", [])[:12],
+                "copilot_review": {
+                    key: value
+                    for key, value in copilot_review.items()
+                    if key != "prompt"
+                },
+            }
+            reviews.append(review_summary)
+            if copilot_review.get("related"):
+                add_candidate(
+                    compared_commit,
+                    "consecutive_history_diff",
+                    25,
+                    extra={
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "compare_url": compared_commit.get("compare_url", ""),
+                        "copilot_diff_review": copilot_review,
+                    },
+                )
+        return reviews
+
     commit_sha = _extract_commit_sha(_get_nested_payload_value(payload, COMMIT_SHA_KEYS))
     previous_sha = _extract_commit_sha(_get_nested_payload_value(payload, PREVIOUS_COMMIT_SHA_KEYS))
+    consecutive_diff_reviews = review_recent_consecutive_diffs()
 
     if commit_sha:
         commit = request_or_warn(f"commits/{commit_sha}", lookup="payload_commit_sha")
@@ -1055,6 +1269,8 @@ def _find_github_impact_context(payload: dict, message: str) -> dict:
         "previous_sha": previous_sha,
         "source_paths": source_paths,
         "search_terms": evidence_terms,
+        "consecutive_diff_limit": _github_history_diff_limit(),
+        "consecutive_diff_reviews": consecutive_diff_reviews[: _github_history_diff_limit()],
         "non_developer_cause_possible": True,
         "lookup_warnings": lookup_warnings[:5],
         "candidates": candidates[:5],
@@ -1141,9 +1357,36 @@ def _post_jira_issue_with_fallbacks(
 ) -> tuple[dict, list[str]]:
     issue_url = f"{site_url}/rest/api/3/issue"
     jira_warnings: list[str] = []
+    if "summary" in fields:
+        fields["summary"] = _jira_summary_text(fields.get("summary"))
 
     def post_issue() -> requests.Response:
         return requests.post(issue_url, headers=headers, json={"fields": fields}, timeout=30)
+
+    def retry_issue_type_fallbacks(response: requests.Response, reason: str) -> requests.Response:
+        fallback_types = issue_type_fallbacks if issue_type_fallbacks is not None else ["Task"]
+        current_type = ""
+        if isinstance(fields.get("issuetype"), dict):
+            current_type = str(fields.get("issuetype", {}).get("name") or "").strip()
+        used_issue_types = {str(issue_type or "").casefold(), current_type.casefold()}
+        for fallback_type in fallback_types:
+            clean_fallback = str(fallback_type or "").strip()
+            if not clean_fallback or clean_fallback.casefold() in used_issue_types:
+                continue
+            used_issue_types.add(clean_fallback.casefold())
+            LOGGER.warning("Jira rejected issue creation as '%s'. Retrying as %s.", current_type or issue_type, clean_fallback)
+            fields["issuetype"] = {"name": clean_fallback}
+            jira_warnings.append(
+                f"Jira rejected issue creation as '{current_type or issue_type}' ({reason}), "
+                f"so Log Monitor retried it as '{clean_fallback}'."
+            )
+            response = post_issue()
+            if response.status_code < 400:
+                return response
+            if response.status_code != 400:
+                return response
+            current_type = clean_fallback
+        return response
 
     response = post_issue()
     if response.status_code >= 400 and priority and _looks_like_jira_priority_error(response.text):
@@ -1152,21 +1395,9 @@ def _post_jira_issue_with_fallbacks(
         jira_warnings.append(f"Jira rejected configured priority '{priority}', so the issue was created without an explicit priority.")
         response = post_issue()
     if response.status_code >= 400 and _looks_like_jira_issue_type_error(response.text):
-        fallback_types = issue_type_fallbacks if issue_type_fallbacks is not None else ["Task"]
-        used_issue_types = {issue_type.casefold()}
-        for fallback_type in fallback_types:
-            clean_fallback = str(fallback_type or "").strip()
-            if not clean_fallback or clean_fallback.casefold() in used_issue_types:
-                continue
-            used_issue_types.add(clean_fallback.casefold())
-            LOGGER.warning("Jira rejected issue type '%s'. Retrying issue creation as %s.", issue_type, clean_fallback)
-            fields["issuetype"] = {"name": clean_fallback}
-            jira_warnings.append(
-                f"Jira rejected issue type '{issue_type}', so Log Monitor retried issue creation as '{clean_fallback}'."
-            )
-            response = post_issue()
-            if response.status_code < 400 or not _looks_like_jira_issue_type_error(response.text):
-                break
+        response = retry_issue_type_fallbacks(response, "invalid issue type")
+    elif response.status_code == 400 and issue_type_fallbacks:
+        response = retry_issue_type_fallbacks(response, "Jira returned 400 Bad Request")
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -1213,9 +1444,16 @@ def _build_jira_description(payload: dict, prediction_result: dict, github_conte
         if diff_evidence.get("changed_files"):
             diff_bits.append("changed files: " + ", ".join(str(path) for path in diff_evidence["changed_files"][:5]))
         diff_summary = " | ".join(diff_bits) if diff_bits else "no changed-file or patch-text match found"
+        copilot_review = candidate.get("copilot_diff_review") if isinstance(candidate.get("copilot_diff_review"), dict) else {}
+        copilot_summary = ""
+        if copilot_review:
+            copilot_summary = (
+                f"\n  Copilot diff review: related={copilot_review.get('related')} "
+                f"confidence={copilot_review.get('confidence')} reason={copilot_review.get('reason', '')}"
+            )
         candidate_lines.append(
             f"- {sha} by {author} at {authored_at} [{confidence}, {source}] {commit_message} {url}\n"
-            f"  Diff evidence: {diff_summary}".strip()
+            f"  Diff evidence: {diff_summary}{copilot_summary}".strip()
         )
         for snippet in diff_evidence.get("diff_snippets", [])[:2] if isinstance(diff_evidence.get("diff_snippets"), list) else []:
             candidate_lines.append(f"  Patch snippet: {snippet}")
@@ -1265,7 +1503,7 @@ def _create_jira_issue(payload: dict, prediction_result: dict, github_context: d
     priority = _get_env("LOGMONITOR_JIRA_PRIORITY")
     labels = _parse_jira_labels(_get_env("LOGMONITOR_JIRA_LABELS", "log-monitor,ml-triage"))
     message = _extract_message(payload)
-    summary = _truncate("Log Monitor Error: " + (message.splitlines()[0] if message else "unclassified runtime error"), 240)
+    summary = _jira_summary_text("Log Monitor Error: " + (message or "unclassified runtime error"))
     description_text = _build_jira_description(payload, prediction_result, github_context)
     fields = {
         "project": {"key": project_key},
@@ -1309,6 +1547,7 @@ def _new_monitoring_day(day_key: str) -> dict:
         "action_status_counts": {"ok": 0, "partial_failure": 0},
         "jira_created": 0,
         "jira_failed": 0,
+        "jira_failure_reasons": {},
         "actions_by_type": {},
         "first_seen_at": _now_utc_iso(),
         "updated_at": _now_utc_iso(),
@@ -1320,11 +1559,27 @@ def _increment_count(container: dict, key: str, amount: int = 1) -> None:
     container[clean_key] = int(container.get(clean_key, 0) or 0) + int(amount)
 
 
+def _compact_action_errors(action_errors: list[dict], limit: int = 4) -> list[dict]:
+    compact_errors = []
+    for action_error in action_errors[:limit]:
+        if not isinstance(action_error, dict):
+            compact_errors.append({"type": "unknown", "error": _truncate(str(action_error), 1000)})
+            continue
+        compact_errors.append(
+            {
+                "type": str(action_error.get("type") or "unknown"),
+                "error": _truncate(str(action_error.get("error") or ""), 1000),
+            }
+        )
+    return compact_errors
+
+
 def _build_monitoring_summary_text(day: dict) -> str:
     counts = day.get("counts") if isinstance(day.get("counts"), dict) else {}
     action_counts = day.get("action_status_counts") if isinstance(day.get("action_status_counts"), dict) else {}
     actions_by_type = day.get("actions_by_type") if isinstance(day.get("actions_by_type"), dict) else {}
     unknown_predictions = day.get("unknown_predictions") if isinstance(day.get("unknown_predictions"), dict) else {}
+    jira_failure_reasons = day.get("jira_failure_reasons") if isinstance(day.get("jira_failure_reasons"), dict) else {}
     lines = [
         f"Log Monitor Prediction Summary - {day.get('date', '')}",
         "",
@@ -1344,10 +1599,18 @@ def _build_monitoring_summary_text(day: dict) -> str:
             f"Total predictions: {int(day.get('total', 0) or 0)}",
             f"Jira incident issues created from Error predictions: {int(day.get('jira_created', 0) or 0)}",
             f"Error predictions where Jira incident creation failed: {int(day.get('jira_failed', 0) or 0)}",
-            "",
-            "Action status counts:",
         ]
     )
+    if jira_failure_reasons:
+        lines.extend(["", "Jira incident failure reasons:"])
+        sorted_reasons = sorted(
+            jira_failure_reasons.items(),
+            key=lambda item: int(item[1] or 0),
+            reverse=True,
+        )
+        for reason, count in sorted_reasons[:6]:
+            lines.append(f"- {int(count or 0)}x {_truncate(str(reason), 900)}")
+    lines.extend(["", "Action status counts:"])
     for key in sorted(action_counts):
         lines.append(f"- {key}: {int(action_counts.get(key, 0) or 0)}")
     lines.append("")
@@ -1379,7 +1642,7 @@ def _upsert_jira_monitoring_issue(day: dict) -> dict:
     labels = _parse_jira_labels(
         _get_env("LOGMONITOR_JIRA_MONITORING_LABELS", "log-monitor,ml-monitoring,prediction-summary")
     )
-    summary = _truncate(f"Log Monitor Prediction Summary - {day.get('date', '')}", 240)
+    summary = _jira_summary_text(f"Log Monitor Prediction Summary - {day.get('date', '')}")
     description = _jira_adf_from_text(_build_monitoring_summary_text(day))
     headers = _jira_auth_headers(account_email, api_token)
     issue_key = str(day.get("jira_summary_issue_key") or "").strip()
@@ -1446,6 +1709,7 @@ def _record_prediction_monitoring(
     action_status_counts = day.setdefault("action_status_counts", {"ok": 0, "partial_failure": 0})
     actions_by_type = day.setdefault("actions_by_type", {})
     unknown_predictions = day.setdefault("unknown_predictions", {})
+    jira_failure_reasons = day.setdefault("jira_failure_reasons", {})
 
     normalized_prediction = _normalize_prediction_label(prediction) or str(prediction or "Unknown")
     day["total"] = int(day.get("total", 0) or 0) + 1
@@ -1464,6 +1728,15 @@ def _record_prediction_monitoring(
             day["jira_created"] = int(day.get("jira_created", 0) or 0) + 1
         else:
             day["jira_failed"] = int(day.get("jira_failed", 0) or 0) + 1
+            jira_errors = [
+                str(action_error.get("error") or "").strip()
+                for action_error in action_errors
+                if isinstance(action_error, dict) and str(action_error.get("type") or "") == "jira"
+            ]
+            if not jira_errors:
+                jira_errors = ["Jira issue was not created, and no Jira error details were recorded."]
+            for jira_error in jira_errors:
+                _increment_count(jira_failure_reasons, _truncate(jira_error, 900))
 
     day["last_prediction"] = {
         "prediction": normalized_prediction,
@@ -1471,6 +1744,7 @@ def _record_prediction_monitoring(
         "action_status": action_status,
         "jira_created": bool(jira_issue.get("issue_key")),
         "jira_issue_key": str(jira_issue.get("issue_key") or ""),
+        "action_errors": _compact_action_errors(action_errors),
         "raw_prediction": prediction_result.get("raw_response", ""),
     }
     day["updated_at"] = _now_utc_iso()
@@ -1490,6 +1764,7 @@ def _record_prediction_monitoring(
         "date": day_key,
         "counts": day.get("counts", {}),
         "total": day.get("total", 0),
+        "jira_failure_reasons": day.get("jira_failure_reasons", {}),
         "jira_summary_issue_key": day.get("jira_summary_issue_key", ""),
         "jira_summary_issue_url": day.get("jira_summary_issue_url", ""),
         "jira_summary_operation": day.get("jira_summary_operation", ""),

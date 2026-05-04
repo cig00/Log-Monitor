@@ -62,6 +62,19 @@ class LogProcessorApp:
             "expected": "Noise",
         },
     ]
+    DEFAULT_HOSTING_FORM_VALUES = {
+        "hosting_mode": "azure",
+        "azure_service": "online",
+        "github_token": "GITHUB_TOKEN",
+        "azure_host_sub_id": "91a62f38-6e7e-434a-ad85-592905ae1bf7",
+        "azure_host_tenant_id": "5bf6ff5b-6333-491c-b315-f803d901c135",
+        "configuration_email": "eece00@outlook.com",
+        "system_email": "eece00@outlook.com",
+        "jira_site_url": "https://eece00.atlassian.net",
+        "jira_account_email": "eece00@outlook.com",
+        "jira_api_token": "JIRA_TOKEN",
+        "jira_project_key": "KAN",
+    }
 
     def __init__(self, root):
         self.root = root
@@ -131,7 +144,7 @@ class LogProcessorApp:
         self.grafana_process = None
         self.azure_cached_credential = None
         self.azure_cached_credential_tenant_id = ""
-        self.hosting_mode_var = tk.StringVar(value="local")
+        self.hosting_mode_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["hosting_mode"])
         default_model_dir = Path(self.project_dir) / "outputs" / "final_model"
         default_gate_golden = Path(self.project_dir) / "gates" / "deployment_golden.csv"
         default_gate_policy = Path(self.project_dir) / "gates" / "deployment_policy.json"
@@ -150,10 +163,10 @@ class LogProcessorApp:
         self.feedback_api_url_var = tk.StringVar(value="")
         self.feedback_status_url_var = tk.StringVar(value="")
         self.hosting_mode_summary_var = tk.StringVar(value="")
-        self.azure_host_sub_var = tk.StringVar(value="")
-        self.azure_host_tenant_var = tk.StringVar(value="")
+        self.azure_host_sub_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["azure_host_sub_id"])
+        self.azure_host_tenant_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["azure_host_tenant_id"])
         self.azure_host_compute_var = tk.StringVar(value="cpu")
-        self.azure_host_service_var = tk.StringVar(value="queued_batch")
+        self.azure_host_service_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["azure_service"])
         default_serverless_model_id = self.azure_platform_service.get_default_serverless_model_id()
         default_serverless_endpoint_name = self.azure_platform_service.build_default_serverless_endpoint_name(
             default_serverless_model_id,
@@ -174,17 +187,18 @@ class LogProcessorApp:
         self.azure_hosted_endpoint_name_var = tk.StringVar(value="")
         self.create_pr_var = tk.BooleanVar(value=False)
         self.github_pr_url_var = tk.StringVar(value="")
-        self.configuration_email_var = tk.StringVar(value="")
-        self.system_email_var = tk.StringVar(value="")
+        self.github_token_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["github_token"])
+        self.configuration_email_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["configuration_email"])
+        self.system_email_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["system_email"])
         self.acs_connection_string_var = tk.StringVar(value="")
         self.acs_connection_choice_var = tk.StringVar(value="")
         self.acs_sender_address_var = tk.StringVar(value="")
         self.acs_connection_inventory = []
         self.acs_sender_inventory = []
-        self.jira_site_url_var = tk.StringVar(value="")
-        self.jira_account_email_var = tk.StringVar(value="")
-        self.jira_api_token_var = tk.StringVar(value="")
-        self.jira_project_key_var = tk.StringVar(value="")
+        self.jira_site_url_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["jira_site_url"])
+        self.jira_account_email_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["jira_account_email"])
+        self.jira_api_token_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["jira_api_token"])
+        self.jira_project_key_var = tk.StringVar(value=self.DEFAULT_HOSTING_FORM_VALUES["jira_project_key"])
         self.jira_issue_type_var = tk.StringVar(value="Bug")
         self.jira_priority_var = tk.StringVar(value="")
         self.jira_labels_var = tk.StringVar(value="log-monitor,ml-triage")
@@ -504,7 +518,7 @@ class LogProcessorApp:
         hosting_frame.columnconfigure(3, weight=1)
 
         ttk.Label(hosting_frame, text="GitHub PAT:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.github_key_entry = ttk.Entry(hosting_frame, width=30, show="*")
+        self.github_key_entry = ttk.Entry(hosting_frame, textvariable=self.github_token_var, width=30, show="*")
         self.github_key_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
         self.load_repos_btn = ttk.Button(hosting_frame, text="Load Repos", command=self.start_repo_thread)

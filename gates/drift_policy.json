@@ -1,24 +1,24 @@
 {
   "warning": {
-    "min_accuracy": 0.88,
-    "min_weighted_f1": 0.88,
-    "min_macro_f1": 0.84,
+    "min_accuracy": 0.92,
+    "min_weighted_f1": 0.92,
+    "min_macro_f1": 0.86,
     "min_recall_per_class": {
       "Error": 0.8,
       "CONFIGURATION": 0.8,
-      "SYSTEM": 0.75,
-      "Noise": 0.75
+      "SYSTEM": 0.8,
+      "Noise": 0.94
     }
   },
   "critical": {
-    "min_accuracy": 0.8,
-    "min_weighted_f1": 0.8,
-    "min_macro_f1": 0.75,
+    "min_accuracy": 0.86,
+    "min_weighted_f1": 0.86,
+    "min_macro_f1": 0.78,
     "min_recall_per_class": {
       "Error": 0.7,
       "CONFIGURATION": 0.7,
-      "SYSTEM": 0.65,
-      "Noise": 0.65
+      "SYSTEM": 0.7,
+      "Noise": 0.88
     }
   }
 }

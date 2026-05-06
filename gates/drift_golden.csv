@@ -1,0 +1,501 @@
+LogMessage,class
+RuntimeException: Queue worker timed out after 240 seconds while processing App\Jobs\ImportJiraTicketsJob,SYSTEM
+ModelNotFoundException: No query results for model [App\Models\Permission] 1109,Error
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.127.39:443),SYSTEM
+DELETE does-not-exist 404 613ms user=46 ip=10.136.190.54 ua=curl/8.7.1,Noise
+GET activities 503 1556ms user=47 ip=10.31.227.23 ua=Symfony,Noise
+UnexpectedValueException: Invalid configuration value for services.oidc.scope: [],CONFIGURATION
+PUT projects 404 89ms user=62 ip=10.116.24.162 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+"TypeError: App\Filament\Resources\TicketResource::formatDueDate(): Argument #1 must be of type DateTimeInterface, string given",Error
+"UnexpectedValueException: Invalid configuration value for database.connections.mysql.host: """"",CONFIGURATION
+GET ticket-statuses/create 429 1370ms user=41 ip=10.51.163.145 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET livewire/message/tickets 200 477ms user=guest ip=10.196.136.6 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: Configuration key OUTLOOK_MAIL_TENANT was not loaded,CONFIGURATION
+GET tickets/205/edit 503 816ms user=21 ip=10.191.37.33 ua=Symfony,Noise
+"ErrorException: Attempt to read property ""owner"" on null in TicketResource.php",Error
+Fatal error: Allowed memory size of 301989888 bytes exhausted (tried to allocate 3145728 bytes) in /var/www/html/vendor/laravel/framework/src/Illuminate/View/Factory.php:102,SYSTEM
+POST ticket-priorities 503 1271ms user=56 ip=10.156.172.38 ua=Symfony,Noise
+GET activities 401 165ms user=96 ip=10.146.158.230 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 248 MB,SYSTEM
+GET settings/general 400 789ms user=72 ip=10.16.114.12 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+DELETE does-not-exist 500 939ms user=60 ip=10.136.144.192 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+InvalidArgumentException: View [filament.widgets.open-ticket-table] not found.,Error
+GET login 403 975ms user=78 ip=10.226.178.120 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+DELETE projects 500 962ms user=11 ip=10.1.1.1 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET projects/101/edit 200 208ms user=7 ip=10.211.65.109 ua=curl/8.7.1,Noise
+RuntimeException: Configuration key MAIL_USERNAME was not loaded,CONFIGURATION
+UnexpectedValueException: Invalid configuration value for filesystems.disks.s3.bucket: false,CONFIGURATION
+GET livewire/message/app.filament.widgets.favorite-projects 304 1606ms user=43 ip=10.71.7.83 ua=Symfony,Noise
+InvalidArgumentException: Configuration value DB_HOST cannot be blank,CONFIGURATION
+InvalidArgumentException: Configuration value APP_KEY cannot be blank,CONFIGURATION
+PATCH admin 503 99ms user=42 ip=10.216.164.82 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+ErrorException: Undefined variable $assignees in view tickets.form,Error
+DELETE tickets/205 200 1264ms user=67 ip=10.181.69.87 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET filament/assets/echo.js 304 1583ms user=92 ip=10.206.150.44 ua=curl/8.7.1,Noise
+PATCH tickets 302 819ms user=12 ip=10.86.74.2 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET ticket-statuses/create 200 756ms user=45 ip=10.51.117.53 ua=Symfony,Noise
+ErrorException: file_put_contents(storage/framework/views/ticket.blade.php): Failed to open stream: Read-only file system,SYSTEM
+PATCH roles/9/edit 405 1377ms user=30 ip=10.26.36.96 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+"RuntimeException: OIDC login cannot start because ""scopes"" is not configured",CONFIGURATION
+GET users/create 200 932ms user=guest ip=10.161.41.11 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PUT ticket-statuses/create 302 1274ms user=47 ip=10.51.209.7 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+ModelNotFoundException: No query results for model [App\Models\Role] 6044,Error
+RuntimeException: Queue worker timed out after 75 seconds while processing App\Jobs\ImportJiraTicketsJob,SYSTEM
+POST ticket-statuses/create 404 852ms user=39 ip=10.51.71.191 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PUT tickets 405 205ms user=16 ip=10.86.28.140 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET roles 405 1639ms user=70 ip=10.36.4.42 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+TransportException: Outlook OAuth token request failed with status 400: invalid_request,CONFIGURATION
+GET livewire/message/app.filament.widgets.favorite-projects 200 733ms user=94 ip=10.186.30.14 ua=curl/8.7.1,Noise
+ErrorException: Undefined variable $record in view tickets.form,Error
+GET admin 302 1490ms user=89 ip=10.101.3.105 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.163.107:443),SYSTEM
+DELETE activities 403 520ms user=43 ip=10.31.43.115 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+POST filament/assets/echo.js 401 643ms user=82 ip=10.206.150.44 ua=curl/8.7.1,Noise
+GET tickets/205 404 1523ms user=20 ip=10.66.230.64 ua=curl/8.7.1,Noise
+GET roles/9/edit 404 1022ms user=83 ip=10.141.151.211 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+"TypeError: App\Filament\Resources\UserResource::formatName(): Argument #1 must be of type string, array given",Error
+RuntimeException: Configuration key MAIL_HOST was not loaded,CONFIGURATION
+GET livewire/message/tickets 400 26ms user=95 ip=10.81.67.213 ua=Symfony,Noise
+POST projects 503 1317ms user=54 ip=10.116.116.116 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET users/create 422 59ms user=26 ip=10.46.64.172 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET tickets 204 464ms user=65 ip=10.201.189.117 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+"RuntimeException: SMTP transport configuration is missing MAIL_HOST, MAIL_PORT, MAIL_USERNAME",CONFIGURATION
+POST projects/101/edit 200 1503ms user=60 ip=10.96.180.224 ua=curl/8.7.1,Noise
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.71.111:443),SYSTEM
+"ParseError: syntax error, unexpected token ""readonly"" in ProjectResource.php:144",Error
+QueryException: SQLSTATE[HY000] [2002] Connection refused (172.16.199.175:443),SYSTEM
+GET livewire/message/tickets 422 1254ms user=87 ip=10.81.159.167 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+RuntimeException: Configuration key QUEUE_CONNECTION was not loaded,CONFIGURATION
+GET livewire/message/tickets 302 1513ms user=40 ip=10.196.90.144 ua=curl/8.7.1,Noise
+POST login 304 457ms user=76 ip=10.226.86.166 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PATCH projects 200 540ms user=3 ip=10.1.93.185 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET livewire/message/app.filament.widgets.tickets-by-priority 201 826ms user=1 ip=10.61.177.183 ua=Symfony,Noise
+PUT does-not-exist 304 1390ms user=1 ip=10.21.213.215 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+DELETE roles 201 1543ms user=76 ip=10.36.50.134 ua=curl/8.7.1,Noise
+DELETE tickets 200 1241ms user=20 ip=10.86.212.48 ua=Symfony,Noise
+PATCH projects/101/edit 304 889ms user=64 ip=10.96.134.132 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 128 MB,SYSTEM
+Transaction: delete from `users` where `id` = ? and `deleted_at` is null,Noise
+GET settings/general 503 338ms user=35 ip=10.131.45.219 ua=curl/8.7.1,Noise
+GET livewire/message/app.filament.widgets.tickets-by-priority 422 1277ms user=38 ip=10.176.16.206 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: Cannot call refresh on a model that has not been saved,Error
+"Transaction: insert into `projects` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+GET users/create 304 673ms user=22 ip=10.46.110.34 ua=curl/8.7.1,Noise
+InvalidArgumentException: Configuration value S3_BUCKET cannot be blank,CONFIGURATION
+PATCH logs-report 405 1400ms user=77 ip=10.121.123.135 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+InvalidArgumentException: Configuration value OIDC_URL_ACCESS_TOKEN cannot be blank,CONFIGURATION
+GET login 405 1138ms user=37 ip=10.111.155.189 ua=curl/8.7.1,Noise
+"InvalidArgumentException: Provider option ""scopes"" must not be empty",CONFIGURATION
+"Transaction: update `password_reset_tokens` set `updated_at` = ?, `status_id` = ? where `id` = ?",Noise
+PATCH ticket-priorities 200 331ms user=46 ip=10.156.172.38 ua=Symfony,Noise
+InvalidArgumentException: Configuration value MAIL_PORT cannot be blank,CONFIGURATION
+POST logs-report 400 527ms user=32 ip=10.6.146.66 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+"Transaction: insert into `sessions` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+RuntimeException: Configuration key OIDC_REDIRECT_URI was not loaded,CONFIGURATION
+QueryException: SQLSTATE[HY000] [2002] Connection refused (172.16.118.22:6379),SYSTEM
+POST users 204 225ms user=72 ip=10.56.78.210 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+RuntimeException: Configuration key DB_USERNAME was not loaded,CONFIGURATION
+"UnexpectedValueException: Invalid configuration value for logging.channels.stack.channels: ""single""",CONFIGURATION
+PUT users/create 429 414ms user=69 ip=10.161.179.57 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET settings/general 403 952ms user=31 ip=10.131.91.81 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PUT projects 401 1576ms user=7 ip=10.1.47.93 ua=Symfony,Noise
+PATCH activities 201 587ms user=8 ip=10.146.66.46 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET login 204 1397ms user=86 ip=10.226.86.166 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+POST ticket-priorities 429 1108ms user=1 ip=10.41.195.199 ua=curl/8.7.1,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 184 MB,SYSTEM
+DELETE roles 200 1380ms user=21 ip=10.151.73.65 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET projects 200 22ms user=guest ip=10.1.1.1 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET tickets/205/edit 302 557ms user=68 ip=10.76.106.56 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+POST users 200 62ms user=17 ip=10.171.101.141 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PUT filament/assets/echo.js 200 902ms user=35 ip=10.91.81.21 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PATCH tickets/205/edit 304 912ms user=15 ip=10.191.221.171 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET ticket-priorities 201 849ms user=48 ip=10.156.34.222 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+RuntimeException: SMTP transport configuration is missing MAIL_HOST,CONFIGURATION
+GET projects/create 304 1151ms user=8 ip=10.106.102.78 ua=Symfony,Noise
+PATCH roles 401 1121ms user=68 ip=10.36.142.88 ua=Symfony,Noise
+InvalidArgumentException: Configuration value MAIL_HOST cannot be blank,CONFIGURATION
+PATCH logs-report 429 1563ms user=36 ip=10.6.100.204 ua=curl/8.7.1,Noise
+RuntimeException: Configuration key MAIL_PASSWORD was not loaded,CONFIGURATION
+DELETE tickets 503 1078ms user=61 ip=10.201.5.209 ua=curl/8.7.1,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 200 MB,SYSTEM
+GET logs-report 200 1141ms user=28 ip=10.6.192.158 ua=Symfony,Noise
+Transaction: delete from `sessions` where `id` = ? and `deleted_at` is null,Noise
+ModelNotFoundException: No query results for model [App\Models\User] 7109,Error
+POST api/fake 200 1387ms user=guest ip=10.126.176.16 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 296 MB,SYSTEM
+"RuntimeException: OIDC login cannot start because ""redirectUri"" is not configured",CONFIGURATION
+POST tickets 201 109ms user=22 ip=10.86.74.2 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+"TypeError: App\Filament\Resources\Kanban::canAccess(): Argument #1 must be of type bool, string given",Error
+"RuntimeException: OIDC login cannot start because ""urlAccessToken"" is not configured",CONFIGURATION
+Transaction: delete from `ticket_priorities` where `id` = ? and `deleted_at` is null,Noise
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.44.60:9200),SYSTEM
+RuntimeException: Configuration key OUTLOOK_MAIL_REFRESH_TOKEN was not loaded,CONFIGURATION
+InvalidArgumentException: Configuration value OUTLOOK_MAIL_REFRESH_TOKEN cannot be blank,CONFIGURATION
+DELETE livewire/message/app.filament.widgets.tickets-by-priority 401 404ms user=89 ip=10.61.39.137 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET livewire/message/app.filament.widgets.tickets-by-priority 200 663ms user=42 ip=10.176.200.114 ua=curl/8.7.1,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 152 MB,SYSTEM
+GET ticket-priorities 400 72ms user=93 ip=10.41.11.61 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+DELETE projects/create 503 1055ms user=14 ip=10.106.148.170 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PUT ticket-priorities 204 1204ms user=91 ip=10.41.149.107 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+Fatal error: Allowed memory size of 603979776 bytes exhausted (tried to allocate 524288 bytes) in /var/www/html/vendor/laravel/framework/src/Illuminate/View/Factory.php:104,SYSTEM
+POST livewire/message/app.filament.widgets.tickets-by-priority 405 922ms user=91 ip=10.61.131.91 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+ErrorException: file_put_contents(storage/framework/cache/data/routes.php): Failed to open stream: Permission denied,SYSTEM
+POST ticket-statuses/create 500 1178ms user=53 ip=10.51.25.99 ua=curl/8.7.1,Noise
+DELETE users 200 1357ms user=70 ip=10.56.216.26 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+ErrorException: Undefined variable $comments in view tickets.form,Error
+"TypeError: App\Filament\Resources\TicketPolicy::authorizeOwner(): Argument #1 must be of type int, string given",Error
+InvalidArgumentException: Configuration value DB_USERNAME cannot be blank,CONFIGURATION
+InvalidArgumentException: Configuration value DB_PORT cannot be blank,CONFIGURATION
+InvalidArgumentException: Configuration value OIDC_SCOPE cannot be blank,CONFIGURATION
+"ErrorException: Attempt to read property ""role"" on null in PermissionResource.php",Error
+GET tickets/205 500 746ms user=65 ip=10.181.207.133 ua=Symfony,Noise
+PUT roles/9/edit 503 600ms user=75 ip=10.141.13.165 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+POST roles 204 248ms user=23 ip=10.151.165.19 ua=curl/8.7.1,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 168 MB,SYSTEM
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.136.56:9200),SYSTEM
+ErrorException: Undefined variable $permissions in view tickets.form,Error
+DELETE livewire/message/tickets 304 218ms user=83 ip=10.81.205.29 ua=curl/8.7.1,Noise
+InvalidArgumentException: Configuration value MAIL_PASSWORD cannot be blank,CONFIGURATION
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.17.9:3306),SYSTEM
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.46.86:6379),SYSTEM
+GET ticket-statuses/create 503 1533ms user=96 ip=10.166.140.214 ua=curl/8.7.1,Noise
+PUT tickets 403 42ms user=57 ip=10.201.51.71 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: Queue worker timed out after 45 seconds while processing App\Jobs\ImportJiraTicketsJob,SYSTEM
+PATCH roles/9/edit 403 1214ms user=71 ip=10.141.59.27 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+DELETE filament/assets/echo.js 400 288ms user=39 ip=10.91.35.159 ua=curl/8.7.1,Noise
+UnexpectedValueException: Hash verification failed while signing ticket attachment URL,Error
+GET users 200 1002ms user=27 ip=10.171.101.141 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET tickets 401 1337ms user=14 ip=10.86.166.186 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: Configuration key OIDC_SCOPE was not loaded,CONFIGURATION
+GET logs-report 422 105ms user=24 ip=10.6.8.20 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PUT roles 200 670ms user=guest ip=10.151.73.65 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+ModelNotFoundException: No query results for model [App\Models\TicketType] 1711,Error
+"UnexpectedValueException: Invalid configuration value for session.lifetime: ""forever""",CONFIGURATION
+PATCH tickets/205/edit 401 1075ms user=70 ip=10.76.198.10 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+RuntimeException: Configuration key OIDC_URL_AUTHORIZE was not loaded,CONFIGURATION
+POST api/fake 500 1224ms user=51 ip=10.11.199.177 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET projects 200 185ms user=56 ip=10.116.208.70 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET admin 422 1231ms user=40 ip=10.216.72.128 ua=Symfony,Noise
+RuntimeException: Configuration key OUTLOOK_MAIL_CLIENT_ID was not loaded,CONFIGURATION
+InvalidArgumentException: Configuration value CACHE_STORE cannot be blank,CONFIGURATION
+PATCH projects/101/edit 204 726ms user=9 ip=10.211.157.63 ua=Symfony,Noise
+ErrorException: Undefined variable $statuses in view tickets.form,Error
+GET livewire/message/tickets 201 1350ms user=81 ip=10.81.113.75 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+DELETE activities 429 846ms user=57 ip=10.31.227.23 ua=Symfony,Noise
+"Transaction: update `ticket_comments` set `updated_at` = ?, `status_id` = ? where `id` = ?",Noise
+RuntimeException: Queue worker timed out after 60 seconds while processing App\Jobs\ImportJiraTicketsJob,SYSTEM
+PATCH livewire/message/app.filament.widgets.favorite-projects 500 52ms user=37 ip=10.71.191.221 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 120 MB,SYSTEM
+POST logs-report 302 364ms user=73 ip=10.121.169.227 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET does-not-exist 200 162ms user=9 ip=10.21.121.31 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.62.94:6379),SYSTEM
+POST livewire/message/app.filament.widgets.favorite-projects 422 992ms user=47 ip=10.71.191.221 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PUT roles/9/edit 429 437ms user=20 ip=10.26.36.96 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PUT projects/create 403 1669ms user=10 ip=10.106.194.32 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PATCH livewire/message/app.filament.widgets.tickets-by-priority 200 308ms user=95 ip=10.61.85.229 ua=curl/8.7.1,Noise
+"Transaction: insert into `notifications` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+"TypeError: App\Filament\Resources\LatestTickets::getTableRecords(): Argument #1 must be of type Countable, null given",Error
+Transaction: delete from `tickets` where `id` = ? and `deleted_at` is null,Noise
+DELETE does-not-exist 422 776ms user=5 ip=10.21.167.123 ua=Symfony,Noise
+POST tickets/205/edit 200 39ms user=66 ip=10.76.14.102 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PUT projects/101/edit 404 112ms user=13 ip=10.211.111.201 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET admin 404 1068ms user=81 ip=10.101.95.59 ua=curl/8.7.1,Noise
+GET settings/general 429 175ms user=76 ip=10.16.68.150 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+TransportException: Outlook OAuth token request failed with status 400: unsupported_grant_type,CONFIGURATION
+QueryException: SQLSTATE[HY000] [2002] Connection refused (172.16.26.26:6379),SYSTEM
+DELETE livewire/message/app.filament.widgets.tickets-by-priority 404 567ms user=48 ip=10.176.16.206 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+POST tickets/205/edit 200 1526ms user=11 ip=10.191.37.33 ua=Symfony,Noise
+GET tickets/205 200 909ms user=guest ip=10.66.184.202 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET settings/general 200 1048ms user=25 ip=10.131.45.219 ua=curl/8.7.1,Noise
+DELETE logs-report 204 1659ms user=30 ip=10.6.54.112 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET filament/assets/echo.js 200 547ms user=88 ip=10.206.196.136 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET api/fake 200 255ms user=12 ip=10.126.38.200 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PATCH livewire/message/tickets 429 1609ms user=34 ip=10.196.44.52 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET livewire/message/app.filament.widgets.tickets-by-priority 400 49ms user=46 ip=10.176.154.22 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PATCH users/create 403 1191ms user=24 ip=10.46.202.218 ua=Symfony,Noise
+GET projects 403 281ms user=50 ip=10.116.162.208 ua=Symfony,Noise
+PATCH tickets 400 982ms user=67 ip=10.201.51.71 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+"Transaction: update `users` set `updated_at` = ?, `status_id` = ? where `id` = ?",Noise
+RuntimeException: Configuration key REDIS_HOST was not loaded,CONFIGURATION
+"ParseError: syntax error, unexpected token ""enum"" in RoleResource.php:87",Error
+Transaction: delete from `roles` where `id` = ? and `deleted_at` is null,Noise
+GET roles 403 929ms user=80 ip=10.36.4.42 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET does-not-exist 405 421ms user=58 ip=10.136.52.8 ua=Symfony,Noise
+"ErrorException: Attempt to read property ""activity"" on null in ActivityResource.php",Error
+POST roles/9/edit 400 504ms user=81 ip=10.141.59.27 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET users/create 404 1546ms user=67 ip=10.161.87.103 ua=Symfony,Noise
+"ErrorException: Attempt to read property ""hours"" on null in TicketTimeLogged.php",Error
+POST livewire/message/tickets 405 899ms user=44 ip=10.196.44.52 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.19.35:443),SYSTEM
+"Transaction: insert into `ticket_comments` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+InvalidArgumentException: Configuration value OIDC_CLIENT_SECRET cannot be blank,CONFIGURATION
+"InvalidArgumentException: Provider option ""urlAuthorize"" must not be empty",CONFIGURATION
+GET users 400 743ms user=74 ip=10.56.170.164 ua=curl/8.7.1,Noise
+InvalidArgumentException: Configuration value DB_DATABASE cannot be blank,CONFIGURATION
+POST ticket-priorities 405 945ms user=42 ip=10.156.218.130 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET livewire/message/tickets 500 1417ms user=46 ip=10.196.136.6 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+BadMethodCallException: Method Filament\Forms\Components\ColorPicker::alphaSlider does not exist.,Error
+PATCH ticket-priorities 200 494ms user=5 ip=10.41.149.107 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+"Transaction: insert into `users` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+PATCH filament/assets/echo.js 500 29ms user=86 ip=10.206.104.182 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PATCH livewire/message/app.filament.widgets.favorite-projects 200 215ms user=guest ip=10.186.168.60 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET tickets 500 723ms user=18 ip=10.86.120.94 ua=curl/8.7.1,Noise
+GET roles/9/edit 200 955ms user=guest ip=10.26.128.50 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+ModelNotFoundException: No query results for model [App\Models\Sprint] 1904,Error
+RuntimeException: Queue worker timed out after 180 seconds while processing App\Jobs\ImportJiraTicketsJob,SYSTEM
+InvalidArgumentException: Invalid timezone identifier: Moon/Base,Error
+ErrorException: file_put_contents(storage/logs/laravel.log): Failed to open stream: No space left on device,SYSTEM
+RuntimeException: Configuration key OIDC_URL_ACCESS_TOKEN was not loaded,CONFIGURATION
+GET users 503 839ms user=68 ip=10.56.124.72 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.109.5:3306),SYSTEM
+"InvalidArgumentException: Provider option ""redirectUri"" must not be empty",CONFIGURATION
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.28.52:9200),SYSTEM
+PATCH users/create 405 1354ms user=79 ip=10.161.179.57 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PATCH login 500 1656ms user=39 ip=10.111.17.143 ua=Symfony,Noise
+GET does-not-exist 302 1035ms user=54 ip=10.136.98.100 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+POST admin 403 713ms user=38 ip=10.216.210.174 ua=curl/8.7.1,Noise
+GET api/fake 404 351ms user=6 ip=10.126.222.108 ua=Symfony,Noise
+InvalidArgumentException: Configuration value REDIS_PORT cannot be blank,CONFIGURATION
+"ErrorException: Attempt to read property ""priority"" on null in TicketPriorityResource.php",Error
+InvalidArgumentException: Configuration value QUEUE_CONNECTION cannot be blank,CONFIGURATION
+RuntimeException: Queue worker stopped after exceeding memory limit of 392 MB,SYSTEM
+GET livewire/message/app.filament.widgets.tickets-by-priority 500 1440ms user=93 ip=10.61.223.45 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+"TypeError: App\Filament\Resources\TicketsByType::summarize(): Argument #1 must be of type Illuminate\Support\Collection, stdClass given",Error
+RuntimeException: Queue worker stopped after exceeding memory limit of 232 MB,SYSTEM
+PATCH users 401 1098ms user=21 ip=10.171.55.49 ua=curl/8.7.1,Noise
+GET ticket-priorities 200 686ms user=89 ip=10.41.57.153 ua=Symfony,Noise
+"Transaction: insert into `ticket_priorities` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+POST users/create 302 318ms user=75 ip=10.161.225.149 ua=curl/8.7.1,Noise
+GET projects 302 1058ms user=5 ip=10.1.185.139 ua=curl/8.7.1,Noise
+"Transaction: insert into `personal_access_tokens` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+PUT livewire/message/app.filament.widgets.tickets-by-priority 304 1344ms user=3 ip=10.61.39.137 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PATCH api/fake 302 773ms user=14 ip=10.126.130.154 ua=curl/8.7.1,Noise
+"TypeError: App\Filament\Resources\ProjectResource::resolveProject(): Argument #1 must be of type App\Models\Project, null given",Error
+GET livewire/message/tickets 200 640ms user=91 ip=10.81.113.75 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET projects/create 401 1314ms user=63 ip=10.221.79.147 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+DELETE livewire/message/tickets 401 381ms user=42 ip=10.196.182.98 ua=Symfony,Noise
+Transaction: delete from `password_reset_tokens` where `id` = ? and `deleted_at` is null,Noise
+GET roles 200 1025ms user=74 ip=10.36.188.180 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET filament/assets/echo.js 204 1420ms user=37 ip=10.91.173.205 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET tickets 200 301ms user=10 ip=10.86.212.48 ua=Symfony,Noise
+PUT filament/assets/echo.js 201 1065ms user=90 ip=10.206.58.90 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+QueryException: SQLSTATE[HY000] [2002] Connection refused (172.16.172.124:9200),SYSTEM
+InvalidArgumentException: Configuration value LOG_CHANNEL cannot be blank,CONFIGURATION
+GET projects/create 200 115ms user=4 ip=10.106.148.170 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET projects/create 204 441ms user=18 ip=10.106.102.78 ua=Symfony,Noise
+PUT api/fake 403 1646ms user=59 ip=10.11.107.223 ua=Symfony,Noise
+Fatal error: Allowed memory size of 2415919104 bytes exhausted (tried to allocate 524288 bytes) in /var/www/html/vendor/laravel/framework/src/Illuminate/View/Factory.php:108,SYSTEM
+Transaction: delete from `jobs` where `id` = ? and `deleted_at` is null,Noise
+GET livewire/message/app.filament.widgets.favorite-projects 204 1443ms user=84 ip=10.186.30.14 ua=curl/8.7.1,Noise
+TransportException: Outlook OAuth token request failed with status 401: invalid_grant,CONFIGURATION
+GET tickets 422 560ms user=59 ip=10.201.143.25 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET livewire/message/app.filament.widgets.favorite-projects 200 570ms user=39 ip=10.71.53.175 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET projects/101/edit 403 1407ms user=66 ip=10.96.226.86 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+POST tickets/205 200 1619ms user=14 ip=10.66.184.202 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+"ParseError: syntax error, unexpected token ""trait"" in PermissionResource.php:51",Error
+DELETE tickets/205/edit 200 1334ms user=23 ip=10.191.129.217 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+InvalidArgumentException: View [filament.resources.permission.matrix] not found.,Error
+POST tickets 200 1596ms user=63 ip=10.201.97.163 ua=Symfony,Noise
+DELETE livewire/message/app.filament.widgets.favorite-projects 403 474ms user=45 ip=10.71.99.37 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PATCH does-not-exist 200 517ms user=52 ip=10.136.6.146 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PATCH settings/general 404 1307ms user=74 ip=10.16.206.196 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+DELETE admin 401 358ms user=91 ip=10.101.95.59 ua=curl/8.7.1,Noise
+InvalidArgumentException: Configuration value SESSION_DOMAIN cannot be blank,CONFIGURATION
+"ParseError: syntax error, unexpected token ""namespace"" in TicketCommentResource.php:64",Error
+UnderflowException: Cannot remove the first breadcrumb from an empty trail,Error
+ModelNotFoundException: No query results for model [App\Models\TicketPriority] 3028,Error
+LogicException: Route [filament.resources.timesheets.view] not defined.,Error
+GET projects/create 404 374ms user=53 ip=10.221.79.147 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET ticket-priorities 403 235ms user=52 ip=10.156.218.130 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+POST projects 200 1480ms user=13 ip=10.1.93.185 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+DELETE admin 304 195ms user=36 ip=10.216.118.220 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PUT users/create 503 577ms user=28 ip=10.46.156.126 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET projects 405 444ms user=9 ip=10.1.139.47 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+POST tickets/205 201 132ms user=69 ip=10.181.161.41 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PUT admin 200 809ms user=32 ip=10.216.164.82 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+RuntimeException: SMTP transport configuration is missing MAIL_PORT,CONFIGURATION
+Fatal error: Allowed memory size of 1207959552 bytes exhausted (tried to allocate 3145728 bytes) in /var/www/html/vendor/laravel/framework/src/Illuminate/View/Factory.php:106,SYSTEM
+GET tickets/205/edit 405 1593ms user=72 ip=10.76.60.194 ua=curl/8.7.1,Noise
+GET api/fake 304 1128ms user=57 ip=10.11.15.39 ua=curl/8.7.1,Noise
+"RuntimeException: SMTP transport configuration is missing MAIL_HOST, MAIL_USERNAME",CONFIGURATION
+RuntimeException: Queue worker stopped after exceeding memory limit of 216 MB,SYSTEM
+Transaction: delete from `ticket_statuses` where `id` = ? and `deleted_at` is null,Noise
+PATCH users/create 400 1028ms user=65 ip=10.161.225.149 ua=curl/8.7.1,Noise
+RuntimeException: Configuration key OIDC_URL_RESOURCE_OWNER_DETAILS was not loaded,CONFIGURATION
+GET api/fake 204 965ms user=2 ip=10.126.38.200 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+BadMethodCallException: Method Filament\Forms\Components\TextColumn::badgeIcon does not exist.,Error
+GET roles 429 152ms user=29 ip=10.151.211.111 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+OutOfBoundsException: Undefined offset: assignee_id,Error
+POST roles/9/edit 302 341ms user=26 ip=10.26.82.188 ua=Symfony,Noise
+BadMethodCallException: Method Filament\Forms\Components\TextInput::telRegex does not exist.,Error
+InvalidArgumentException: Configuration value OIDC_URL_AUTHORIZE cannot be blank,CONFIGURATION
+Transaction: delete from `activities` where `id` = ? and `deleted_at` is null,Noise
+PATCH does-not-exist 200 354ms user=93 ip=10.21.29.77 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PUT admin 200 972ms user=87 ip=10.101.141.151 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+DELETE ticket-statuses/create 405 660ms user=51 ip=10.51.163.145 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PUT ticket-priorities 304 1367ms user=50 ip=10.156.126.176 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PUT projects/101/edit 401 1599ms user=54 ip=10.96.134.132 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PUT login 200 716ms user=guest ip=10.111.17.143 ua=Symfony,Noise
+POST settings/general 401 597ms user=84 ip=10.16.206.196 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PATCH api/fake 201 610ms user=55 ip=10.11.153.85 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+"UnexpectedValueException: Invalid configuration value for cache.stores.redis.connection: ""missing""",CONFIGURATION
+GET admin 201 1327ms user=34 ip=10.216.26.36 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: Configuration key DB_DATABASE was not loaded,CONFIGURATION
+InvalidArgumentException: Configuration value OIDC_URL_RESOURCE_OWNER_DETAILS cannot be blank,CONFIGURATION
+InvalidArgumentException: Configuration value OUTLOOK_MAIL_CLIENT_ID cannot be blank,CONFIGURATION
+ErrorException: Undefined variable $timeline in view tickets.form,Error
+POST ticket-statuses/create 422 1015ms user=94 ip=10.166.48.30 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET ticket-statuses/create 204 919ms user=4 ip=10.166.94.122 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+POST login 401 620ms user=35 ip=10.111.63.5 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET api/fake 422 514ms user=61 ip=10.11.199.177 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+"Transaction: insert into `activities` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.35.43:443),SYSTEM
+RuntimeException: Queue worker timed out after 90 seconds while processing App\Jobs\ImportJiraTicketsJob,SYSTEM
+PUT livewire/message/app.filament.widgets.favorite-projects 302 1251ms user=96 ip=10.186.122.198 ua=Symfony,Noise
+GET livewire/message/app.filament.widgets.favorite-projects 405 1184ms user=35 ip=10.71.99.37 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+InvalidArgumentException: Configuration value OUTLOOK_MAIL_CLIENT_SECRET cannot be blank,CONFIGURATION
+"ParseError: syntax error, unexpected token ""??"" in SprintResource.php:77",Error
+PATCH filament/assets/echo.js 422 1516ms user=31 ip=10.91.127.113 ua=Symfony,Noise
+GET login 200 1234ms user=31 ip=10.111.109.97 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+RuntimeException: Configuration key OIDC_CLIENT_ID was not loaded,CONFIGURATION
+RuntimeException: Queue worker stopped after exceeding memory limit of 456 MB,SYSTEM
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.82.154:6379),SYSTEM
+TransportException: Outlook OAuth token request failed with status 422: invalid_tenant,CONFIGURATION
+"UnexpectedValueException: Invalid configuration value for services.oidc.redirect_uri: ""not-a-url""",CONFIGURATION
+PATCH settings/general 422 1470ms user=33 ip=10.131.183.35 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PUT does-not-exist 401 1553ms user=56 ip=10.136.190.54 ua=curl/8.7.1,Noise
+InvalidArgumentException: Configuration value OUTLOOK_MAIL_TENANT cannot be blank,CONFIGURATION
+DELETE tickets/205/edit 200 1171ms user=guest ip=10.76.152.148 ua=Symfony,Noise
+GET filament/assets/echo.js 503 384ms user=33 ip=10.91.219.67 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET projects/101/edit 201 371ms user=62 ip=10.96.42.178 ua=Symfony,Noise
+"Transaction: update `jobs` set `updated_at` = ?, `status_id` = ? where `id` = ?",Noise
+GET logs-report 200 431ms user=guest ip=10.6.192.158 ua=Symfony,Noise
+DELETE settings/general 302 79ms user=82 ip=10.16.114.12 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+DELETE users 201 1520ms user=29 ip=10.171.193.95 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+LogicException: Route [filament.resources.roles.edit] not defined.,Error
+GET roles 503 862ms user=19 ip=10.151.211.111 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: SMTP transport configuration is missing MAIL_PASSWORD,CONFIGURATION
+InvalidArgumentException: Configuration value MAIL_USERNAME cannot be blank,CONFIGURATION
+GET livewire/message/app.filament.widgets.favorite-projects 429 1347ms user=90 ip=10.186.76.106 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PATCH livewire/message/app.filament.widgets.tickets-by-priority 503 145ms user=40 ip=10.176.108.160 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+POST tickets 200 1433ms user=guest ip=10.86.120.94 ua=curl/8.7.1,Noise
+"RuntimeException: SMTP transport configuration is missing MAIL_HOST, MAIL_PORT, MAIL_PASSWORD",CONFIGURATION
+RuntimeException: Queue worker stopped after exceeding memory limit of 136 MB,SYSTEM
+GET ticket-priorities 500 1463ms user=44 ip=10.156.80.84 ua=curl/8.7.1,Noise
+RuntimeException: Configuration key CACHE_STORE was not loaded,CONFIGURATION
+GET login 200 524ms user=41 ip=10.111.109.97 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+RuntimeException: Queue worker stopped after exceeding memory limit of 360 MB,SYSTEM
+PUT settings/general 200 693ms user=guest ip=10.16.160.104 ua=curl/8.7.1,Noise
+GET logs-report 500 268ms user=79 ip=10.121.215.89 ua=curl/8.7.1,Noise
+DELETE tickets/205 503 1101ms user=12 ip=10.66.92.18 ua=Symfony,Noise
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.100.188:9200),SYSTEM
+RuntimeException: Configuration key S3_BUCKET was not loaded,CONFIGURATION
+GET users 302 580ms user=19 ip=10.171.193.95 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.8.192:9200),SYSTEM
+LogicException: Route [filament.resources.ticket-types.create] not defined.,Error
+RuntimeException: Configuration key FILESYSTEM_DISK was not loaded,CONFIGURATION
+DELETE login 400 265ms user=88 ip=10.226.178.120 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+ErrorException: Undefined variable $tickets in view tickets.form,Error
+"Transaction: update `tickets` set `updated_at` = ?, `status_id` = ? where `id` = ?",Noise
+DELETE activities 405 683ms user=2 ip=10.146.20.184 ua=curl/8.7.1,Noise
+BadMethodCallException: Method Filament\Forms\Components\DatePicker::weekStartsOn does not exist.,Error
+Fatal error: Allowed memory size of 150994944 bytes exhausted (tried to allocate 1048576 bytes) in /var/www/html/vendor/laravel/framework/src/Illuminate/View/Factory.php:101,SYSTEM
+InvalidArgumentException: Configuration value APP_FORCE_HTTPS cannot be blank,CONFIGURATION
+Transaction: delete from `model_has_roles` where `id` = ? and `deleted_at` is null,Noise
+GET ticket-statuses/create 304 1629ms user=90 ip=10.166.94.122 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+RangeException: Sprint capacity percentage must be between 0 and 100,Error
+Fatal error: Allowed memory size of 1811939328 bytes exhausted (tried to allocate 6291456 bytes) in /var/www/html/vendor/laravel/framework/src/Illuminate/View/Factory.php:107,SYSTEM
+DELETE api/fake 429 869ms user=8 ip=10.126.84.62 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PUT api/fake 400 1483ms user=4 ip=10.126.130.154 ua=curl/8.7.1,Noise
+TransportException: Outlook OAuth token request failed with status 403: unauthorized_client,CONFIGURATION
+QueryException: SQLSTATE[HY000] [2002] Connection refused (172.16.145.73:3306),SYSTEM
+DivisionByZeroError: Division by zero while computing sprint burndown ratio,Error
+Fatal error: Allowed memory size of 452984832 bytes exhausted (tried to allocate 6291456 bytes) in /var/www/html/vendor/laravel/framework/src/Illuminate/View/Factory.php:103,SYSTEM
+GET does-not-exist 200 1649ms user=guest ip=10.136.144.192 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+"ErrorException: Attempt to read property ""status"" on null in TicketStatusResource.php",Error
+"InvalidArgumentException: Provider option ""urlAccessToken"" must not be empty",CONFIGURATION
+QueryException: SQLSTATE[HY000] [2002] Connection timed out (172.16.190.158:6379),SYSTEM
+"RuntimeException: OIDC login cannot start because ""clientSecret"" is not configured",CONFIGURATION
+QueryException: SQLSTATE[HY000] [2002] Connection refused (172.16.37.69:3306),SYSTEM
+PUT livewire/message/tickets 204 1158ms user=93 ip=10.81.205.29 ua=curl/8.7.1,Noise
+"UnexpectedValueException: Invalid configuration value for services.outlook_mail.tenant: """"",CONFIGURATION
+GET livewire/message/app.filament.widgets.favorite-projects 503 1510ms user=49 ip=10.71.53.175 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET settings/general 200 1211ms user=80 ip=10.16.22.58 ua=Symfony,Noise
+"Transaction: insert into `password_reset_tokens` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+QueryException: SQLSTATE[HY000] [2002] Connection refused (172.16.10.18:6379),SYSTEM
+DELETE ticket-priorities 404 590ms user=95 ip=10.41.103.15 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PATCH login 422 1493ms user=80 ip=10.226.40.74 ua=curl/8.7.1,Noise
+LogicException: Route [filament.resources.permissions.view] not defined.,Error
+DELETE projects/create 429 892ms user=55 ip=10.221.171.101 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET admin 500 291ms user=30 ip=10.216.72.128 ua=Symfony,Noise
+RuntimeException: SMTP transport configuration is missing MAIL_USERNAME,CONFIGURATION
+GET projects/create 422 537ms user=12 ip=10.106.56.216 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET activities 304 1105ms user=10 ip=10.146.158.230 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PUT livewire/message/app.filament.widgets.tickets-by-priority 204 1181ms user=44 ip=10.176.62.68 ua=Symfony,Noise
+PUT tickets/205 405 228ms user=63 ip=10.181.115.179 ua=curl/8.7.1,Noise
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.89.145:3306),SYSTEM
+POST roles 304 411ms user=78 ip=10.36.142.88 ua=Symfony,Noise
+ErrorException: Undefined variable $columns in view tickets.form,Error
+GET users 403 1453ms user=64 ip=10.56.170.164 ua=curl/8.7.1,Noise
+GET roles/9/edit 200 1118ms user=77 ip=10.141.105.119 ua=curl/8.7.1,Noise
+"UnexpectedValueException: Invalid configuration value for database.connections.mysql.port: ""zero""",CONFIGURATION
+GET livewire/message/app.filament.widgets.tickets-by-priority 302 1536ms user=87 ip=10.61.177.183 ua=Symfony,Noise
+AuthorizationException: This action is unauthorized for archived projects.,Error
+BadMethodCallException: Method Filament\Forms\Components\Repeater::cloneLabel does not exist.,Error
+GET activities 200 779ms user=92 ip=10.146.204.92 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET tickets/205 422 36ms user=75 ip=10.181.207.133 ua=Symfony,Noise
+BadMethodCallException: Method Filament\Forms\Components\Select::disablePlaceholderSelection does not exist.,Error
+POST livewire/message/app.filament.widgets.favorite-projects 404 829ms user=88 ip=10.186.214.152 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET roles/9/edit 304 696ms user=69 ip=10.141.197.73 ua=Symfony,Noise
+GET projects/101/edit 429 630ms user=15 ip=10.211.203.155 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+PUT projects/create 405 182ms user=65 ip=10.221.171.101 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+ModelNotFoundException: No query results for model [App\Models\TicketComment] 2602,Error
+DELETE users/create 200 1287ms user=18 ip=10.46.156.126 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET login 503 361ms user=82 ip=10.226.132.28 ua=Symfony,Noise
+InvalidArgumentException: Configuration value REDIS_HOST cannot be blank,CONFIGURATION
+RuntimeException: Queue worker stopped after exceeding memory limit of 328 MB,SYSTEM
+DELETE projects 422 799ms user=52 ip=10.116.24.162 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+GET roles 200 1188ms user=33 ip=10.151.165.19 ua=curl/8.7.1,Noise
+"Transaction: insert into `model_has_roles` (`created_at`, `updated_at`, `name`) values (?, ?, ?)",Noise
+GET projects 429 607ms user=64 ip=10.116.116.116 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PATCH ticket-statuses/create 200 238ms user=guest ip=10.51.25.99 ua=curl/8.7.1,Noise
+GET livewire/message/app.filament.widgets.favorite-projects 401 119ms user=2 ip=10.186.214.152 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.181.141:3306),SYSTEM
+InvalidArgumentException: Configuration value FILESYSTEM_DISK cannot be blank,CONFIGURATION
+GET tickets 404 1500ms user=69 ip=10.201.143.25 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+LogicException: Route [filament.pages.audit-log] not defined.,Error
+PUT settings/general 500 530ms user=23 ip=10.131.183.35 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+ModelNotFoundException: No query results for model [App\Models\Project] 8003,Error
+InvalidArgumentException: Configuration value OIDC_CLIENT_ID cannot be blank,CONFIGURATION
+Transaction: delete from `projects` where `id` = ? and `deleted_at` is null,Noise
+GET projects/101/edit 400 1244ms user=11 ip=10.211.19.17 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+POST users/create 201 155ms user=20 ip=10.46.18.80 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+DELETE api/fake 405 706ms user=49 ip=10.11.107.223 ua=Symfony,Noise
+RuntimeException: Configuration key APP_KEY was not loaded,CONFIGURATION
+DELETE login 302 102ms user=33 ip=10.111.201.51 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+RuntimeException: Queue worker timed out after 120 seconds while processing App\Jobs\ImportJiraTicketsJob,SYSTEM
+QueryException: SQLSTATE[HY000] [08006] server closed the connection unexpectedly (172.16.154.90:6379),SYSTEM
+InvalidArgumentException: View [filament.resources.project.hours] not found.,Error
+GET does-not-exist 201 872ms user=95 ip=10.21.121.31 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+PATCH projects/create 201 633ms user=6 ip=10.106.10.124 ua=curl/8.7.1,Noise
+GET users/create 200 1095ms user=30 ip=10.46.18.80 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+Fatal error: Allowed memory size of 905969664 bytes exhausted (tried to allocate 1048576 bytes) in /var/www/html/vendor/laravel/framework/src/Illuminate/View/Factory.php:105,SYSTEM
+POST admin 400 550ms user=79 ip=10.101.3.105 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+"UnexpectedValueException: Invalid configuration value for app.timezone: ""Mars/Colony""",CONFIGURATION
+"UnexpectedValueException: Invalid configuration value for mail.mailers.smtp.encryption: ""ssl2""",CONFIGURATION
+TransportException: Outlook OAuth token request failed with status 401: invalid_client,CONFIGURATION
+ErrorException: Undefined variable $defaultStatus in view tickets.form,Error
+PATCH does-not-exist 204 680ms user=11 ip=10.21.213.215 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+LogicException: Cannot serialize relation manager closure for table action,Error
+GET logs-report 401 882ms user=75 ip=10.121.31.181 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+GET ticket-priorities 302 1012ms user=7 ip=10.41.11.61 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+"ErrorException: Attempt to read property ""comment"" on null in TicketCommentResource.php",Error
+PUT livewire/message/tickets 200 995ms user=38 ip=10.196.228.190 ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36,Noise
+GET roles 400 766ms user=25 ip=10.151.27.203 ua=Symfony,Noise
+PUT ticket-statuses/create 400 1437ms user=6 ip=10.166.186.76 ua=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36,Noise
+QueryException: SQLSTATE[HY000] [2002] Connection refused (172.16.80.128:9200),SYSTEM
+DELETE users 200 1194ms user=guest ip=10.171.9.187 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PATCH projects/create 302 796ms user=61 ip=10.221.217.193 ua=Symfony,Noise
+"TypeError: App\Filament\Resources\TicketResource::mutateFormDataBeforeSave(): Argument #1 must be of type array, null given",Error
+GET filament/assets/echo.js 429 1324ms user=43 ip=10.91.219.67 ua=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36,Noise
+PATCH admin 429 1586ms user=83 ip=10.101.187.13 ua=Symfony,Noise

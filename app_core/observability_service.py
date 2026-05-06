@@ -803,6 +803,133 @@ class ObservabilityService:
 
     def build_local_grafana_dashboard_json(self, hosting_meta: dict, training_meta: dict, tracking_console_url: str = "", tracking_console_note: str = "") -> str:
         datasource = {"type": "prometheus", "uid": "local-prometheus"}
+
+        def stat_panel(
+            panel_id: int,
+            title: str,
+            expr: str,
+            grid_pos: dict[str, int],
+            unit: str = "short",
+            decimals: int | None = None,
+            color_mode: str = "value",
+            mappings: list[dict[str, Any]] | None = None,
+            thresholds: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            field_config: dict[str, Any] = {
+                "defaults": {
+                    "color": {"mode": "thresholds"},
+                    "unit": unit,
+                    "mappings": mappings or [],
+                    "thresholds": thresholds
+                    or {
+                        "mode": "absolute",
+                        "steps": [
+                            {"color": "green", "value": None},
+                        ],
+                    },
+                },
+                "overrides": [],
+            }
+            if decimals is not None:
+                field_config["defaults"]["decimals"] = decimals
+            return {
+                "id": panel_id,
+                "type": "stat",
+                "title": title,
+                "datasource": datasource,
+                "gridPos": grid_pos,
+                "fieldConfig": field_config,
+                "options": {
+                    "colorMode": color_mode,
+                    "graphMode": "area",
+                    "justifyMode": "auto",
+                    "orientation": "auto",
+                    "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
+                    "textMode": "auto",
+                },
+                "targets": [{"expr": expr, "instant": True, "refId": "A"}],
+            }
+
+        def timeseries_panel(
+            panel_id: int,
+            title: str,
+            expr: str,
+            grid_pos: dict[str, int],
+            unit: str = "short",
+            decimals: int | None = None,
+            legend_format: str = "{{method}} {{path}} {{status}}",
+        ) -> dict[str, Any]:
+            defaults: dict[str, Any] = {
+                "color": {"mode": "palette-classic"},
+                "custom": {
+                    "axisBorderShow": False,
+                    "axisCenteredZero": False,
+                    "axisColorMode": "text",
+                    "axisLabel": "",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "hideFrom": {"legend": False, "tooltip": False, "viz": False},
+                    "insertNulls": False,
+                    "lineInterpolation": "linear",
+                    "lineWidth": 2,
+                    "pointSize": 4,
+                    "scaleDistribution": {"type": "linear"},
+                    "showPoints": "never",
+                    "spanNulls": False,
+                    "stacking": {"group": "A", "mode": "none"},
+                    "thresholdsStyle": {"mode": "off"},
+                },
+                "mappings": [],
+                "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": None}]},
+                "unit": unit,
+            }
+            if decimals is not None:
+                defaults["decimals"] = decimals
+            return {
+                "id": panel_id,
+                "type": "timeseries",
+                "title": title,
+                "datasource": datasource,
+                "gridPos": grid_pos,
+                "fieldConfig": {"defaults": defaults, "overrides": []},
+                "options": {
+                    "legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": True},
+                    "tooltip": {"mode": "multi", "sort": "none"},
+                },
+                "targets": [{"expr": expr, "legendFormat": legend_format, "refId": "A"}],
+            }
+
+        def table_panel(panel_id: int, title: str, expr: str, grid_pos: dict[str, int]) -> dict[str, Any]:
+            return {
+                "id": panel_id,
+                "type": "table",
+                "title": title,
+                "datasource": datasource,
+                "gridPos": grid_pos,
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "thresholds"},
+                        "custom": {
+                            "align": "auto",
+                            "cellOptions": {"type": "auto"},
+                            "inspect": False,
+                        },
+                        "mappings": [],
+                        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": None}]},
+                    },
+                    "overrides": [],
+                },
+                "options": {
+                    "cellHeight": "sm",
+                    "footer": {"countRows": False, "fields": "", "reducer": ["sum"], "show": False},
+                    "showHeader": True,
+                },
+                "targets": [{"expr": expr, "format": "table", "instant": True, "refId": "A"}],
+            }
+
         api_url = clean_optional_string(hosting_meta.get("api_url"))
         api_home_url = api_url[:-8] if api_url.endswith("/predict") else api_url
         health_url = clean_optional_string(hosting_meta.get("health_url"))
@@ -847,8 +974,84 @@ class ObservabilityService:
             "editable": False,
             "graphTooltip": 0,
             "panels": [
-                {"id": 1, "type": "stat", "title": "Prediction Requests", "datasource": datasource, "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}, "targets": [{"expr": "sum(log_monitor_predictions_total)", "instant": True, "refId": "A"}]},
-                {"id": 8, "type": "text", "title": "Service Notes", "gridPos": {"h": 8, "w": 14, "x": 10, "y": 12}, "options": {"mode": "markdown", "content": "\n".join(details_lines)}},
+                stat_panel(
+                    1,
+                    "API Up",
+                    "max(log_monitor_api_up) or vector(0)",
+                    {"h": 4, "w": 4, "x": 0, "y": 0},
+                    mappings=[
+                        {"options": {"0": {"color": "red", "index": 0, "text": "Down"}, "1": {"color": "green", "index": 1, "text": "Up"}}, "type": "value"}
+                    ],
+                    thresholds={"mode": "absolute", "steps": [{"color": "red", "value": None}, {"color": "green", "value": 1}]},
+                ),
+                stat_panel(
+                    2,
+                    "Model Loaded",
+                    "max(log_monitor_model_loaded) or vector(0)",
+                    {"h": 4, "w": 4, "x": 4, "y": 0},
+                    mappings=[
+                        {"options": {"0": {"color": "red", "index": 0, "text": "No"}, "1": {"color": "green", "index": 1, "text": "Yes"}}, "type": "value"}
+                    ],
+                    thresholds={"mode": "absolute", "steps": [{"color": "red", "value": None}, {"color": "green", "value": 1}]},
+                ),
+                stat_panel(
+                    3,
+                    "HTTP Requests",
+                    "sum(log_monitor_http_requests_total) or vector(0)",
+                    {"h": 4, "w": 4, "x": 8, "y": 0},
+                ),
+                stat_panel(
+                    4,
+                    "Prediction Responses",
+                    "sum(log_monitor_predictions_total) or vector(0)",
+                    {"h": 4, "w": 4, "x": 12, "y": 0},
+                ),
+                stat_panel(
+                    5,
+                    "Avg Latency",
+                    "(sum(rate(log_monitor_request_duration_seconds_sum[5m])) / sum(rate(log_monitor_request_duration_seconds_count[5m]))) or vector(0)",
+                    {"h": 4, "w": 4, "x": 16, "y": 0},
+                    unit="s",
+                    decimals=4,
+                ),
+                stat_panel(
+                    6,
+                    "Process Uptime",
+                    "max(log_monitor_process_uptime_seconds) or vector(0)",
+                    {"h": 4, "w": 4, "x": 20, "y": 0},
+                    unit="s",
+                    decimals=0,
+                ),
+                timeseries_panel(
+                    7,
+                    "HTTP Request Rate",
+                    "sum by (method, path, status) (rate(log_monitor_http_requests_total[5m]))",
+                    {"h": 8, "w": 12, "x": 0, "y": 4},
+                    unit="reqps",
+                    decimals=3,
+                ),
+                timeseries_panel(
+                    8,
+                    "Average Request Latency",
+                    "sum by (method, path) (rate(log_monitor_request_duration_seconds_sum[5m])) / sum by (method, path) (rate(log_monitor_request_duration_seconds_count[5m]))",
+                    {"h": 8, "w": 12, "x": 12, "y": 4},
+                    unit="s",
+                    decimals=4,
+                    legend_format="{{method}} {{path}}",
+                ),
+                table_panel(
+                    9,
+                    "HTTP Requests By Route",
+                    "sum by (method, path, status) (log_monitor_http_requests_total)",
+                    {"h": 8, "w": 12, "x": 0, "y": 12},
+                ),
+                table_panel(
+                    10,
+                    "Predictions By Class",
+                    "sum by (prediction) (log_monitor_predictions_total)",
+                    {"h": 8, "w": 12, "x": 12, "y": 12},
+                ),
+                {"id": 11, "type": "text", "title": "Service Notes", "gridPos": {"h": 10, "w": 24, "x": 0, "y": 20}, "options": {"mode": "markdown", "content": "\n".join(details_lines)}},
             ],
             "templating": {"list": []},
         }

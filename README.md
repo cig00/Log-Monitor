@@ -309,9 +309,9 @@ Printed training output includes:
 Use the `Hosting` section:
 
 - `Generated Model`: select the trained model directory
-- `Gate Golden Set`: labeled CSV used as the deployment acceptance gate (`LogMessage` + `class`, with common aliases accepted)
+- `Gate Golden Set`: optional labeled CSV used as the deployment acceptance gate (`LogMessage` + `class`, with common aliases accepted); leave blank to skip the deployment gate
 - `Gate Policy`: JSON thresholds (`gates/deployment_policy.json` by default)
-- `Drift Golden Set`: labeled CSV used for drift monitoring baseline checks
+- `Drift Golden Set`: optional labeled CSV used for drift monitoring baseline checks; leave blank to skip the drift baseline
 - `Drift Policy`: JSON warning/critical drift thresholds (`gates/drift_policy.json` by default)
 - `Available Models`: review and select discovered local versioned models, latest local output, downloaded models, or the current manual selection
 - `Host Target`:
@@ -337,7 +337,9 @@ The app resolves the actual model directory by searching for:
   - `model.safetensors`
   - `tf_model.h5`
 
-Before deployment starts, the app evaluates the selected model against the golden set and blocks deployment if thresholds are not met.
+Before deployment starts, the app evaluates the selected model against the golden set and blocks deployment if thresholds are not met. If no gate golden set is provided, deployment gate evaluation is skipped.
+
+The repo includes `gates/deployment_golden.csv` as the default artificial deployment gate set. The default deployment policy is calibrated for this balanced, hard 320-row golden set with 80 rows per class. Recalibrate `gates/deployment_policy.json` if the deployment golden-set distribution changes materially.
 
 Deployment gate outputs are written to:
 
@@ -347,7 +349,9 @@ Deployment gate outputs are written to:
 
 Gate PASS evaluations are cached by `model_hash + golden_set_hash + policy_hash` and reused automatically.
 
-After deployment succeeds, observability runs a drift-monitoring baseline against the configured drift golden set and stores results in:
+The repo includes `gates/drift_golden.csv` as the default artificial drift-monitoring golden set. The default drift policy is calibrated for this 500-row production-like golden set with Noise as the majority class and explicit minority-class recall checks. Recalibrate `gates/drift_policy.json` when the drift golden-set mix changes.
+
+After deployment succeeds, observability runs a drift-monitoring baseline against the configured drift golden set and stores results in the paths below. If no drift golden set is provided, drift baseline evaluation is skipped.
 
 - `outputs/drift_monitoring/<deployment>/drift_eval_<timestamp>.json`
 - `outputs/drift_monitoring/<deployment>/drift_eval_<timestamp>_predictions.csv`
@@ -513,9 +517,9 @@ Local runtime policy:
 - `Branch`
 - `Create PR`: after hosting succeeds, create a GitHub Copilot coding-agent task in the selected repo/branch to add async log forwarding to the created endpoint
 - `Generated Model`
-- `Gate Golden Set`
+- `Gate Golden Set` (optional; blank skips the deployment gate)
 - `Gate Policy`
-- `Drift Golden Set`
+- `Drift Golden Set` (optional; blank skips the drift baseline)
 - `Drift Policy`
 - `Host Target`
 - Azure-host-only fields:
@@ -731,6 +735,7 @@ After successful local hosting, the app opens a local dashboard page at:
 The local dashboard:
 
 - summarizes hosted API information
+- visualizes Prometheus metrics for API up/model-loaded state, HTTP request totals, prediction totals, request rate, average latency, process uptime, route/status totals, and prediction class totals
 - shows training metadata if it can find `last_training_mlflow.json`
 - shows the hosted model version when known
 - lists discovered available models from local version archives and downloaded bundles

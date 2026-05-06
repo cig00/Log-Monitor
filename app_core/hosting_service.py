@@ -512,7 +512,13 @@ class HostingService:
                 "reason": "Azure hosting used a registered Azure ML model, so no local model directory was available for drift baseline evaluation.",
             }
             return
-        drift_golden = clean_optional_string(request.drift_golden_path) or "gates/drift_golden.csv"
+        drift_golden = clean_optional_string(request.drift_golden_path)
+        if not drift_golden:
+            result["drift_monitoring"] = {
+                "status": "skipped",
+                "reason": "No drift golden set was provided.",
+            }
+            return
         drift_policy = clean_optional_string(request.drift_policy_path) or "gates/drift_policy.json"
         deployment_id = clean_optional_string(result.get("endpoint_name")) or clean_optional_string(result.get("api_url"))
         service_kind = clean_optional_string(request.azure_service) if request.mode == "azure" else "local"
@@ -603,6 +609,8 @@ class HostingService:
                 "progress",
                 "Skipping local deployment gate because Azure hosting is using a registered Azure ML model.",
             )
+        elif not clean_optional_string(request.deployment_gate_golden_path):
+            ctx.emit("progress", "Skipping deployment gate because no gate golden set was provided.")
         else:
             gate_payload = self._enforce_deployment_gate(ctx, request)
         if request.mode == "azure":

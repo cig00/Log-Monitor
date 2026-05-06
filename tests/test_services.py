@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib.util
 import json
 import sys
@@ -7,6 +8,7 @@ import tempfile
 import types
 import unittest
 import zipfile
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -232,6 +234,75 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("Copilot prompt version: abc123 (abc123full)", prompt)
         self.assertIn("Azure ML Studio endpoint page", body)
         self.assertIn(studio_url, body)
+
+    def test_local_grafana_dashboard_includes_prometheus_metric_panels(self):
+        dashboard = json.loads(
+            self.observability.build_local_grafana_dashboard_json(
+                hosting_meta={
+                    "api_url": "http://127.0.0.1:8000/predict",
+                    "health_url": "http://127.0.0.1:8000/health",
+                    "metrics_url": "http://127.0.0.1:8000/metrics",
+                    "prometheus_url": "http://127.0.0.1:9090",
+                    "grafana_url": "http://127.0.0.1:3000",
+                    "model_version_id": "model-v1",
+                },
+                training_meta={"experiment_name": "local", "backend": "local"},
+            )
+        )
+
+        panel_titles = {panel["title"] for panel in dashboard["panels"]}
+        self.assertEqual(
+            {
+                "API Up",
+                "Model Loaded",
+                "HTTP Requests",
+                "Prediction Responses",
+                "Avg Latency",
+                "Process Uptime",
+                "HTTP Request Rate",
+                "Average Request Latency",
+                "HTTP Requests By Route",
+                "Predictions By Class",
+                "Service Notes",
+            },
+            panel_titles,
+        )
+        panel_json = json.dumps(dashboard)
+        for metric_name in [
+            "log_monitor_api_up",
+            "log_monitor_model_loaded",
+            "log_monitor_http_requests_total",
+            "log_monitor_predictions_total",
+            "log_monitor_request_duration_seconds_sum",
+            "log_monitor_request_duration_seconds_count",
+            "log_monitor_process_uptime_seconds",
+        ]:
+            self.assertIn(metric_name, panel_json)
+
+    def test_default_golden_sets_match_policy_calibration(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        expected = {
+            repo_root / "gates" / "deployment_golden.csv": {
+                "rows": 320,
+                "labels": {"CONFIGURATION": 80, "SYSTEM": 80, "Error": 80, "Noise": 80},
+            },
+            repo_root / "gates" / "drift_golden.csv": {
+                "rows": 500,
+                "labels": {"CONFIGURATION": 80, "SYSTEM": 60, "Error": 60, "Noise": 300},
+            },
+        }
+
+        for path, expectation in expected.items():
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file(), f"Missing default golden set: {path}")
+                with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    rows = list(reader)
+
+                self.assertEqual(["LogMessage", "class"], reader.fieldnames)
+                self.assertEqual(expectation["rows"], len(rows))
+                self.assertEqual(expectation["labels"], dict(Counter(row["class"] for row in rows)))
+                self.assertTrue(all(row["LogMessage"].strip() for row in rows))
 
     def test_hosting_copilot_pr_task_uses_studio_url_and_logs_prompt_version(self):
         studio_url = "https://ml.azure.com/endpoints?wsid=abc&tid=tenant&reloadCount=1"
@@ -1587,7 +1658,11 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["settings"]["LOGMONITOR_MONITORING_STATE_BLOB"], "monitoring/prediction-summary-state.json")
 
     def test_hosting_run_blocks_when_gate_fails(self):
-        request = HostingRequest(model_dir=str(self.project_dir), mode="local")
+        request = HostingRequest(
+            model_dir=str(self.project_dir),
+            mode="local",
+            deployment_gate_golden_path=str(self.project_dir / "gates" / "deployment_golden.csv"),
+        )
         ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
         with mock.patch.object(self.hosting, "_enforce_deployment_gate", side_effect=RuntimeError("gate failed")), mock.patch.object(
             self.hosting,
@@ -1598,7 +1673,11 @@ class ServiceTests(unittest.TestCase):
         local_host_mock.assert_not_called()
 
     def test_hosting_run_attaches_gate_summary_when_gate_passes(self):
-        request = HostingRequest(model_dir=str(self.project_dir), mode="local")
+        request = HostingRequest(
+            model_dir=str(self.project_dir),
+            mode="local",
+            deployment_gate_golden_path=str(self.project_dir / "gates" / "deployment_golden.csv"),
+        )
         ctx = SimpleNamespace(emit=lambda *args, **kwargs: None)
         gate_payload = {
             "gate_pass": True,
@@ -1624,6 +1703,23 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("Deployment gate: PASS", result["message"])
         self.assertIn("Deployment gate: PASS", result["summary"])
         self.assertEqual(result["gate"]["sample_count"], 4)
+
+    def test_hosting_run_skips_gate_and_drift_when_golden_sets_are_blank(self):
+        request = HostingRequest(model_dir=str(self.project_dir), mode="local")
+        emitted = []
+        ctx = SimpleNamespace(emit=lambda _kind, message: emitted.append(message))
+        with mock.patch.object(self.hosting, "_enforce_deployment_gate") as gate_mock, mock.patch.object(
+            self.hosting,
+            "_run_local_hosting",
+            return_value={"operation": "hosting", "message": "Local stack is ready.", "summary": "Local stack is ready."},
+        ) as local_host_mock:
+            result = self.hosting._run(ctx, request)
+
+        gate_mock.assert_not_called()
+        local_host_mock.assert_called_once()
+        self.assertEqual(result["drift_monitoring"]["status"], "skipped")
+        self.assertIn("No drift golden set", result["drift_monitoring"]["reason"])
+        self.assertTrue(any("Skipping deployment gate" in message for message in emitted))
 
     def test_hosting_run_skips_local_gate_for_azure_registered_model(self):
         request = HostingRequest(

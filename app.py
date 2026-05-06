@@ -151,9 +151,9 @@ class LogProcessorApp:
         default_drift_golden = Path(self.project_dir) / "gates" / "drift_golden.csv"
         default_drift_policy = Path(self.project_dir) / "gates" / "drift_policy.json"
         self.hosted_model_path_var = tk.StringVar(value=str(default_model_dir) if default_model_dir.exists() else "")
-        self.host_gate_golden_path_var = tk.StringVar(value=str(default_gate_golden))
+        self.host_gate_golden_path_var = tk.StringVar(value=str(default_gate_golden) if default_gate_golden.exists() else "")
         self.host_gate_policy_path_var = tk.StringVar(value=str(default_gate_policy))
-        self.host_drift_golden_path_var = tk.StringVar(value=str(default_drift_golden))
+        self.host_drift_golden_path_var = tk.StringVar(value=str(default_drift_golden) if default_drift_golden.exists() else "")
         self.host_drift_policy_path_var = tk.StringVar(value=str(default_drift_policy))
         self.hosted_model_inventory = []
         self.available_model_choice_var = tk.StringVar(value="")
@@ -790,7 +790,7 @@ class LogProcessorApp:
         self.jira_labels_entry = ttk.Entry(self.azure_triage_frame, textvariable=self.jira_labels_var)
         self.jira_labels_entry.grid(row=6, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
 
-        self.gate_golden_label = ttk.Label(hosting_frame, text="Gate Golden Set:")
+        self.gate_golden_label = ttk.Label(hosting_frame, text="Gate Golden Set (optional):")
         self.gate_golden_label.grid(row=11, column=0, sticky="w", padx=5, pady=5)
         self.gate_golden_entry = ttk.Entry(
             hosting_frame,
@@ -820,7 +820,7 @@ class LogProcessorApp:
         )
         self.gate_policy_browse_btn.grid(row=12, column=3, padx=5, pady=5)
 
-        self.drift_golden_label = ttk.Label(hosting_frame, text="Drift Golden Set:")
+        self.drift_golden_label = ttk.Label(hosting_frame, text="Drift Golden Set (optional):")
         self.drift_golden_label.grid(row=13, column=0, sticky="w", padx=5, pady=5)
         self.drift_golden_entry = ttk.Entry(
             hosting_frame,
@@ -1863,44 +1863,40 @@ class LogProcessorApp:
                 messagebox.showerror("Hosting", f"Could not locate a saved model in that path.\n\n{exc}")
                 return
 
-            if not gate_golden_path:
-                messagebox.showwarning("Hosting", "Please select the deployment gate golden set CSV.")
-                return
-            if not gate_policy_path:
-                messagebox.showwarning("Hosting", "Please select the deployment gate policy JSON.")
-                return
-            if not drift_golden_path:
-                messagebox.showwarning("Hosting", "Please select the drift golden set CSV.")
-                return
-            if not drift_policy_path:
-                messagebox.showwarning("Hosting", "Please select the drift policy JSON.")
-                return
+            if gate_golden_path:
+                if not gate_policy_path:
+                    messagebox.showwarning("Hosting", "Please select the deployment gate policy JSON.")
+                    return
+                gate_golden_resolved = resolve_gate_path(gate_golden_path)
+                gate_policy_resolved = resolve_gate_path(gate_policy_path)
+                if not gate_golden_resolved.exists() or not gate_golden_resolved.is_file():
+                    messagebox.showerror("Hosting", f"Deployment gate golden set file not found.\n\n{gate_golden_resolved}")
+                    return
+                if not gate_policy_resolved.exists() or not gate_policy_resolved.is_file():
+                    messagebox.showerror("Hosting", f"Deployment gate policy file not found.\n\n{gate_policy_resolved}")
+                    return
+                resolved_gate_golden_path = str(gate_golden_resolved)
+                resolved_gate_policy_path = str(gate_policy_resolved)
+                self.host_gate_golden_path_var.set(resolved_gate_golden_path)
+                self.host_gate_policy_path_var.set(resolved_gate_policy_path)
 
-            gate_golden_resolved = resolve_gate_path(gate_golden_path)
-            gate_policy_resolved = resolve_gate_path(gate_policy_path)
-            drift_golden_resolved = resolve_gate_path(drift_golden_path)
-            drift_policy_resolved = resolve_gate_path(drift_policy_path)
-            if not gate_golden_resolved.exists() or not gate_golden_resolved.is_file():
-                messagebox.showerror("Hosting", f"Deployment gate golden set file not found.\n\n{gate_golden_resolved}")
-                return
-            if not gate_policy_resolved.exists() or not gate_policy_resolved.is_file():
-                messagebox.showerror("Hosting", f"Deployment gate policy file not found.\n\n{gate_policy_resolved}")
-                return
-            if not drift_golden_resolved.exists() or not drift_golden_resolved.is_file():
-                messagebox.showerror("Hosting", f"Drift golden set file not found.\n\n{drift_golden_resolved}")
-                return
-            if not drift_policy_resolved.exists() or not drift_policy_resolved.is_file():
-                messagebox.showerror("Hosting", f"Drift policy file not found.\n\n{drift_policy_resolved}")
-                return
+            if drift_golden_path:
+                if not drift_policy_path:
+                    messagebox.showwarning("Hosting", "Please select the drift policy JSON.")
+                    return
+                drift_golden_resolved = resolve_gate_path(drift_golden_path)
+                drift_policy_resolved = resolve_gate_path(drift_policy_path)
+                if not drift_golden_resolved.exists() or not drift_golden_resolved.is_file():
+                    messagebox.showerror("Hosting", f"Drift golden set file not found.\n\n{drift_golden_resolved}")
+                    return
+                if not drift_policy_resolved.exists() or not drift_policy_resolved.is_file():
+                    messagebox.showerror("Hosting", f"Drift policy file not found.\n\n{drift_policy_resolved}")
+                    return
+                resolved_drift_golden_path = str(drift_golden_resolved)
+                resolved_drift_policy_path = str(drift_policy_resolved)
+                self.host_drift_golden_path_var.set(resolved_drift_golden_path)
+                self.host_drift_policy_path_var.set(resolved_drift_policy_path)
 
-            resolved_gate_golden_path = str(gate_golden_resolved)
-            resolved_gate_policy_path = str(gate_policy_resolved)
-            resolved_drift_golden_path = str(drift_golden_resolved)
-            resolved_drift_policy_path = str(drift_policy_resolved)
-            self.host_gate_golden_path_var.set(resolved_gate_golden_path)
-            self.host_gate_policy_path_var.set(resolved_gate_policy_path)
-            self.host_drift_golden_path_var.set(resolved_drift_golden_path)
-            self.host_drift_policy_path_var.set(resolved_drift_policy_path)
             self.hosted_model_path_var.set(resolved_model_dir)
             self.refresh_hosted_model_inventory(preferred_path=resolved_model_dir)
 

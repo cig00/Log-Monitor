@@ -4,6 +4,8 @@
 ### 🎬 Watch the Demo
 Watch demo.mp4 in repo or [▶️ Click here to watch the demo](https://wh1522657.ispot.cc/demo.mp4)
 
+Also watch the Set up in setup.mp4 or [▶️ Click here to watch the setup](https://wh1522657.ispot.cc/setup.mp4)
+
 > Note: GitHub Markdown preview does not reliably render the HTML `<video>` tag, so this link is provided as a working fallback.
 
 ---

@@ -4,16 +4,22 @@ import os
 import random
 import re
 import shutil
+import sys
 import tempfile
+import time
 from collections import Counter
 from contextlib import nullcontext
 from typing import Any, Dict, Tuple
 
 os.environ.setdefault("USE_TF", "0")
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
+import torch
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -50,6 +56,17 @@ LABEL_MAPPING = {"Error": 0, "CONFIGURATION": 1, "SYSTEM": 2, "Noise": 3}
 LABEL_NAMES = [name for name, _ in sorted(LABEL_MAPPING.items(), key=lambda item: item[1])]
 LABEL_ALIASES = {label.casefold(): label for label in LABEL_MAPPING}
 MODEL_NAME = "microsoft/deberta-v3-xsmall"
+
+
+def load_sequence_classifier():
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME,
+        num_labels=len(LABEL_NAMES),
+        id2label={idx: label for idx, label in enumerate(LABEL_NAMES)},
+        label2id=LABEL_MAPPING,
+        dtype=torch.float32,
+    )
+    return model.float()
 
 
 class LogDataset(Dataset):
@@ -423,7 +440,7 @@ def train_with_validation(
     device,
 ):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=len(LABEL_NAMES))
+    model = load_sequence_classifier()
     model.to(device)
 
     train_dataset = LogDataset(train_texts, train_labels, tokenizer, max_length=config["max_length"])
@@ -449,7 +466,13 @@ def train_with_validation(
             batch = {key: value.to(device) for key, value in batch.items()}
             outputs = model(**batch)
             loss = outputs.loss
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Training loss became non-finite. "
+                    "Try a lower learning rate or inspect the latest batch for invalid values."
+                )
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
             total_loss += float(loss.item())
@@ -508,7 +531,7 @@ def train_with_validation(
 
 def train_on_full_dev(dev_texts, dev_labels, config: dict, device):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=len(LABEL_NAMES))
+    model = load_sequence_classifier()
     model.to(device)
 
     dataset = LogDataset(dev_texts, dev_labels, tokenizer, max_length=config["max_length"])
@@ -528,7 +551,13 @@ def train_on_full_dev(dev_texts, dev_labels, config: dict, device):
             batch = {key: value.to(device) for key, value in batch.items()}
             outputs = model(**batch)
             loss = outputs.loss
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Training loss became non-finite. "
+                    "Try a lower learning rate or inspect the latest batch for invalid values."
+                )
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
             total_loss += float(loss.item())

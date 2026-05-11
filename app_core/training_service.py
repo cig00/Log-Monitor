@@ -212,6 +212,7 @@ class TrainingService:
             env=process_env,
         )
         ctx.register_subprocess("local_training", process)
+        recent_output: list[str] = []
         try:
             if process.stdout:
                 while True:
@@ -224,10 +225,16 @@ class TrainingService:
                         continue
                     clean_line = line.strip()
                     if clean_line:
+                        recent_output.append(clean_line)
+                        recent_output = recent_output[-20:]
                         ctx.emit("progress", clean_line[:150])
             return_code = process.wait()
             if return_code != 0:
-                raise RuntimeError(f"Local training failed with exit code {return_code}.")
+                details = "\n".join(recent_output[-12:])
+                message = f"Local training failed with exit code {return_code}."
+                if details:
+                    message += f"\n\nLast training output:\n{details}"
+                raise RuntimeError(message)
         finally:
             ctx.clear_subprocess("local_training")
 
@@ -387,14 +394,42 @@ class TrainingService:
                 preferred_model_path = discover_model_dir(download_path)
             except Exception:
                 pass
+            azure_model_info: dict[str, Any] = {}
+            if preferred_model_path:
+                ctx.emit("progress", "Registering trained model in Azure ML...")
+                azure_model_info = self.azure_platform_service.register_azure_model_asset(
+                    ml_client,
+                    preferred_model_path,
+                    model_name=resolved_mlflow_config.registered_model_name,
+                    description="Log Monitor Azure training output",
+                    tags={
+                        "azure_training_job": returned_job_name,
+                        "azure_compute": compute_size,
+                        "pipeline_id": clean_optional_string(pipeline_context_local.get("pipeline_id")),
+                        "training_data_asset": azure_data_asset_uri,
+                    },
+                )
             completion_message = f"Model trained and downloaded to {os.path.abspath(download_path)}"
             if azure_data_asset_uri:
                 completion_message += f"\nAzure data asset: {azure_data_asset_uri}"
+            if azure_model_info:
+                azure_model_name = clean_optional_string(azure_model_info.get("name"))
+                azure_model_version = clean_optional_string(azure_model_info.get("version"))
+                azure_model_display = f"{azure_model_name} v{azure_model_version}" if azure_model_version else azure_model_name
+                completion_message += (
+                    "\nAzure model: "
+                    f"{azure_model_display}"
+                )
             return {
                 "operation": "training",
                 "message": completion_message,
                 "download_path": os.path.abspath(download_path),
                 "selected_model_dir": preferred_model_path,
+                "azure_model_id": clean_optional_string(azure_model_info.get("id")) if azure_model_info else "",
+                "azure_model_name": clean_optional_string(azure_model_info.get("name")) if azure_model_info else "",
+                "azure_model_version": clean_optional_string(azure_model_info.get("version")) if azure_model_info else "",
+                "azure_model_uri": clean_optional_string(azure_model_info.get("azure_model_uri")) if azure_model_info else "",
+                "azure_model_label": clean_optional_string(azure_model_info.get("label")) if azure_model_info else "",
                 "instance_type": compute_size,
                 "azure_data_asset_name": azure_data_asset_info.get("azure_data_asset_name", ""),
                 "azure_data_asset_version": azure_data_asset_info.get("azure_data_asset_version", ""),

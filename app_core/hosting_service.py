@@ -831,6 +831,7 @@ class HostingService:
         local_hosting_meta = {
             "mode": "local",
             "service_kind": "grafana_local",
+            "observability_run_id": ctx.job_id,
             "model_dir": request.model_dir,
             "model_version_id": clean_optional_string(training_metadata.get("model_version_id", "")),
             "training_run_id": clean_optional_string(training_metadata.get("run_id", "")),

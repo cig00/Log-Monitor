@@ -72,12 +72,32 @@ from mlops_utils import clean_optional_string, read_json
 
 Reporter = Callable[[str], None]
 DEFAULT_SERVERLESS_MODEL_ID = "azureml://registries/azureml/models/Phi-4-mini-instruct"
+DEFAULT_AZURE_TRAINED_MODEL_NAME = "log-monitor-deberta-classifier"
+AZURE_TRAINING_BASE_IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04:latest"
+AZURE_TRAINING_TRANSFORMERS_VERSION = "4.56.1"
 COMMUNICATION_API_VERSION = "2025-09-01"
 FUNCTION_BRIDGE_WORKER_SETTINGS = {
     "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
     "PYTHON_ENABLE_WORKER_EXTENSIONS": "1",
     "PYTHON_ISOLATE_WORKER_DEPENDENCIES": "1",
 }
+AZURE_WORKFLOW_RESOURCE_PROVIDERS = (
+    "Microsoft.MachineLearningServices",
+    "Microsoft.ContainerRegistry",
+    "Microsoft.Storage",
+    "Microsoft.KeyVault",
+    "Microsoft.ManagedIdentity",
+    "Microsoft.Network",
+    "Microsoft.Compute",
+    "Microsoft.Insights",
+    "Microsoft.OperationalInsights",
+    "Microsoft.PolicyInsights",
+    "Microsoft.Cdn",
+    "Microsoft.ApiManagement",
+    "Microsoft.Web",
+    "Microsoft.Communication",
+)
+AZURE_PROVIDER_REGISTER_PERMISSION = "Microsoft.Resources/subscriptions/providers/register/action"
 
 
 class AzurePlatformService:
@@ -635,6 +655,85 @@ class AzurePlatformService:
         except Exception:
             resource_client.resource_groups.create_or_update(clean_group, {"location": location})
         return clean_group
+
+    def normalize_provider_names(self, provider_names) -> list[str]:
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for provider_name in provider_names or []:
+            clean_name = clean_optional_string(provider_name)
+            if not clean_name:
+                continue
+            provider_key = clean_name.casefold()
+            if provider_key in seen:
+                continue
+            seen.add(provider_key)
+            normalized.append(clean_name)
+        return normalized
+
+    def ensure_resource_providers(
+        self,
+        credential,
+        sub_id: str,
+        provider_names=None,
+        emit: Reporter | None = None,
+        timeout_seconds: int = 600,
+        poll_interval_seconds: int = 10,
+        resource_client=None,
+    ) -> dict[str, str]:
+        self.ensure_azure_dependencies()
+        clean_sub_id = clean_optional_string(sub_id)
+        if not clean_sub_id:
+            raise ValueError("Azure Subscription ID is required to check resource provider registration.")
+        providers = self.normalize_provider_names(provider_names or AZURE_WORKFLOW_RESOURCE_PROVIDERS)
+        if not providers:
+            return {}
+        if resource_client is None:
+            resource_client = ResourceManagementClient(credential, clean_sub_id)
+
+        states: dict[str, str] = {}
+        pending: set[str] = set()
+        for provider_name in providers:
+            try:
+                provider_info = resource_client.providers.get(provider_name)
+                state = clean_optional_string(getattr(provider_info, "registration_state", ""))
+            except Exception:
+                state = ""
+            states[provider_name] = state or "Unknown"
+            if state.casefold() == "registered":
+                continue
+            if emit:
+                emit(f"Registering Azure resource provider {provider_name}...")
+            try:
+                resource_client.providers.register(provider_name)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Azure resource provider '{provider_name}' is not registered, and the app could not register it.\n\n"
+                    f"The signed-in account needs permission: {AZURE_PROVIDER_REGISTER_PERMISSION}\n\n"
+                    f"Details: {clean_optional_string(exc)}"
+                ) from exc
+            pending.add(provider_name)
+
+        deadline = time.time() + max(int(timeout_seconds), 1)
+        interval = max(int(poll_interval_seconds), 0)
+        while pending:
+            for provider_name in list(pending):
+                try:
+                    provider_info = resource_client.providers.get(provider_name)
+                    state = clean_optional_string(getattr(provider_info, "registration_state", ""))
+                except Exception:
+                    state = ""
+                states[provider_name] = state or "Unknown"
+                if state.casefold() == "registered":
+                    pending.remove(provider_name)
+            if not pending:
+                break
+            if time.time() >= deadline:
+                pending_text = ", ".join(f"{name} ({states.get(name, 'Unknown')})" for name in sorted(pending))
+                raise TimeoutError(f"Timed out waiting for Azure resource provider registration: {pending_text}")
+            if emit:
+                emit("Waiting for Azure resource provider registration: " + ", ".join(sorted(pending)))
+            time.sleep(interval)
+        return states
 
     def list_acs_communication_services(self, credential, sub_id: str) -> list[dict[str, Any]]:
         clean_sub_id = clean_optional_string(sub_id)
@@ -1601,15 +1700,14 @@ class AzurePlatformService:
             resource_client.resource_groups.create_or_update(self.resource_group, {"location": "eastus"})
 
         if emit:
-            emit("Verifying Azure ML registration...")
-        resource_client.providers.register("Microsoft.MachineLearningServices")
-        while True:
-            provider_info = resource_client.providers.get("Microsoft.MachineLearningServices")
-            if provider_info.registration_state == "Registered":
-                break
-            if emit:
-                emit("Activating Azure ML services...")
-            time.sleep(10)
+            emit("Checking Azure resource provider registration...")
+        self.ensure_resource_providers(
+            credential,
+            sub_id,
+            AZURE_WORKFLOW_RESOURCE_PROVIDERS,
+            emit=emit,
+            resource_client=resource_client,
+        )
 
         if emit:
             emit("Ensuring Azure ML Workspace exists...")
@@ -1882,14 +1980,26 @@ class AzurePlatformService:
         if command is None:
             raise RuntimeError("Azure ML command job creation is unavailable in this Python environment.")
         safe_csv_path = clean_optional_string(data_input_path) or csv_path.replace("\\", "/")
+        extra_training_packages = " ".join(
+            package
+            for package in [
+                f"transformers=={AZURE_TRAINING_TRANSFORMERS_VERSION}",
+                clean_optional_string(mlflow_install_fragment),
+            ]
+            if package
+        )
+        dependency_install_command = (
+            "python -m pip install --upgrade pip "
+            "&& python -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cpu "
+            f"&& python -m pip install --upgrade -r requirements.train.txt {extra_training_packages}"
+        ).strip()
         train_job = command(
             inputs={"training_data": Input(type="uri_file", path=safe_csv_path, mode="download")},
             compute=compute_name,
-            environment="AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest",
+            environment=Environment(image=AZURE_TRAINING_BASE_IMAGE),
             code=".",
             command=(
-                "pip install --upgrade numpy==1.23.5 pandas==1.5.3 transformers==4.24.0 sentencepiece==0.1.99 protobuf==3.20.3 scikit-learn==1.1.3 "
-                f"{mlflow_install_fragment}"
+                f"{dependency_install_command} "
                 f"&& {export_segment} && USE_TF=0 python train.py --data ${{inputs.training_data}}{train_cli_segment}"
             ),
             experiment_name=experiment_name,
@@ -1905,6 +2015,35 @@ class AzurePlatformService:
     def download_job_output(self, ml_client, job_name: str, download_path: str) -> None:
         self.ensure_azure_dependencies()
         ml_client.jobs.download(name=job_name, download_path=download_path, all=False)
+
+    def register_azure_model_asset(
+        self,
+        ml_client,
+        model_dir: str,
+        model_name: str = "",
+        description: str = "",
+        tags: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_azure_dependencies()
+        resolved_model_dir = str(Path(model_dir).expanduser().resolve())
+        if not Path(resolved_model_dir).is_dir():
+            raise FileNotFoundError(f"Model directory does not exist: {resolved_model_dir}")
+        clean_model_name = self.sanitize_azure_name(model_name or DEFAULT_AZURE_TRAINED_MODEL_NAME, max_length=255)
+        clean_tags = {str(key): str(value) for key, value in (tags or {}).items() if clean_optional_string(key) and clean_optional_string(value)}
+        registered_model = ml_client.models.create_or_update(
+            Model(
+                path=resolved_model_dir.replace("\\", "/"),
+                name=clean_model_name,
+                type=AssetTypes.CUSTOM_MODEL,
+                description=clean_optional_string(description) or "Log Monitor trained DeBERTa classifier",
+                tags=clean_tags,
+            )
+        )
+        payload = self.build_azure_model_payload_from_entity(registered_model)
+        name = clean_optional_string(payload.get("name")) or clean_model_name
+        version = clean_optional_string(payload.get("version"))
+        payload["azure_model_uri"] = f"azureml:{name}:{version}" if version else f"azureml:{name}"
+        return payload
 
     def delete_compute(self, ml_client, compute_name: str) -> None:
         self.ensure_azure_dependencies()

@@ -87,8 +87,8 @@ Credentials are automatically configured.
    - **Azure** → trains and deploys using Azure ML Studio  
 3. Start the training process  
 4. Make sure you're signed in to microsoft and enter those
-SUBID: 91a62f38-6e7e-434a-ad85-592905ae1bf7
-Tenant ID: 5bf6ff5b-6333-491c-b315-f803d901c135
+SUBID: 64f9c97f-cd8e-4408-812c-d8fd13c0adf1
+Tenant ID: a02e95d4-6401-4ba3-966e-0f469e1cced3
 ---
 
 ### 🔹 Host a New Model

@@ -386,6 +386,14 @@ def _jira_summary_text(value: object, max_chars: int = 240) -> str:
     return text[: max(1, max_chars - len(suffix))].rstrip() + suffix
 
 
+def _dedupe_match_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _jira_jql_string(value: object) -> str:
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _get_payload_value(payload: dict, keys: tuple[str, ...]) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -698,6 +706,127 @@ def _github_post(path: str, payload: dict, timeout: int = 60) -> dict:
         raise RuntimeError(f"GitHub request failed ({response.status_code}). {detail}") from exc
     parsed = response.json()
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _summarize_github_issue_reference(item: dict) -> dict:
+    number = item.get("number")
+    reference = {
+        "number": number,
+        "title": str(item.get("title") or ""),
+        "state": str(item.get("state") or ""),
+        "html_url": str(item.get("html_url") or ""),
+        "api_url": str(item.get("url") or ""),
+    }
+    if isinstance(item.get("pull_request"), dict):
+        reference["pull_request"] = True
+        reference["pull_request_url"] = str(item.get("pull_request", {}).get("url") or "")
+    return reference
+
+
+def _github_search_issue_references(issue_key: str, reference_type: str) -> dict:
+    clean_issue_key = str(issue_key or "").strip()
+    repo = _get_env("LOGMONITOR_GITHUB_REPO")
+    if not clean_issue_key or not repo or not _get_env("LOGMONITOR_GITHUB_TOKEN"):
+        return {
+            "status": "skipped",
+            "reason": "GitHub token, repository, or Jira issue key is not configured.",
+            "items": [],
+            "total_count": 0,
+        }
+    clean_reference_type = "pr" if str(reference_type or "").strip().casefold() in {"pr", "pull_request"} else "issue"
+    query = f'repo:{repo} "{clean_issue_key}" type:{clean_reference_type}'
+    try:
+        response = requests.get(
+            "https://api.github.com/search/issues",
+            headers=_github_headers(),
+            params={"q": query, "per_page": 5},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        LOGGER.warning("GitHub remediation dedupe lookup failed for %s: %s", clean_issue_key, exc)
+        return {
+            "status": "failed",
+            "reason": str(exc),
+            "query": query,
+            "items": [],
+            "total_count": 0,
+        }
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    if not isinstance(items, list):
+        items = []
+    references = [_summarize_github_issue_reference(item) for item in items if isinstance(item, dict)]
+    return {
+        "status": "found" if references else "not_found",
+        "query": query,
+        "items": references,
+        "total_count": int(payload.get("total_count", len(references)) or 0) if isinstance(payload, dict) else len(references),
+    }
+
+
+def _find_existing_github_remediation(issue_key: str) -> dict:
+    pull_requests = _github_search_issue_references(issue_key, "pr")
+    if pull_requests.get("items"):
+        return {
+            "status": "found",
+            "operation": "reused",
+            "kind": "pull_request",
+            "has_pr": True,
+            "jira_issue_key": str(issue_key or "").strip(),
+            "pull_request": pull_requests["items"][0],
+            "pull_request_search": pull_requests,
+        }
+    if pull_requests.get("status") == "failed":
+        return {
+            "status": "failed",
+            "kind": "pull_request",
+            "has_pr": False,
+            "jira_issue_key": str(issue_key or "").strip(),
+            "error": pull_requests.get("reason", ""),
+            "pull_request_search": pull_requests,
+        }
+
+    issues = _github_search_issue_references(issue_key, "issue")
+    if issues.get("items"):
+        return {
+            "status": "found",
+            "operation": "reused",
+            "kind": "issue",
+            "has_pr": False,
+            "jira_issue_key": str(issue_key or "").strip(),
+            "issue": issues["items"][0],
+            "issue_search": issues,
+            "pull_request_search": pull_requests,
+        }
+    if issues.get("status") == "failed":
+        return {
+            "status": "failed",
+            "kind": "issue",
+            "has_pr": False,
+            "jira_issue_key": str(issue_key or "").strip(),
+            "error": issues.get("reason", ""),
+            "issue_search": issues,
+            "pull_request_search": pull_requests,
+        }
+    if pull_requests.get("status") == "skipped" or issues.get("status") == "skipped":
+        return {
+            "status": "skipped",
+            "kind": "",
+            "has_pr": False,
+            "jira_issue_key": str(issue_key or "").strip(),
+            "reason": pull_requests.get("reason") or issues.get("reason", ""),
+            "pull_request_search": pull_requests,
+            "issue_search": issues,
+        }
+    return {
+        "status": "not_found",
+        "kind": "",
+        "has_pr": False,
+        "jira_issue_key": str(issue_key or "").strip(),
+        "pull_request_search": pull_requests,
+        "issue_search": issues,
+    }
 
 
 def _github_search_commits(repo: str, terms: list[str], since_date: str) -> list[dict]:
@@ -1507,6 +1636,82 @@ def _build_jira_description(payload: dict, prediction_result: dict, github_conte
     return "\n".join(lines)
 
 
+def _summarize_existing_jira_issue(site_url: str, issue: dict, expected_summary: str) -> dict:
+    fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+    status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+    issue_key = str(issue.get("key") or "")
+    return {
+        "issue_key": issue_key,
+        "issue_url": f"{site_url}/browse/{issue_key}" if issue_key else "",
+        "operation": "reused",
+        "jira_response": issue,
+        "jira_summary": str(fields.get("summary") or ""),
+        "jira_status": str(status.get("name") or ""),
+        "jira_warnings": [],
+        "dedupe": {
+            "matched": True,
+            "match_kind": "summary",
+            "expected_summary": expected_summary,
+        },
+    }
+
+
+def _find_existing_jira_error_issue(payload: dict) -> dict:
+    site_url = _normalize_jira_site_url(_get_env("LOGMONITOR_JIRA_SITE_URL"))
+    account_email = _get_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL")
+    api_token = _get_env("LOGMONITOR_JIRA_API_TOKEN")
+    project_key = _get_env("LOGMONITOR_JIRA_PROJECT_KEY")
+    message = _extract_message(payload)
+    summary = _jira_summary_text("Log Monitor Error: " + (message or "unclassified runtime error"))
+    if not (site_url and account_email and api_token and project_key and message):
+        return {
+            "status": "skipped",
+            "reason": "Jira site, account, token, project key, or log message is not configured.",
+            "summary": summary,
+        }
+
+    jql = f'project = "{_jira_jql_string(project_key)}" AND summary ~ "{_jira_jql_string(summary)}" ORDER BY updated DESC'
+    try:
+        response = requests.get(
+            f"{site_url}/rest/api/3/search",
+            headers=_jira_auth_headers(account_email, api_token),
+            params={"jql": jql, "maxResults": 10, "fields": "summary,status,labels"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload_json = response.json()
+    except Exception as exc:
+        LOGGER.warning("Jira dedupe lookup failed for summary '%s': %s", summary, exc)
+        return {
+            "status": "failed",
+            "reason": str(exc),
+            "summary": summary,
+            "jql": jql,
+        }
+
+    issues = payload_json.get("issues", []) if isinstance(payload_json, dict) else []
+    if not isinstance(issues, list):
+        issues = []
+    expected_summary = _dedupe_match_text(summary)
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+        if _dedupe_match_text(fields.get("summary")) == expected_summary:
+            return {
+                "status": "found",
+                "summary": summary,
+                "jql": jql,
+                "issue": _summarize_existing_jira_issue(site_url, issue, summary),
+            }
+    return {
+        "status": "not_found",
+        "summary": summary,
+        "jql": jql,
+        "result_count": len(issues),
+    }
+
+
 def _create_jira_issue(payload: dict, prediction_result: dict, github_context: dict) -> dict:
     site_url = _normalize_jira_site_url(_require_env("LOGMONITOR_JIRA_SITE_URL"))
     account_email = _require_env("LOGMONITOR_JIRA_ACCOUNT_EMAIL")
@@ -1535,6 +1740,7 @@ def _create_jira_issue(payload: dict, prediction_result: dict, github_context: d
     return {
         "issue_key": issue_key,
         "issue_url": f"{site_url}/browse/{issue_key}" if issue_key else "",
+        "operation": "created",
         "jira_response": result,
         "jira_warnings": jira_warnings,
     }
@@ -1726,6 +1932,7 @@ def _new_monitoring_day(day_key: str) -> dict:
         "unknown_predictions": {},
         "action_status_counts": {"ok": 0, "partial_failure": 0},
         "jira_created": 0,
+        "jira_reused": 0,
         "jira_failed": 0,
         "jira_failure_reasons": {},
         "actions_by_type": {},
@@ -1778,6 +1985,7 @@ def _build_monitoring_summary_text(day: dict) -> str:
             "",
             f"Total predictions: {int(day.get('total', 0) or 0)}",
             f"Jira incident issues created from Error predictions: {int(day.get('jira_created', 0) or 0)}",
+            f"Existing Jira incidents reused from Error predictions: {int(day.get('jira_reused', 0) or 0)}",
             f"Error predictions where Jira incident creation failed: {int(day.get('jira_failed', 0) or 0)}",
         ]
     )
@@ -1890,6 +2098,7 @@ def _record_prediction_monitoring(
     actions_by_type = day.setdefault("actions_by_type", {})
     unknown_predictions = day.setdefault("unknown_predictions", {})
     jira_failure_reasons = day.setdefault("jira_failure_reasons", {})
+    day.setdefault("jira_reused", 0)
 
     normalized_prediction = _normalize_prediction_label(prediction) or str(prediction or "Unknown")
     day["total"] = int(day.get("total", 0) or 0) + 1
@@ -1905,7 +2114,10 @@ def _record_prediction_monitoring(
             _increment_count(actions_by_type, str(action.get("type") or "unknown"))
     if normalized_prediction == "Error":
         if jira_issue.get("issue_key"):
-            day["jira_created"] = int(day.get("jira_created", 0) or 0) + 1
+            if str(jira_issue.get("operation") or "").casefold() == "reused":
+                day["jira_reused"] = int(day.get("jira_reused", 0) or 0) + 1
+            else:
+                day["jira_created"] = int(day.get("jira_created", 0) or 0) + 1
         else:
             day["jira_failed"] = int(day.get("jira_failed", 0) or 0) + 1
             jira_errors = [
@@ -1922,7 +2134,8 @@ def _record_prediction_monitoring(
         "prediction": normalized_prediction,
         "received_at": payload.get("received_at") if isinstance(payload, dict) else "",
         "action_status": action_status,
-        "jira_created": bool(jira_issue.get("issue_key")),
+        "jira_created": bool(jira_issue.get("issue_key")) and str(jira_issue.get("operation") or "").casefold() != "reused",
+        "jira_reused": bool(jira_issue.get("issue_key")) and str(jira_issue.get("operation") or "").casefold() == "reused",
         "jira_issue_key": str(jira_issue.get("issue_key") or ""),
         "action_errors": _compact_action_errors(action_errors),
         "raw_prediction": prediction_result.get("raw_response", ""),
@@ -1944,6 +2157,9 @@ def _record_prediction_monitoring(
         "date": day_key,
         "counts": day.get("counts", {}),
         "total": day.get("total", 0),
+        "jira_created": day.get("jira_created", 0),
+        "jira_reused": day.get("jira_reused", 0),
+        "jira_failed": day.get("jira_failed", 0),
         "jira_failure_reasons": day.get("jira_failure_reasons", {}),
         "jira_summary_issue_key": day.get("jira_summary_issue_key", ""),
         "jira_summary_issue_url": day.get("jira_summary_issue_url", ""),
@@ -2606,69 +2822,153 @@ def _execute_triage_actions(normalized: dict, prediction_result: dict, predictio
             candidates=len(github_context.get("candidates", []) if isinstance(github_context.get("candidates"), list) else []),
             error=github_context.get("error", ""),
         )
-        _add_diagnostic(diagnostics, "jira_create", "started")
-        try:
-            jira_issue = _create_jira_issue(normalized, prediction_result, github_context)
+        _add_diagnostic(diagnostics, "jira_dedupe_lookup", "started")
+        jira_lookup = _find_existing_jira_error_issue(normalized)
+        if jira_lookup.get("status") == "found" and isinstance(jira_lookup.get("issue"), dict):
+            jira_issue = jira_lookup["issue"]
             actions.append({"type": "jira", **jira_issue})
             _add_diagnostic(
                 diagnostics,
-                "jira_create",
+                "jira_dedupe_lookup",
+                "found",
                 issue_key=jira_issue.get("issue_key", ""),
                 issue_url=jira_issue.get("issue_url", ""),
-                warnings=jira_issue.get("jira_warnings", []),
+                summary=jira_lookup.get("summary", ""),
             )
-            _add_diagnostic(diagnostics, "copilot_remediation", "started")
+        else:
+            _add_diagnostic(
+                diagnostics,
+                "jira_dedupe_lookup",
+                str(jira_lookup.get("status") or "not_found"),
+                reason=jira_lookup.get("reason", ""),
+                result_count=jira_lookup.get("result_count", 0),
+            )
+
+        if not jira_issue.get("issue_key"):
+            _add_diagnostic(diagnostics, "jira_create", "started")
             try:
-                copilot_task = _create_github_copilot_remediation_task(
-                    normalized,
-                    prediction_result,
-                    github_context,
-                    jira_issue,
-                )
-                if copilot_task.get("enabled") is False:
-                    _add_diagnostic(
-                        diagnostics,
-                        "copilot_remediation",
-                        "skipped",
-                        reason=copilot_task.get("reason", ""),
-                    )
-                else:
-                    actions.append({"type": "github_copilot_remediation", **copilot_task})
-                    _add_diagnostic(
-                        diagnostics,
-                        "copilot_remediation",
-                        issue_number=copilot_task.get("issue_number", ""),
-                        issue_url=copilot_task.get("html_url", ""),
-                        assignee=copilot_task.get("copilot_assignee", ""),
-                        jira_comment_error=copilot_task.get("jira_comment_error", ""),
-                    )
-            except Exception as exc:
-                LOGGER.exception("Failed to create GitHub Copilot remediation task.")
-                action_errors.append(
-                    {
-                        "type": "github_copilot_remediation",
-                        "error": str(exc),
-                        "jira_issue": jira_issue,
-                        "github_repo": _get_env("LOGMONITOR_GITHUB_REPO"),
-                    }
-                )
+                jira_issue = _create_jira_issue(normalized, prediction_result, github_context)
+                actions.append({"type": "jira", **jira_issue})
                 _add_diagnostic(
                     diagnostics,
-                    "copilot_remediation",
+                    "jira_create",
+                    issue_key=jira_issue.get("issue_key", ""),
+                    issue_url=jira_issue.get("issue_url", ""),
+                    warnings=jira_issue.get("jira_warnings", []),
+                )
+            except Exception as exc:
+                LOGGER.exception("Failed to create Jira issue.")
+                action_errors.append({"type": "jira", "error": str(exc), "github_context": github_context, "jira_config": jira_config})
+                _add_diagnostic(
+                    diagnostics,
+                    "jira_create",
                     "failed",
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
-        except Exception as exc:
-            LOGGER.exception("Failed to create Jira issue.")
-            action_errors.append({"type": "jira", "error": str(exc), "github_context": github_context, "jira_config": jira_config})
+        else:
             _add_diagnostic(
                 diagnostics,
                 "jira_create",
-                "failed",
-                error_type=type(exc).__name__,
-                error=str(exc),
+                "skipped",
+                reason="Existing Jira issue matched this Error event.",
+                issue_key=jira_issue.get("issue_key", ""),
             )
+
+        if jira_issue.get("issue_key"):
+            _add_diagnostic(diagnostics, "github_remediation_dedupe", "started")
+            remediation_lookup = _find_existing_github_remediation(str(jira_issue.get("issue_key") or ""))
+            if remediation_lookup.get("status") == "found" and remediation_lookup.get("has_pr"):
+                pull_request = remediation_lookup.get("pull_request") if isinstance(remediation_lookup.get("pull_request"), dict) else {}
+                actions.append(
+                    {
+                        "type": "github_pull_request",
+                        "operation": "reused",
+                        "jira_issue_key": jira_issue.get("issue_key", ""),
+                        "number": pull_request.get("number"),
+                        "html_url": pull_request.get("html_url", ""),
+                        "state": pull_request.get("state", ""),
+                        "title": pull_request.get("title", ""),
+                    }
+                )
+                _add_diagnostic(
+                    diagnostics,
+                    "github_remediation_dedupe",
+                    "found",
+                    kind="pull_request",
+                    number=pull_request.get("number"),
+                    html_url=pull_request.get("html_url", ""),
+                )
+            elif remediation_lookup.get("status") == "found":
+                issue = remediation_lookup.get("issue") if isinstance(remediation_lookup.get("issue"), dict) else {}
+                actions.append(
+                    {
+                        "type": "github_copilot_remediation",
+                        "operation": "reused",
+                        "jira_issue_key": jira_issue.get("issue_key", ""),
+                        "issue_number": issue.get("number"),
+                        "html_url": issue.get("html_url", ""),
+                        "state": issue.get("state", ""),
+                        "title": issue.get("title", ""),
+                    }
+                )
+                _add_diagnostic(
+                    diagnostics,
+                    "github_remediation_dedupe",
+                    "found",
+                    kind="issue",
+                    issue_number=issue.get("number"),
+                    html_url=issue.get("html_url", ""),
+                )
+            else:
+                _add_diagnostic(
+                    diagnostics,
+                    "github_remediation_dedupe",
+                    str(remediation_lookup.get("status") or "not_found"),
+                    reason=remediation_lookup.get("reason") or remediation_lookup.get("error", ""),
+                )
+                _add_diagnostic(diagnostics, "copilot_remediation", "started")
+                try:
+                    copilot_task = _create_github_copilot_remediation_task(
+                        normalized,
+                        prediction_result,
+                        github_context,
+                        jira_issue,
+                    )
+                    if copilot_task.get("enabled") is False:
+                        _add_diagnostic(
+                            diagnostics,
+                            "copilot_remediation",
+                            "skipped",
+                            reason=copilot_task.get("reason", ""),
+                        )
+                    else:
+                        actions.append({"type": "github_copilot_remediation", **copilot_task})
+                        _add_diagnostic(
+                            diagnostics,
+                            "copilot_remediation",
+                            issue_number=copilot_task.get("issue_number", ""),
+                            issue_url=copilot_task.get("html_url", ""),
+                            assignee=copilot_task.get("copilot_assignee", ""),
+                            jira_comment_error=copilot_task.get("jira_comment_error", ""),
+                        )
+                except Exception as exc:
+                    LOGGER.exception("Failed to create GitHub Copilot remediation task.")
+                    action_errors.append(
+                        {
+                            "type": "github_copilot_remediation",
+                            "error": str(exc),
+                            "jira_issue": jira_issue,
+                            "github_repo": _get_env("LOGMONITOR_GITHUB_REPO"),
+                        }
+                    )
+                    _add_diagnostic(
+                        diagnostics,
+                        "copilot_remediation",
+                        "failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
     else:
         actions.append({"type": "none", "reason": f"No triage rule is configured for prediction '{prediction}'."})
         _add_diagnostic(diagnostics, "action_route", "skipped", reason=f"No triage rule is configured for prediction '{prediction}'.")
@@ -2705,9 +3005,11 @@ def _execute_triage_actions(normalized: dict, prediction_result: dict, predictio
             error=str(exc),
         )
 
-    jira_created = bool(jira_issue.get("issue_key"))
+    jira_available = bool(jira_issue.get("issue_key"))
+    jira_reused = jira_available and str(jira_issue.get("operation") or "").casefold() == "reused"
+    jira_created = jira_available and not jira_reused
     status_code = 200
-    if prediction == "Error" and not jira_created:
+    if prediction == "Error" and not jira_available:
         status_code = 502
     action_status = "partial_failure" if action_errors or monitoring_errors else "ok"
     return {
@@ -2722,7 +3024,9 @@ def _execute_triage_actions(normalized: dict, prediction_result: dict, predictio
         "github_context": github_context,
         "jira_config": jira_config,
         "jira_issue": jira_issue,
+        "jira_available": jira_available,
         "jira_created": jira_created,
+        "jira_reused": jira_reused,
         "received_at": normalized.get("received_at"),
     }
 
@@ -2734,7 +3038,9 @@ def _to_triage_action_response(normalized: dict, result: dict, diagnostics: list
         status_code=result.get("status_code", 200),
         accepted=bool(result.get("accepted")),
         action_status=result.get("action_status", ""),
+        jira_available=bool(result.get("jira_available")),
         jira_created=bool(result.get("jira_created")),
+        jira_reused=bool(result.get("jira_reused")),
         action_error_count=len(result.get("action_errors", [])),
         monitoring_error_count=len(result.get("monitoring_errors", [])),
     )
@@ -2751,7 +3057,9 @@ def _to_triage_action_response(normalized: dict, result: dict, diagnostics: list
             "github_context": result.get("github_context", {}),
             "jira_config": result.get("jira_config", {}),
             "jira_issue": result.get("jira_issue", {}),
+            "jira_available": bool(result.get("jira_available")),
             "jira_created": bool(result.get("jira_created")),
+            "jira_reused": bool(result.get("jira_reused")),
             "received_at": normalized.get("received_at"),
             "caveat": (
                 "GitHub history is an investigation aid only. A matching or recent commit does not prove developer impact, "

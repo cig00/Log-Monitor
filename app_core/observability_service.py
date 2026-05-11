@@ -686,6 +686,10 @@ class ObservabilityService:
         binary_path = self.find_vendored_observability_binary(tool_name)
         if not binary_path:
             raise RuntimeError(f"The {tool_name} archive was extracted, but the expected binary was not found.")
+        if sys.platform == "win32" and tool_name == "grafana-server":
+            grafana_home = self.get_grafana_home(binary_path)
+            if grafana_home:
+                self.repair_grafana_windows_standalone_bundle(grafana_home)
         return binary_path
 
     def install_windows_local_observability_dependencies(self, emit: Reporter | None = None) -> None:
@@ -752,9 +756,132 @@ class ObservabilityService:
                 resolved = candidate.resolve()
             except Exception:
                 resolved = candidate
-            if (resolved / "conf" / "defaults.ini").exists() and (resolved / "public").exists():
+            has_legacy_config = (resolved / "conf" / "defaults.ini").exists()
+            has_bundled_binary = any((resolved / "bin" / name).exists() for name in self.get_observability_binary_names("grafana-server"))
+            if (resolved / "public").exists() and (has_legacy_config or has_bundled_binary):
                 return str(resolved)
         return ""
+
+    def get_grafana_version_for_home(self, grafana_home: str) -> str:
+        home_path = Path(grafana_home).expanduser()
+        match = re.search(r"grafana-(\d+\.\d+\.\d+)", home_path.name)
+        if match:
+            return match.group(1)
+        binary_names = self.get_observability_binary_names("grafana-server")
+        binaries = [home_path / "bin" / name for name in binary_names]
+        for binary in binaries:
+            if not binary.exists():
+                continue
+            try:
+                result = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=15)
+            except Exception:
+                continue
+            match = re.search(r"(\d+\.\d+\.\d+)", (result.stdout or "") + "\n" + (result.stderr or ""))
+            if match:
+                return match.group(1)
+        return ""
+
+    def find_cached_grafana_windows_archive(self, version: str = "") -> Path | None:
+        downloads_root = self.get_local_observability_downloads_root()
+        if not downloads_root.exists():
+            return None
+        archives = [
+            path
+            for path in downloads_root.iterdir()
+            if path.is_file()
+            and path.name.lower().startswith("grafana")
+            and (path.name.lower().endswith(".zip") or path.name.lower().endswith(".tar.gz") or path.name.lower().endswith(".tgz"))
+        ]
+        if version:
+            versioned = [path for path in archives if version in path.name]
+            if versioned:
+                archives = versioned
+        if not archives:
+            return None
+        return max(archives, key=lambda path: path.stat().st_mtime)
+
+    def restore_grafana_public_assets_from_archive(self, grafana_home: str) -> bool:
+        home_path = Path(clean_optional_string(grafana_home)).expanduser()
+        if not home_path.exists():
+            return False
+        assets_manifest = home_path / "public" / "build" / "assets-manifest.json"
+        index_template = home_path / "public" / "views" / "index.html"
+        if assets_manifest.exists() and index_template.exists():
+            return False
+
+        version = self.get_grafana_version_for_home(str(home_path))
+        archive_path = self.find_cached_grafana_windows_archive(version)
+        if archive_path is None:
+            return False
+
+        extract_parent = home_path.parent.resolve()
+        public_prefix = home_path.name.rstrip("/\\") + "/public"
+        archive_name = archive_path.name.lower()
+        if archive_name.endswith(".tar.gz") or archive_name.endswith(".tgz"):
+            with tarfile.open(archive_path, "r:*") as archive:
+                members = [
+                    member
+                    for member in archive.getmembers()
+                    if member.name == public_prefix or member.name.startswith(public_prefix + "/")
+                ]
+                for member in members:
+                    member_path = (extract_parent / member.name).resolve()
+                    if member_path != extract_parent and extract_parent not in member_path.parents:
+                        raise RuntimeError(f"Unsafe Grafana archive entry: {member.name}")
+                archive.extractall(extract_parent, members=members)
+        elif archive_name.endswith(".zip"):
+            with zipfile.ZipFile(archive_path) as archive:
+                members = [
+                    member
+                    for member in archive.infolist()
+                    if member.filename == public_prefix or member.filename.startswith(public_prefix + "/")
+                ]
+                for member in members:
+                    member_path = (extract_parent / member.filename).resolve()
+                    if member_path != extract_parent and extract_parent not in member_path.parents:
+                        raise RuntimeError(f"Unsafe Grafana archive entry: {member.filename}")
+                    archive.extract(member, extract_parent)
+        return assets_manifest.exists() and index_template.exists()
+
+    def repair_grafana_windows_standalone_bundle(self, grafana_home: str) -> None:
+        if sys.platform != "win32":
+            return
+        home_path = Path(clean_optional_string(grafana_home))
+        if not home_path.exists() or not (home_path / "public").exists():
+            return
+        self.restore_grafana_public_assets_from_archive(str(home_path))
+
+        defaults_path = home_path / "conf" / "defaults.ini"
+        if not defaults_path.exists():
+            version = self.get_grafana_version_for_home(str(home_path))
+            if not version:
+                raise RuntimeError("Grafana defaults.ini is missing and the Grafana version could not be detected.")
+            defaults_url = f"https://raw.githubusercontent.com/grafana/grafana/v{version}/conf/defaults.ini"
+            try:
+                defaults_text = self.fetch_text_url(defaults_url, timeout_seconds=60)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Grafana defaults.ini is missing from the Windows standalone archive, and the app could not "
+                    f"download Grafana's official defaults.ini for v{version}. Re-run automatic installation when "
+                    "network access is available."
+                ) from exc
+            defaults_path.parent.mkdir(parents=True, exist_ok=True)
+            defaults_path.write_text(defaults_text, encoding="utf-8")
+
+        emails_root = home_path / "public" / "emails"
+        emails_root.mkdir(parents=True, exist_ok=True)
+        html_templates = list(emails_root.glob("*.html"))
+        text_templates = list(emails_root.glob("*.txt"))
+        if not html_templates:
+            (emails_root / "log-monitor-placeholder.html").write_text(
+                "<html><body>{{ .Subject }}</body></html>\n",
+                encoding="utf-8",
+            )
+        if not text_templates:
+            (emails_root / "log-monitor-placeholder.txt").write_text(
+                "{{ .Subject }}\n",
+                encoding="utf-8",
+            )
 
     def yaml_quote(self, value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
@@ -1059,8 +1186,15 @@ class ObservabilityService:
 
     def write_local_observability_files(self, hosting_meta: dict, training_meta: dict, tracking_console_url: str = "", tracking_console_note: str = "") -> dict:
         root = self.get_local_observability_root()
-        prometheus_root = root / "prometheus"
-        grafana_root = root / "grafana"
+        raw_run_id = (
+            clean_optional_string(hosting_meta.get("observability_run_id"))
+            or clean_optional_string(hosting_meta.get("created_at"))
+            or "current"
+        )
+        run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_run_id).strip(".-") or "current"
+        run_root = root / "runs" / run_id
+        prometheus_root = run_root / "prometheus"
+        grafana_root = run_root / "grafana"
         provisioning_root = grafana_root / "provisioning"
         datasources_root = provisioning_root / "datasources"
         dashboards_root = provisioning_root / "dashboards"
@@ -1167,10 +1301,12 @@ class ObservabilityService:
         grafana_home = self.get_grafana_home(grafana_binary)
         if not grafana_home:
             raise RuntimeError("The Grafana server binary was found, but the app could not determine Grafana's home directory.")
+        self.repair_grafana_windows_standalone_bundle(grafana_home)
         env = os.environ.copy()
         env.update(
             {
                 "GF_PATHS_DATA": data_path,
+                "GF_PATHS_HOME": grafana_home,
                 "GF_PATHS_LOGS": logs_path,
                 "GF_PATHS_PLUGINS": plugins_path,
                 "GF_PATHS_PROVISIONING": provisioning_path,

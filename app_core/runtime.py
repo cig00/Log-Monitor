@@ -315,6 +315,7 @@ class JobManager:
                     payload=result,
                 )
             except JobCancelled as exc:
+                context.cancel()
                 canceled_record = JobRecord(
                     job_id=job_id,
                     job_type=job_type,
@@ -333,6 +334,7 @@ class JobManager:
                     payload={"message": str(exc)},
                 )
             except Exception as exc:
+                context.cancel()
                 failed_record = JobRecord(
                     job_id=job_id,
                     job_type=job_type,

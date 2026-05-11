@@ -4,6 +4,7 @@ import csv
 import importlib.util
 import json
 import sys
+import tarfile
 import tempfile
 import types
 import unittest
@@ -13,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from app_core import azure_platform_service
 from app_core.contracts import HostingRequest, MlflowConfig
 from app_core.azure_platform_service import AzurePlatformService
 from app_core.data_prep_service import DataPrepService
@@ -278,6 +280,91 @@ class ServiceTests(unittest.TestCase):
             "log_monitor_process_uptime_seconds",
         ]:
             self.assertIn(metric_name, panel_json)
+
+    def test_local_observability_files_use_run_specific_data_dirs(self):
+        first = self.observability.write_local_observability_files(
+            hosting_meta={
+                "observability_run_id": "hosting-run-one",
+                "metrics_url": "http://127.0.0.1:8000/metrics",
+                "prometheus_url": "http://127.0.0.1:9090",
+            },
+            training_meta={},
+        )
+        second = self.observability.write_local_observability_files(
+            hosting_meta={
+                "observability_run_id": "hosting-run-two",
+                "metrics_url": "http://127.0.0.1:8001/metrics",
+                "prometheus_url": "http://127.0.0.1:9091",
+            },
+            training_meta={},
+        )
+
+        self.assertNotEqual(first["prometheus_data_path"], second["prometheus_data_path"])
+        self.assertNotEqual(first["grafana_data_path"], second["grafana_data_path"])
+        self.assertIn("hosting-run-one", first["prometheus_data_path"])
+        self.assertIn("hosting-run-two", second["prometheus_data_path"])
+
+    def test_grafana_home_accepts_windows_standalone_layout_without_conf_dir(self):
+        grafana_home = self.project_dir / "grafana-standalone"
+        grafana_bin = grafana_home / "bin" / "grafana.exe"
+        (grafana_home / "public").mkdir(parents=True)
+        grafana_bin.parent.mkdir(parents=True)
+        grafana_bin.write_text("", encoding="utf-8")
+
+        with mock.patch("sys.platform", "win32"):
+            self.assertEqual(self.observability.get_grafana_home(str(grafana_bin)), str(grafana_home.resolve()))
+
+    def test_repair_grafana_windows_standalone_bundle_adds_missing_runtime_files(self):
+        grafana_home = self.project_dir / "grafana-13.0.1"
+        grafana_bin = grafana_home / "bin" / "grafana.exe"
+        (grafana_home / "public").mkdir(parents=True)
+        grafana_bin.parent.mkdir(parents=True)
+        grafana_bin.write_text("", encoding="utf-8")
+
+        with mock.patch("sys.platform", "win32"), mock.patch.object(
+            self.observability,
+            "fetch_text_url",
+            return_value="[server]\nhttp_port = 3000\n",
+        ) as fetch_text:
+            self.observability.repair_grafana_windows_standalone_bundle(str(grafana_home))
+
+        defaults_path = grafana_home / "conf" / "defaults.ini"
+        self.assertTrue(defaults_path.exists())
+        self.assertIn("http_port", defaults_path.read_text(encoding="utf-8"))
+        self.assertTrue((grafana_home / "public" / "emails" / "log-monitor-placeholder.html").exists())
+        self.assertTrue((grafana_home / "public" / "emails" / "log-monitor-placeholder.txt").exists())
+        fetch_text.assert_called_once_with(
+            "https://raw.githubusercontent.com/grafana/grafana/v13.0.1/conf/defaults.ini",
+            timeout_seconds=60,
+        )
+
+    def test_repair_grafana_windows_standalone_bundle_restores_public_assets_from_cached_archive(self):
+        grafana_home = self.project_dir / "outputs" / "local_observability" / "tools" / "windows" / "grafana-server" / "current" / "grafana-13.0.1"
+        grafana_bin = grafana_home / "bin" / "grafana.exe"
+        (grafana_home / "public").mkdir(parents=True)
+        grafana_bin.parent.mkdir(parents=True)
+        grafana_bin.write_text("", encoding="utf-8")
+
+        archive_staging = self.project_dir / "archive-staging" / "grafana-13.0.1" / "public"
+        (archive_staging / "build").mkdir(parents=True)
+        (archive_staging / "views").mkdir(parents=True)
+        (archive_staging / "build" / "assets-manifest.json").write_text("{}", encoding="utf-8")
+        (archive_staging / "views" / "index.html").write_text("<html></html>", encoding="utf-8")
+        downloads_root = self.project_dir / "outputs" / "local_observability" / "downloads" / "windows"
+        downloads_root.mkdir(parents=True)
+        archive_path = downloads_root / "grafana-enterprise_13.0.1_windows_amd64.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            archive.add(self.project_dir / "archive-staging" / "grafana-13.0.1", arcname="grafana-13.0.1")
+
+        with mock.patch("sys.platform", "win32"), mock.patch.object(
+            self.observability,
+            "fetch_text_url",
+            return_value="[server]\nhttp_port = 3000\n",
+        ):
+            self.observability.repair_grafana_windows_standalone_bundle(str(grafana_home))
+
+        self.assertTrue((grafana_home / "public" / "build" / "assets-manifest.json").exists())
+        self.assertTrue((grafana_home / "public" / "views" / "index.html").exists())
 
     def test_default_golden_sets_match_policy_calibration(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -563,6 +650,130 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(fake_client.data.created.tags, {"pipeline_id": "abc"})
         self.assertEqual(len(service.sanitize_azure_asset_version("a" * 64)), 30)
 
+    def test_azure_platform_registers_missing_resource_providers(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+        emitted: list[str] = []
+
+        class FakeProviderOperations:
+            def __init__(self):
+                self.states = {
+                    "Microsoft.MachineLearningServices": "Registered",
+                    "Microsoft.ContainerRegistry": "NotRegistered",
+                    "Microsoft.Storage": "Registering",
+                }
+                self.registered: list[str] = []
+
+            def get(self, provider_name):
+                return SimpleNamespace(registration_state=self.states.get(provider_name, "NotRegistered"))
+
+            def register(self, provider_name):
+                self.registered.append(provider_name)
+                self.states[provider_name] = "Registered"
+
+        fake_resource_client = SimpleNamespace(providers=FakeProviderOperations())
+
+        states = service.ensure_resource_providers(
+            credential=object(),
+            sub_id="sub",
+            provider_names=[
+                "Microsoft.MachineLearningServices",
+                "Microsoft.ContainerRegistry",
+                "Microsoft.Storage",
+                "Microsoft.Storage",
+            ],
+            emit=emitted.append,
+            resource_client=fake_resource_client,
+            poll_interval_seconds=0,
+        )
+
+        self.assertEqual(states["Microsoft.MachineLearningServices"], "Registered")
+        self.assertEqual(states["Microsoft.ContainerRegistry"], "Registered")
+        self.assertEqual(states["Microsoft.Storage"], "Registered")
+        self.assertEqual(
+            fake_resource_client.providers.registered,
+            ["Microsoft.ContainerRegistry", "Microsoft.Storage"],
+        )
+        self.assertTrue(any("Microsoft.ContainerRegistry" in message for message in emitted))
+
+    def test_azure_platform_provider_registration_error_mentions_permission(self):
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+
+        class FakeProviderOperations:
+            def get(self, provider_name):
+                del provider_name
+                return SimpleNamespace(registration_state="NotRegistered")
+
+            def register(self, provider_name):
+                del provider_name
+                raise RuntimeError("authorization failed")
+
+        fake_resource_client = SimpleNamespace(providers=FakeProviderOperations())
+
+        with self.assertRaisesRegex(RuntimeError, "register/action"):
+            service.ensure_resource_providers(
+                credential=object(),
+                sub_id="sub",
+                provider_names=["Microsoft.Network"],
+                resource_client=fake_resource_client,
+                poll_interval_seconds=0,
+            )
+
+    def test_azure_workflow_provider_preflight_includes_online_endpoint_dependencies(self):
+        providers = set(azure_platform_service.AZURE_WORKFLOW_RESOURCE_PROVIDERS)
+
+        self.assertIn("Microsoft.MachineLearningServices", providers)
+        self.assertIn("Microsoft.PolicyInsights", providers)
+        self.assertIn("Microsoft.Cdn", providers)
+        self.assertIn("Microsoft.ApiManagement", providers)
+
+    def test_azure_platform_registers_downloaded_training_model(self):
+        model_dir = self.project_dir / "downloaded_model" / "artifacts" / "final_model"
+        model_dir.mkdir(parents=True)
+        service = AzurePlatformService(str(self.project_dir), resource_group="rg", workspace_name="ws")
+        service.ensure_azure_dependencies = lambda: None
+
+        class FakeModelEntity:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakeModelOperations:
+            def __init__(self):
+                self.created = None
+
+            def create_or_update(self, model_asset):
+                self.created = model_asset
+                return SimpleNamespace(
+                    id="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.MachineLearningServices/workspaces/ws/models/custom-log-monitor-model/versions/1",
+                    name=model_asset.name,
+                    version="1",
+                    path=model_asset.path,
+                    type=model_asset.type,
+                    description=model_asset.description,
+                )
+
+        fake_client = SimpleNamespace(models=FakeModelOperations())
+        fake_asset_types = SimpleNamespace(CUSTOM_MODEL="custom_model")
+
+        with mock.patch("app_core.azure_platform_service.Model", FakeModelEntity), mock.patch(
+            "app_core.azure_platform_service.AssetTypes",
+            fake_asset_types,
+        ):
+            result = service.register_azure_model_asset(
+                fake_client,
+                str(model_dir),
+                model_name="Custom Log Monitor Model",
+                tags={"pipeline_id": "abc", "empty": ""},
+            )
+
+        self.assertEqual(result["name"], "custom-log-monitor-model")
+        self.assertEqual(result["version"], "1")
+        self.assertEqual(result["azure_model_uri"], "azureml:custom-log-monitor-model:1")
+        self.assertEqual(fake_client.models.created.type, "custom_model")
+        self.assertEqual(fake_client.models.created.tags, {"pipeline_id": "abc"})
+        self.assertTrue(fake_client.models.created.path.endswith("downloaded_model/artifacts/final_model"))
+
     def test_azure_host_instance_candidates_start_with_smaller_cpu_sizes(self):
         candidates = self.azure_platform.get_azure_host_instance_candidates("cpu")
 
@@ -588,6 +799,48 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("Standard_E4s_v3", message)
         self.assertIn("Request a quota increase", message)
         self.assertNotIn("BadRequest", message)
+
+    def test_azure_training_job_uses_current_training_environment_and_requirements(self):
+        captured_job = {}
+
+        def fake_input(**kwargs):
+            return kwargs
+
+        def fake_command(**kwargs):
+            captured_job.update(kwargs)
+            return SimpleNamespace(**kwargs)
+
+        class FakeJobs:
+            def create_or_update(self, job):
+                self.created_job = job
+                return SimpleNamespace(name="train-job-123")
+
+        fake_client = SimpleNamespace(jobs=FakeJobs())
+
+        with (
+            mock.patch("app_core.azure_platform_service.AZURE_AVAILABLE", True),
+            mock.patch("app_core.azure_platform_service.Input", fake_input),
+            mock.patch("app_core.azure_platform_service.command", fake_command),
+        ):
+            job_name = self.azure_platform.submit_azure_training_job(
+                ml_client=fake_client,
+                csv_path="C:/data/logs.csv",
+                compute_name="cpu-cluster",
+                mlflow_install_fragment="mlflow==2.9.2 azureml-mlflow ",
+                export_segment="export USE_MLFLOW=1",
+                train_cli_segment=" --epochs 3",
+            )
+
+        self.assertEqual(job_name, "train-job-123")
+        self.assertEqual(captured_job["environment"].image, azure_platform_service.AZURE_TRAINING_BASE_IMAGE)
+        command_text = captured_job["command"]
+        self.assertIn("python -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cpu", command_text)
+        self.assertIn("python -m pip install --upgrade -r requirements.train.txt", command_text)
+        self.assertIn(f"transformers=={azure_platform_service.AZURE_TRAINING_TRANSFORMERS_VERSION}", command_text)
+        self.assertIn("azureml-mlflow", command_text)
+        self.assertNotIn("transformers==4.24.0", command_text)
+        self.assertNotIn("AzureML-pytorch-1.10", captured_job["environment"].image)
+        self.assertNotIn("cuda", captured_job["environment"].image.lower())
 
     def test_function_bridge_package_includes_feedback_retraining_code(self):
         bridge_root = self.project_dir / "azure_function_bridge"
@@ -901,6 +1154,105 @@ class ServiceTests(unittest.TestCase):
         self.assertLessEqual(len(summary), 240)
         self.assertIn("ViewException", summary)
 
+    def test_function_bridge_finds_existing_jira_error_issue_by_summary(self):
+        bridge = self.load_function_bridge_module()
+
+        class FakeResponse:
+            status_code = 200
+            text = "{}"
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "issues": [
+                        {
+                            "key": "KAN-77",
+                            "fields": {
+                                "summary": bridge._jira_summary_text("Log Monitor Error: database write failed"),
+                                "status": {"name": "In Progress"},
+                            },
+                        }
+                    ]
+                }
+
+        calls = []
+
+        def fake_get(url, headers=None, params=None, timeout=None):
+            del headers, timeout
+            calls.append({"url": url, "params": params})
+            return FakeResponse()
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_JIRA_SITE_URL": "https://eece00.atlassian.net",
+                "LOGMONITOR_JIRA_ACCOUNT_EMAIL": "eece00@outlook.com",
+                "LOGMONITOR_JIRA_API_TOKEN": "jira-token",
+                "LOGMONITOR_JIRA_PROJECT_KEY": "KAN",
+            },
+            clear=False,
+        ), mock.patch.object(bridge.requests, "get", side_effect=fake_get):
+            result = bridge._find_existing_jira_error_issue({"errorMessage": "database write failed"})
+
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["issue"]["issue_key"], "KAN-77")
+        self.assertEqual(result["issue"]["operation"], "reused")
+        self.assertEqual(result["issue"]["jira_status"], "In Progress")
+        self.assertEqual(calls[0]["url"], "https://eece00.atlassian.net/rest/api/3/search")
+        self.assertIn("summary ~", calls[0]["params"]["jql"])
+
+    def test_function_bridge_finds_existing_github_pr_for_jira_issue(self):
+        bridge = self.load_function_bridge_module()
+
+        class FakeResponse:
+            status_code = 200
+            text = "{}"
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "total_count": 1,
+                    "items": [
+                        {
+                            "number": 12,
+                            "title": "Fix KAN-77 database writes",
+                            "state": "open",
+                            "html_url": "https://github.com/owner/repo/pull/12",
+                            "url": "https://api.github.com/repos/owner/repo/issues/12",
+                            "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/12"},
+                        }
+                    ],
+                }
+
+        calls = []
+
+        def fake_get(url, headers=None, params=None, timeout=None):
+            del headers, timeout
+            calls.append({"url": url, "params": params})
+            return FakeResponse()
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_GITHUB_TOKEN": "gh-token",
+                "LOGMONITOR_GITHUB_REPO": "owner/repo",
+            },
+            clear=False,
+        ), mock.patch.object(bridge.requests, "get", side_effect=fake_get):
+            result = bridge._find_existing_github_remediation("KAN-77")
+
+        self.assertEqual(result["status"], "found")
+        self.assertTrue(result["has_pr"])
+        self.assertEqual(result["kind"], "pull_request")
+        self.assertEqual(result["pull_request"]["number"], 12)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('"KAN-77"', calls[0]["params"]["q"])
+        self.assertIn("type:pr", calls[0]["params"]["q"])
+
     def test_function_bridge_creates_copilot_remediation_issue_for_jira_incident(self):
         bridge = self.load_function_bridge_module()
 
@@ -1084,6 +1436,14 @@ class ServiceTests(unittest.TestCase):
             return_value={"status": "skipped", "candidates": []},
         ), mock.patch.object(
             bridge,
+            "_find_existing_jira_error_issue",
+            return_value={"status": "not_found"},
+        ), mock.patch.object(
+            bridge,
+            "_find_existing_github_remediation",
+            return_value={"status": "not_found", "has_pr": False},
+        ), mock.patch.object(
+            bridge,
             "_create_jira_issue",
             return_value={"issue_key": "KAN-99", "issue_url": "https://eece00.atlassian.net/browse/KAN-99"},
         ), mock.patch.object(
@@ -1165,6 +1525,14 @@ class ServiceTests(unittest.TestCase):
             return_value={"status": "skipped", "candidates": []},
         ), mock.patch.object(
             bridge,
+            "_find_existing_jira_error_issue",
+            return_value={"status": "not_found"},
+        ), mock.patch.object(
+            bridge,
+            "_find_existing_github_remediation",
+            return_value={"status": "not_found", "has_pr": False},
+        ), mock.patch.object(
+            bridge,
             "_create_jira_issue",
             return_value={"issue_key": "KAN-101", "issue_url": "https://eece00.atlassian.net/browse/KAN-101"},
         ), mock.patch.object(
@@ -1202,6 +1570,113 @@ class ServiceTests(unittest.TestCase):
         prediction_events = [entry for entry in body["diagnostics"] if entry["stage"] == "prediction_result"]
         self.assertEqual(prediction_events[-1]["details"]["source"], "already_predicted")
         self.assertEqual(state_writes[-1]["days"][body["monitoring"]["date"]]["jira_created"], 1)
+
+    def test_function_bridge_triage_reuses_existing_jira_and_pr_without_duplicate_creation(self):
+        bridge = self.load_function_bridge_module()
+        state_writes = []
+
+        class FakeRequest:
+            def get_json(self):
+                return {
+                    "message": "database write failed",
+                    "prediction": "Error",
+                    "prediction_result": {"prediction": "Error", "raw_response": {"prediction": "Error"}},
+                }
+
+        def capture_state_write(state):
+            state_writes.append(json.loads(json.dumps(state)))
+
+        existing_jira = {
+            "status": "found",
+            "summary": "Log Monitor Error: database write failed",
+            "issue": {
+                "issue_key": "KAN-77",
+                "issue_url": "https://eece00.atlassian.net/browse/KAN-77",
+                "operation": "reused",
+                "jira_warnings": [],
+            },
+        }
+        existing_pr = {
+            "status": "found",
+            "operation": "reused",
+            "kind": "pull_request",
+            "has_pr": True,
+            "jira_issue_key": "KAN-77",
+            "pull_request": {
+                "number": 12,
+                "title": "Fix KAN-77 database writes",
+                "state": "open",
+                "html_url": "https://github.com/owner/repo/pull/12",
+            },
+        }
+
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "LOGMONITOR_TRIAGE_ENABLED": "1",
+                "LOGMONITOR_JIRA_MONITORING_ENABLED": "1",
+                "LOGMONITOR_SOURCE_ENDPOINT_NAME": "log-monitor-endpoint",
+                "LOGMONITOR_HOSTING_SERVICE_KIND": "real-time endpoint",
+            },
+            clear=False,
+        ), mock.patch.object(
+            bridge,
+            "_call_prediction_endpoint",
+            side_effect=AssertionError("triage_action must not call the model endpoint"),
+        ), mock.patch.object(
+            bridge,
+            "_find_github_impact_context",
+            return_value={"status": "skipped", "candidates": []},
+        ), mock.patch.object(
+            bridge,
+            "_find_existing_jira_error_issue",
+            return_value=existing_jira,
+        ), mock.patch.object(
+            bridge,
+            "_find_existing_github_remediation",
+            return_value=existing_pr,
+        ), mock.patch.object(
+            bridge,
+            "_create_jira_issue",
+            side_effect=AssertionError("must not create a duplicate Jira issue"),
+        ), mock.patch.object(
+            bridge,
+            "_create_github_copilot_remediation_task",
+            side_effect=AssertionError("must not create a duplicate remediation task"),
+        ), mock.patch.object(
+            bridge,
+            "_load_monitoring_state",
+            return_value={},
+        ), mock.patch.object(
+            bridge,
+            "_write_monitoring_state",
+            side_effect=capture_state_write,
+        ), mock.patch.object(
+            bridge,
+            "_upsert_jira_monitoring_issue",
+            return_value={
+                "issue_key": "KAN-55",
+                "issue_url": "https://eece00.atlassian.net/browse/KAN-55",
+                "operation": "updated",
+            },
+        ):
+            response = bridge.triage_action(FakeRequest())
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body["jira_available"])
+        self.assertTrue(body["jira_reused"])
+        self.assertFalse(body["jira_created"])
+        self.assertEqual(body["jira_issue"]["issue_key"], "KAN-77")
+        self.assertTrue(any(action.get("type") == "jira" and action.get("operation") == "reused" for action in body["actions"]))
+        self.assertTrue(any(action.get("type") == "github_pull_request" and action.get("number") == 12 for action in body["actions"]))
+        day = state_writes[-1]["days"][body["monitoring"]["date"]]
+        self.assertEqual(day["jira_reused"], 1)
+        self.assertEqual(day["jira_created"], 0)
+        stages = [entry["stage"] for entry in body["diagnostics"]]
+        self.assertIn("jira_dedupe_lookup", stages)
+        self.assertIn("github_remediation_dedupe", stages)
+        self.assertNotIn("copilot_remediation", stages)
 
     def test_function_bridge_github_lookup_reads_nested_commit_metadata(self):
         bridge = self.load_function_bridge_module()

@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from app_core.contracts import JOB_STATUS_CANCELED, JOB_STATUS_SUCCEEDED
+from app_core.contracts import JOB_STATUS_CANCELED, JOB_STATUS_FAILED, JOB_STATUS_SUCCEEDED
 from app_core.runtime import ArtifactStore, JobCancelled, JobManager, StateStore
 
 
@@ -56,6 +56,41 @@ class RuntimeTests(unittest.TestCase):
         job = self.state_store.get_job(record.job_id)
         self.assertIsNotNone(job)
         self.assertEqual(job.status, JOB_STATUS_CANCELED)
+
+    def test_job_manager_terminates_registered_subprocesses_on_failure(self):
+        class FakeProcess:
+            def __init__(self):
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return 0 if self.terminated or self.killed else None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self.killed = True
+
+        seen = {}
+
+        def failing_handler(ctx):
+            process = FakeProcess()
+            seen["process"] = process
+            ctx.register_subprocess("child", process)
+            raise RuntimeError("boom")
+
+        record = self.job_manager.submit("failure_cleanup_test", failing_handler)
+        event = self.wait_for_terminal_event(record.job_id)
+
+        self.assertEqual(event.status, JOB_STATUS_FAILED)
+        self.assertTrue(seen["process"].terminated)
+        job = self.state_store.get_job(record.job_id)
+        self.assertIsNotNone(job)
+        self.assertEqual(job.status, JOB_STATUS_FAILED)
 
 
 if __name__ == "__main__":

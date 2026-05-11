@@ -645,6 +645,60 @@ Current resource behavior:
 - workspace: `LogClassifier-Workspace`
 - region: `eastus`
 
+Azure resource provider preflight:
+
+- Azure training, model loading, and hosting depend on subscription-level resource providers.
+- The app uses the same Azure login to call `ResourceManagementClient.providers.get(...)`, register missing providers with `ResourceManagementClient.providers.register(...)`, and wait until each provider reaches `Registered`.
+- The signed-in Azure account must have `Microsoft.Resources/subscriptions/providers/register/action`; Azure `Owner` and `Contributor` roles usually include it.
+- Providers checked before Azure workspace, training, model loading, and hosting workflows:
+  - `Microsoft.MachineLearningServices`
+  - `Microsoft.ContainerRegistry`
+  - `Microsoft.Storage`
+  - `Microsoft.KeyVault`
+  - `Microsoft.ManagedIdentity`
+  - `Microsoft.Network`
+  - `Microsoft.Compute`
+  - `Microsoft.Insights`
+  - `Microsoft.OperationalInsights`
+  - `Microsoft.PolicyInsights`
+  - `Microsoft.Cdn`
+  - `Microsoft.ApiManagement`
+  - `Microsoft.Communication`
+
+Equivalent Azure CLI check:
+
+```powershell
+az account set --subscription <subscription-id>
+
+$providers = @(
+  "Microsoft.MachineLearningServices",
+  "Microsoft.ContainerRegistry",
+  "Microsoft.Storage",
+  "Microsoft.KeyVault",
+  "Microsoft.ManagedIdentity",
+  "Microsoft.Network",
+  "Microsoft.Compute",
+  "Microsoft.Insights",
+  "Microsoft.OperationalInsights",
+  "Microsoft.PolicyInsights",
+  "Microsoft.Cdn",
+  "Microsoft.ApiManagement",
+  "Microsoft.Communication"
+)
+
+foreach ($p in $providers) {
+  az provider show --namespace $p --query "{namespace:namespace,state:registrationState}" -o table
+}
+```
+
+Register any provider that is not `Registered`:
+
+```powershell
+az provider register --namespace Microsoft.Communication
+```
+
+Replace `Microsoft.Communication` with the missing provider namespace. Registration can take several minutes.
+
 Compute mapping:
 
 - `Azure Compute = cpu`
@@ -658,7 +712,7 @@ Azure training flow:
 
 1. authenticate with `InteractiveBrowserCredential`
 2. verify or create the Azure resource group
-3. register `Microsoft.MachineLearningServices`
+3. register required Azure resource providers when they are missing
 4. verify or create the Azure ML workspace
 5. register the labeled CSV as an Azure ML Data asset named `log-monitor-labeled-data`
 6. provision a temporary AML compute cluster
@@ -672,19 +726,21 @@ Azure training flow:
 ./downloaded_model
 ```
 
-12. cache training metadata into:
+12. register the downloaded `final_model` folder as an Azure ML model asset
+13. cache training metadata into:
 
 ```text
 ./outputs/last_training_mlflow.json
 ```
 
-13. delete the temporary training compute cluster during cleanup
+14. delete the temporary training compute cluster during cleanup
 
 Azure job notes:
 
 - Azure data asset versions are derived from the local dataset SHA-256 hash and truncated to Azure's 30-character version limit, so identical labeled CSV content reuses the same version.
 - The registered data asset URI is written into the CSV sidecar and training metadata as `azure_data_asset_uri`.
-- The job uses the curated environment `AzureML-pytorch-1.10-ubuntu18.04-py38-cuda11-gpu@latest`.
+- The job uses the CPU-safe Azure ML base image `mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04:latest`, installs CPU PyTorch, and pins Azure training to `transformers==4.56.1`.
+- Downloaded Azure training models are registered under `log-monitor-deberta-classifier` by default unless a registered model name is supplied in the UI.
 - MLflow env vars are always injected into Azure training jobs so metrics are logged to Azure ML even when MLflow is disabled in the UI.
 
 Interruption behavior:
